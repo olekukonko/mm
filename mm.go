@@ -18,14 +18,14 @@ var (
 	ErrDestinationIsNil    = errors.New("destination cannot be nil")
 	ErrDestNotPointer      = errors.New("destination must be a pointer")
 	ErrTypeMismatch        = errors.New("type mismatch")
-	ErrUnexportedField     = errors.New("cannot set unexported field")
+	ErrUnexportedField     = errors.New("cannot set unexported field") // Note: This might be less relevant if copyUnexported+unsafe is used.
 	ErrNoConverter         = errors.New("no suitable type converter found")
 	ErrCycleDetected       = errors.New("cycle detected but cannot assign destination")
 	ErrUnmappedFieldType   = errors.New("field tagged with 'unmapped' must be a map[string]interface{} or map[string]any")
 	ErrMapKeyNotString     = errors.New("source/destination map key type must be string when copying between map and struct")
 	ErrDestNotMap          = errors.New("destination type must be a map when copying from struct")
 	ErrMapValueNotSettable = errors.New("destination map value type not settable")
-	ErrReadUnexportedSrc   = errors.New("reading unexported source field is not supported reliably") // Keep this error, although we'll avoid reading them for now
+	ErrReadUnexportedSrc   = errors.New("reading unexported source field is not supported reliably")
 )
 
 // --- Core Structs & Types ---
@@ -37,39 +37,43 @@ type SmartCopier struct {
 	formatters        map[string]func(interface{}) interface{}
 	typeConverters    map[reflect.Type]map[reflect.Type]func(reflect.Value) (reflect.Value, error)
 	maxDepth          int
-	overwrite         bool // If true, destination fields are always overwritten by source fields (unless skip options apply)
-	skipZeroValue     bool // If true, skip copying source fields that are zero value (0, "", false, nil, etc.)
-	skipEmptyValue    bool // If true, skip copying source fields that are empty (zero, "", false, nil, empty slice/map)
-	skipNilSrc        bool // If true, skip copying if the source *value itself* is nil (top-level or field value)
+	overwrite         bool
+	skipZeroValue     bool
+	skipEmptyValue    bool
+	skipNilSrc        bool
 	useUnsafe         bool
 	enableCycleDetect bool
-	copyUnexported    bool // If true (and useUnsafe is true), allows copying unexported fields
+	copyUnexported    bool // Requires useUnsafe=true
 	collectErrors     bool
 	panicOnError      bool
-
-	typeInfoCache sync.Map
-	bufferPool    sync.Pool
-	debugMode     bool
+	typeInfoCache     sync.Map
+	bufferPool        sync.Pool // TODO: Use buffer pool for memcopy if deemed beneficial. Currently unused.
+	debugMode         bool
 }
 
+// visitKey is used to track visited pointers during recursive copying
+// to detect cycles.
 type visitKey struct {
 	ptr uintptr
 	typ reflect.Type
 }
 
-type copyContext struct {
+// mmContext holds the state for a single copy operation. Renamed from copyContext.
+type mmContext struct {
 	depth   int
-	visited map[visitKey]reflect.Value // Stores *address* of destination value created for a source pointer/address
+	visited map[visitKey]reflect.Value // Stores the destination value corresponding to a source pointer
 	errors  []error
 }
 
+// typeInfo caches reflection information about a type.
 type typeInfo struct {
-	fields        map[string]fieldInfo
-	unmappedField *fieldInfo
-	size          uintptr
-	canMemCopy    bool // Indicates if the type *structure* is suitable for memcopy (no pointers, etc.)
-	alignment     uintptr
-	containsPtrs  bool
+	fields        map[string]fieldInfo // Field name -> info
+	nameToField   map[string]fieldInfo
+	unmappedField *fieldInfo // Info for the field tagged 'unmapped', if any
+	size          uintptr    // reflect.Type.Size()
+	canMemCopy    bool       // Can we potentially use memcopy for this type?
+	alignment     uintptr    // reflect.Type.Align()
+	containsPtrs  bool       // Does this type (or its elements/fields) contain pointers?
 	isStruct      bool
 	isSlice       bool
 	isMap         bool
@@ -77,45 +81,47 @@ type typeInfo struct {
 	isInterface   bool
 }
 
+// fieldInfo caches reflection information about a struct field.
 type fieldInfo struct {
 	name        string
 	structField reflect.StructField
-	index       []int
-	offset      uintptr
+	index       []int   // For FieldByIndex
+	offset      uintptr // For unsafe access
 	typ         reflect.Type
-	canSet      bool // If the field is exported or unsafe+unexported enabled
-	tagOpts     map[string]string
+	canSet      bool              // Based on export status and copyUnexported/useUnsafe flags
+	tagOpts     map[string]string // Parsed options from the struct tag
 }
 
 // --- Tag Parsing & Helpers ---
 
+// parseTagOptions splits a struct tag string into options.
+// Example: "targetName,omitempty,-" -> map["name":"targetName", "omitempty":"", "-":""].
 func parseTagOptions(tag string) map[string]string {
 	opts := make(map[string]string)
 	parts := strings.Split(tag, ",")
-	// Handle the name part first (can be empty)
 	if len(parts) > 0 {
 		trimmedName := strings.TrimSpace(parts[0])
 		if trimmedName == "-" {
-			opts["-"] = "" // Mark as ignored
+			opts["-"] = "" // Mark as skipped
 		} else if trimmedName != "" {
-			opts["name"] = trimmedName
+			opts["name"] = trimmedName // Explicit name mapping
 		}
-		// Process options after the first comma
+		// Handle other options like omitempty, unmapped etc.
 		for _, opt := range parts[1:] {
 			trimmedOpt := strings.TrimSpace(opt)
 			if trimmedOpt != "" {
-				// Handle potential key=value options later if needed
-				opts[trimmedOpt] = ""
+				opts[trimmedOpt] = "" // Presence of the option is enough
 			}
 		}
 	}
-	// Ensure '-' overrides 'name' if both somehow appear (e.g., `mm:"-,omitempty"`)
+	// If skipped, remove name mapping if present
 	if _, ok := opts["-"]; ok {
 		delete(opts, "name")
 	}
 	return opts
 }
 
+// isEmptyValue checks if a reflect.Value represents an empty value (zero, nil, empty collection).
 func isEmptyValue(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
@@ -131,36 +137,40 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.Uint() == 0
 	case reflect.Float32, reflect.Float64:
 		return v.Float() == 0
+	case reflect.Complex64, reflect.Complex128:
+		return v.Complex() == 0
 	case reflect.Interface, reflect.Ptr, reflect.Chan, reflect.Func:
 		return v.IsNil()
 	}
-	// Consider struct zero value? reflect.Value.IsZero() handles this.
-	return v.IsZero() // Use IsZero for struct and other cases
+	// For other types like struct, check the IsZero method
+	return v.IsZero()
 }
 
 // --- Initialization ---
 
 func New() *SmartCopier {
 	return &SmartCopier{
-		tagName:           "mm",
+		tagName:           "mm", // Default struct tag name
 		fieldMappings:     make(map[string]string),
 		skipFields:        make(map[string]struct{}),
 		formatters:        make(map[string]func(interface{}) interface{}),
 		typeConverters:    make(map[reflect.Type]map[reflect.Type]func(reflect.Value) (reflect.Value, error)),
-		maxDepth:          -1,
-		overwrite:         true, // Default: overwrite destination fields
-		useUnsafe:         true, // Default: use unsafe where possible/configured
+		maxDepth:          -1, // No depth limit by default
+		overwrite:         true,
+		useUnsafe:         true, // Allow unsafe operations by default (for unexported fields)
 		enableCycleDetect: true,
-		copyUnexported:    false, // Default: do not copy unexported
+		copyUnexported:    false, // Don't copy unexported fields by default
 		collectErrors:     false,
 		panicOnError:      false,
-		skipNilSrc:        false, // Default: nil source zeros destination if overwrite=true
-		skipZeroValue:     false, // Default: copy zero values
-		skipEmptyValue:    false, // Default: copy empty values
+		skipNilSrc:        false,
+		skipZeroValue:     false,
+		skipEmptyValue:    false,
+		debugMode:         false, // Disable debug logging by default
 		bufferPool: sync.Pool{
 			New: func() interface{} {
-				// Buffer size for potential memcopy, adjust as needed
-				return make([]byte, 1024) // Reduced default size
+				// Allocate a reasonably sized buffer for potential memcopy operations
+				buf := make([]byte, 1024)
+				return &buf
 			},
 		},
 	}
@@ -170,7 +180,7 @@ func New() *SmartCopier {
 
 func (sc *SmartCopier) WithTag(tag string) *SmartCopier {
 	sc.tagName = tag
-	sc.typeInfoCache = sync.Map{} // Clear cache as tags affect type info
+	sc.typeInfoCache = sync.Map{} // Clear cache as tags affect field info
 	return sc
 }
 
@@ -196,43 +206,70 @@ func (sc *SmartCopier) WithMaxDepth(depth int) *SmartCopier {
 	return sc
 }
 
+// WithOverwrite configures whether existing non-empty/non-zero values
+// in the destination should be overwritten. Default is true.
+// Setting to false enables merge-like behavior (see also MergeTo).
 func (sc *SmartCopier) WithOverwrite(overwrite bool) *SmartCopier {
 	sc.overwrite = overwrite
 	return sc
 }
 
+// WithSkipZero configures whether source fields with zero values
+// (according to reflect.Value.IsZero) should be skipped. Default is false.
 func (sc *SmartCopier) WithSkipZero(skip bool) *SmartCopier {
 	sc.skipZeroValue = skip
 	return sc
 }
 
+// WithSkipEmpty configures whether source fields with empty values
+// (zero, nil, or empty collections/strings) should be skipped. Default is false.
+// See isEmptyValue for the definition of empty.
 func (sc *SmartCopier) WithSkipEmpty(skip bool) *SmartCopier {
 	sc.skipEmptyValue = skip
 	return sc
 }
 
+// WithSkipNil configures whether a nil source value (or nil pointer/interface)
+// should be skipped entirely (leaving the destination untouched). Default is false.
+// If false, a nil source might zero the destination field if overwrite is true.
 func (sc *SmartCopier) WithSkipNil(skip bool) *SmartCopier {
 	sc.skipNilSrc = skip
 	return sc
 }
 
+// WithUnsafe enables or disables the use of the unsafe package.
+// Required for copying unexported fields. Default is true.
 func (sc *SmartCopier) WithUnsafe(enable bool) *SmartCopier {
 	sc.useUnsafe = enable
-	sc.typeInfoCache = sync.Map{} // Clear cache as unsafe affects field access
+	sc.typeInfoCache = sync.Map{} // Clear cache as unsafe affects field accessibility
 	return sc
 }
 
+// WithCycleDetection enables or disables cycle detection during recursive copying.
+// Enabled by default. Disabling might improve performance slightly for known
+// acyclic structures but risks infinite loops with cyclic data.
 func (sc *SmartCopier) WithCycleDetection(enable bool) *SmartCopier {
 	sc.enableCycleDetect = enable
 	return sc
 }
 
+// WithUnexported enables copying of unexported fields.
+// Requires WithUnsafe(true). Default is false.
+// Note: Reading unexported fields from the source might still be problematic
+// and isn't guaranteed to work reliably across Go versions or architectures.
+// Setting unexported fields in the destination is generally more reliable with unsafe.
 func (sc *SmartCopier) WithUnexported(enable bool) *SmartCopier {
-	sc.copyUnexported = enable
-	sc.typeInfoCache = sync.Map{} // Clear cache as unexported affects field access
+	if enable && !sc.useUnsafe {
+		log.Println("[mm copier warning] WithUnexported(true) requires WithUnsafe(true). Unexported fields will not be copied.")
+		sc.copyUnexported = false
+	} else {
+		sc.copyUnexported = enable
+	}
+	sc.typeInfoCache = sync.Map{} // Clear cache as this affects field info
 	return sc
 }
 
+// WithTypeConverter registers a custom function to convert values from src type to dst type.
 func (sc *SmartCopier) WithTypeConverter(src, dst reflect.Type, converter func(reflect.Value) (reflect.Value, error)) *SmartCopier {
 	if sc.typeConverters[src] == nil {
 		sc.typeConverters[src] = make(map[reflect.Type]func(reflect.Value) (reflect.Value, error))
@@ -241,735 +278,755 @@ func (sc *SmartCopier) WithTypeConverter(src, dst reflect.Type, converter func(r
 	return sc
 }
 
+// WithErrors enables collecting all errors encountered during a copy operation
+// instead of stopping at the first one. The collected errors are joined
+// into a single error returned at the end. Default is false.
 func (sc *SmartCopier) WithErrors(collect bool) *SmartCopier {
 	sc.collectErrors = collect
 	return sc
 }
 
+// WithPanic enables panicking immediately when any error occurs during copying.
+// Default is false. If true, overrides WithErrors(true).
 func (sc *SmartCopier) WithPanic(panicOnError bool) *SmartCopier {
 	sc.panicOnError = panicOnError
 	return sc
 }
 
+// EnableDebug enables or disables verbose debug logging. Default is false.
 func (sc *SmartCopier) EnableDebug(enable bool) *SmartCopier {
 	sc.debugMode = enable
 	return sc
 }
 
-// --- Public Copy Methods ---
+// --- Error Handling Helpers ---
 
-func (sc *SmartCopier) handlePotentialError(err error, ctx *copyContext) bool {
+// handlePotentialError decides how to handle an error based on copier settings.
+// Returns true if the error was handled (collected) and copying should continue,
+// false if the error should be returned immediately (or panicked on).
+func (sc *SmartCopier) handlePotentialError(err error, ctx *mmContext) bool {
 	if err == nil {
+		return false // No error to handle
+	}
+
+	// If panic mode is on, always panic immediately
+	if sc.panicOnError {
+		panic(fmt.Sprintf("mm copy panic: %v", err))
+		// Note: panic() doesn't return, but Go compiler requires a return path.
+		// In practice, the panic prevents this return.
 		return false
 	}
+
+	// If collect errors mode is on, add to context and continue
 	if sc.collectErrors {
 		sc.debug("Collecting error: %v", err)
 		ctx.errors = append(ctx.errors, err)
-		return true // Indicate error was handled (collected)
+		return true // Error handled by collecting, continue copying
 	}
-	// If not collecting, the error will be returned or panic
-	return false // Indicate error needs propagation
+
+	// Default: return the error immediately
+	return false // Error not handled here, should be returned by caller
 }
 
-func (sc *SmartCopier) finalizeResult(returnedErr error, ctx *copyContext) error {
+// finalizeResult processes the result of a copy operation, considering collected errors.
+func (sc *SmartCopier) finalizeResult(returnedErr error, ctx *mmContext) error {
+	// If errors were collected, join them.
 	if sc.collectErrors && len(ctx.errors) > 0 {
+		// Even if returnedErr is not nil, collected errors take precedence
 		finalErr := errors.Join(ctx.errors...)
+		// Panic here if configured and errors were collected
 		if sc.panicOnError {
 			panic(fmt.Sprintf("mm copy failed with %d error(s): %v", len(ctx.errors), finalErr))
 		}
 		return finalErr
 	}
-	// Handle non-collected error
+
+	// If no errors were collected, handle the potentially returned single error.
 	if returnedErr != nil {
+		// Panic here if configured and a single error occurred without collection.
 		if sc.panicOnError {
 			panic(fmt.Sprintf("mm copy failed: %v", returnedErr))
 		}
 		return returnedErr
 	}
-	// No errors
+
+	// No errors encountered or collected.
 	return nil
 }
 
-func Copy[T any](sc *SmartCopier, src interface{}) (T, error) {
-	var dest T // Zero value of T
-	var zero T // Explicit zero value for return on error
-	destType := reflect.TypeOf(dest)
+// --- Public Copy Methods ---
 
-	// Handle src == nil directly
-	if src == nil {
-		if sc.skipNilSrc {
-			sc.debug("Copy[T]: Source is nil, skipNilSrc=true, returning zero T")
-			return zero, nil // Return zero T, nil error
+// Copy creates a new destination value of type T and copies data from src into it.
+// T must be the desired concrete type for the destination.
+// Returns the newly created destination value and any error encountered.
+func Copy[T any](sc *SmartCopier, src interface{}) (T, error) {
+	var dest T
+	var zero T // Zero value of T to return on error or skip
+
+	destType := reflect.TypeOf(dest)
+	if destType == nil {
+		// This can happen if T is an interface type like `any` or `interface{}`
+		// We need a concrete type to create a new value.
+		// Trying to get type from src if possible.
+		if src != nil {
+			srcVal := reflect.ValueOf(src)
+			if srcVal.Kind() == reflect.Ptr && !srcVal.IsNil() {
+				srcVal = srcVal.Elem()
+			}
+			if srcVal.IsValid() && srcVal.Type() != nil {
+				destType = srcVal.Type() // Use source type as fallback? Risky.
+				sc.debug("Warning: Copy[T] called with interface type T. Attempting to use source type %s for destination.", destType)
+				// We still can't instantiate `dest` directly with this type easily.
+				// This scenario might need rethinking or clearer constraints on T.
+				// For now, let's return an error if the initial destType is nil.
+				return zero, fmt.Errorf("Copy[T] requires a non-interface type for T, got %T", dest)
+
+			}
 		}
-		sc.debug("Copy[T]: Source is nil, skipNilSrc=false, returning zero T and ErrSourceIsNil")
-		err := ErrSourceIsNil
-		if sc.panicOnError {
-			panic(fmt.Sprintf("mm copy failed: %v", err))
-		}
-		return zero, err // Return zero T and the error
+		// If src is also nil or has no type, we cannot proceed.
+		return zero, fmt.Errorf("Copy[T] requires a non-interface type for T, cannot determine type")
 	}
 
-	destVal := reflect.New(destType).Elem() // Create a new instance of T
+	// Handle nil source based on skipNilSrc flag *before* returning ErrSourceIsNil
+	isSrcNil := false
+	if src == nil {
+		isSrcNil = true
+	} else {
+		srcValCheck := reflect.ValueOf(src)
+		if srcValCheck.Kind() == reflect.Ptr || srcValCheck.Kind() == reflect.Interface || srcValCheck.Kind() == reflect.Map || srcValCheck.Kind() == reflect.Slice || srcValCheck.Kind() == reflect.Chan || srcValCheck.Kind() == reflect.Func {
+			if srcValCheck.IsNil() {
+				isSrcNil = true
+			}
+		}
+	}
+
+	if isSrcNil {
+		if sc.skipNilSrc {
+			sc.debug("Copy: Source is nil and skipNilSrc=true, returning zero value for %T", dest)
+			return zero, nil
+		}
+		sc.debug("Copy: Source is nil and skipNilSrc=false, returning error.")
+		// Note: finalizerResult handles panicOnError if needed
+		return zero, sc.finalizeResult(ErrSourceIsNil, &mmContext{})
+	}
+
+	// Create a new settable value of the destination type T
+	// Use reflect.New to get a pointer, then Elem() to get the settable value.
+	destVal := reflect.New(destType).Elem()
 	srcVal := reflect.ValueOf(src)
 
-	// Handle src being a nil pointer explicitly (different from src == nil)
-	if srcVal.Kind() == reflect.Ptr {
-		if srcVal.IsNil() {
-			if sc.skipNilSrc {
-				sc.debug("Copy[T]: Source is nil pointer, skipNilSrc=true, returning zero T")
-				return zero, nil // Return zero T, nil error
-			}
-			// If not skipping nil, a nil pointer source results in a zero value destination
-			sc.debug("Copy[T]: Source is nil pointer, skipNilSrc=false, returning zero T")
-			return zero, nil // Return zero T, nil error (as per TestGenericCopy expectation)
-		}
-		srcVal = srcVal.Elem() // Dereference non-nil pointer
-	}
-
-	ctx := &copyContext{
+	// Prepare context for recursive copy
+	ctx := &mmContext{
 		depth:   0,
 		visited: make(map[visitKey]reflect.Value),
 		errors:  make([]error, 0),
 	}
 
+	sc.debug("Copy: Starting copy from %T (%s) to new %s", src, srcVal.Type(), destVal.Type())
 	err := sc.copyRecursive(destVal, srcVal, ctx)
+
+	// Finalize result (handle collected errors / panic)
 	finalErr := sc.finalizeResult(err, ctx)
 	if finalErr != nil {
-		return zero, finalErr // Return zero T on error
+		return zero, finalErr
 	}
 
-	// Ensure the final result is addressable if T is not a pointer type itself
-	finalResult := destVal
-	if destVal.CanAddr() && destType.Kind() != reflect.Ptr {
-		// If T is not a pointer, return the value.
-		// Interface() handles this correctly.
-	} else if !destVal.CanAddr() && destType.Kind() == reflect.Ptr {
-		// If T is a pointer, but destVal is not addressable (shouldn't happen with New().Elem())
-		// Fallback or error might be needed, but assume Interface() works
+	// Ensure the result is valid and assignable back to T
+	if !destVal.IsValid() {
+		// Should not happen if copyRecursive succeeded without error, but check defensively.
+		return zero, fmt.Errorf("internal error: copy result is invalid for type %s", destType)
 	}
 
-	// Check if the result can be converted to T
-	if !finalResult.IsValid() {
-		// Should not happen if copyRecursive worked, but handle defensively
-		return zero, fmt.Errorf("internal error: copy resulted in invalid value for type %s", destType)
-	}
-	if !finalResult.Type().AssignableTo(destType) {
-		// Try conversion if direct assignment fails
-		if finalResult.Type().ConvertibleTo(destType) {
-			finalResult = finalResult.Convert(destType)
-		} else {
-			return zero, fmt.Errorf("internal error: copy result type %s cannot be assigned or converted to target type %s", finalResult.Type(), destType)
-		}
+	// The destVal is guaranteed to be of type T because we created it with reflect.New(destType).Elem()
+	finalDest, ok := destVal.Interface().(T)
+	if !ok {
+		// This should be impossible if destType was derived from T correctly.
+		return zero, fmt.Errorf("internal error: cannot assert copy result type %s to target type %T", destVal.Type(), dest)
 	}
 
-	return finalResult.Interface().(T), nil
+	return finalDest, nil
 }
 
+// CopyTo copies data from src to the value pointed to by dest.
+// dest must be a non-nil pointer to the destination value.
 func (sc *SmartCopier) CopyTo(dest, src interface{}) error {
 	sc.debug("CopyTo called with dest=%T, src=%T", dest, src)
 	if dest == nil {
 		sc.debug("Destination is nil")
 		err := ErrDestinationIsNil
-		if sc.panicOnError {
-			panic(fmt.Sprintf("mm.CopyTo failed: %v", err))
-		}
-		return err
+		// finalizeResult will handle panicOnError if needed
+		return sc.finalizeResult(err, &mmContext{})
 	}
 
 	destVal := reflect.ValueOf(dest)
-	if destVal.Kind() != reflect.Ptr || destVal.IsNil() {
-		sc.debug("Destination is not a non-nil pointer: %v Kind=%s IsNil=%t", destVal, destVal.Kind(), destVal.IsValid() && destVal.IsNil())
+	if destVal.Kind() != reflect.Ptr {
+		sc.debug("Destination is not a pointer: %v Kind=%s", destVal, destVal.Kind())
 		err := ErrDestNotPointer
-		if sc.panicOnError {
-			panic(fmt.Sprintf("mm.CopyTo failed: %v", err))
-		}
-		return err
+		return sc.finalizeResult(err, &mmContext{})
+	}
+	if destVal.IsNil() {
+		sc.debug("Destination is nil pointer")
+		// A nil pointer destination is not settable.
+		err := ErrDestNotPointer // Or perhaps a more specific error like "destination pointer is nil"
+		return sc.finalizeResult(err, &mmContext{})
 	}
 
-	destElem := destVal.Elem() // The value the pointer points to
+	destElem := destVal.Elem()
 	if !destElem.CanSet() {
+		// This usually happens if dest points to an unexported field in another package,
+		// or if it's obtained in a way that makes it read-only.
 		err := fmt.Errorf("destination element (type %s) is not settable", destElem.Type())
-		if sc.panicOnError {
-			panic(fmt.Sprintf("mm.CopyTo failed: %v", err))
-		}
-		return err
+		return sc.finalizeResult(err, &mmContext{})
 	}
 
-	ctx := &copyContext{
+	// Prepare context for recursive copy
+	ctx := &mmContext{
 		depth:   0,
 		visited: make(map[visitKey]reflect.Value),
 		errors:  make([]error, 0),
 	}
 
-	// Pass destElem (the value) and src to internal copy
 	err := sc.copyToInternal(destElem, src, ctx)
 	return sc.finalizeResult(err, ctx)
 }
 
-// Internal helper that works with the destination *value*
-func (sc *SmartCopier) copyToInternal(destElem reflect.Value, src interface{}, ctx *copyContext) error {
-	sc.debug("copyToInternal called with destElem=%s, src=%T", destElem.Type(), src)
+// copyToInternal is the internal implementation for CopyTo, operating on the settable destination element.
+func (sc *SmartCopier) copyToInternal(destElem reflect.Value, src interface{}, ctx *mmContext) error {
+	sc.debug("copyToInternal called with destElem=%s (%s), src=%T", destElem.Type(), destElem.Kind(), src)
 
-	// Handle nil source interface
+	// Handle nil source value
 	if src == nil {
 		if sc.skipNilSrc {
 			sc.debug("Source is nil, skipNilSrc=true, skipping.")
 			return nil
 		}
-		// Source is nil, zero the destination if overwrite=true
+		// Source is nil, skipNilSrc is false. Behavior depends on overwrite.
 		if sc.overwrite && destElem.IsValid() && destElem.CanSet() {
 			sc.debug("Source is nil, skipNilSrc=false, overwrite=true. Zeroing destination %s.", destElem.Type())
 			destElem.Set(reflect.Zero(destElem.Type()))
 		} else {
 			sc.debug("Source is nil, skipNilSrc=false, overwrite=false. Destination %s remains unchanged.", destElem.Type())
 		}
-		return nil // No error, just potentially zeroed dest
+		return nil // Successfully handled nil source (by skipping or zeroing)
 	}
 
 	srcVal := reflect.ValueOf(src)
 
-	// Handle source being a nil pointer
-	if srcVal.Kind() == reflect.Ptr {
+	// Handle nil pointer/interface source
+	if srcVal.Kind() == reflect.Ptr || srcVal.Kind() == reflect.Interface || srcVal.Kind() == reflect.Map || srcVal.Kind() == reflect.Slice || srcVal.Kind() == reflect.Chan || srcVal.Kind() == reflect.Func {
 		if srcVal.IsNil() {
 			if sc.skipNilSrc {
-				sc.debug("Source is nil pointer, skipNilSrc=true, skipping.")
+				sc.debug("Source is nil pointer/interface/slice/map, skipNilSrc=true, skipping.")
 				return nil
 			}
-			// Source is nil pointer, zero the destination if overwrite=true
 			if sc.overwrite && destElem.IsValid() && destElem.CanSet() {
-				sc.debug("Source is nil pointer, skipNilSrc=false, overwrite=true. Zeroing destination %s.", destElem.Type())
+				sc.debug("Source is nil pointer/interface/slice/map, skipNilSrc=false, overwrite=true. Zeroing destination %s.", destElem.Type())
 				destElem.Set(reflect.Zero(destElem.Type()))
 			} else {
-				sc.debug("Source is nil pointer, skipNilSrc=false, overwrite=false. Destination %s remains unchanged.", destElem.Type())
+				sc.debug("Source is nil pointer/interface/slice/map, skipNilSrc=false, overwrite=false. Destination %s remains unchanged.", destElem.Type())
 			}
-			return nil // No error
+			return nil // Successfully handled nil source
 		}
-		srcVal = srcVal.Elem() // Dereference non-nil pointer
 	}
 
-	if !destElem.IsValid() {
-		err := fmt.Errorf("destination element became invalid")
-		if sc.handlePotentialError(err, ctx) {
-			return nil
-		} // Should not happen if initial check passed
-		return err
-	}
-	if !srcVal.IsValid() {
-		// This might happen if src was e.g., an interface containing a nil pointer that got dereferenced
-		if sc.skipNilSrc {
-			return nil
-		}
-		if sc.overwrite && destElem.CanSet() {
-			destElem.Set(reflect.Zero(destElem.Type()))
-		}
-		return nil
-	}
-
+	// Source is not nil, proceed with recursive copy
 	sc.debug("Starting recursive copy from %s to %s", srcVal.Type(), destElem.Type())
 	return sc.copyRecursive(destElem, srcVal, ctx)
 }
 
+// MustCopyTo is like CopyTo but panics if any error occurs.
 func (sc *SmartCopier) MustCopyTo(dest, src interface{}) {
+	// Temporarily enable panicOnError, ensuring it's restored afterward
 	originalPanic := sc.panicOnError
 	sc.panicOnError = true
-	defer func() { sc.panicOnError = originalPanic }() // Ensure panic mode is reset
+	defer func() { sc.panicOnError = originalPanic }()
 
+	// Call CopyTo. finalizeResult inside CopyTo will handle the panic.
 	if err := sc.CopyTo(dest, src); err != nil {
-		// CopyTo already panics if panicOnError is true and error occurs
-		// If it returns an error here, it means panicOnError was false initially,
-		// but we still need to panic now.
+		// This part should technically not be reached if panicOnError works correctly
+		// inside finalizeResult. However, adding a fallback panic just in case.
 		panic(fmt.Sprintf("mm.MustCopyTo failed: %v", err))
 	}
 }
 
+// MergeTo copies data from src to dest, but only for fields that are
+// considered empty/zero in the destination. It's equivalent to configuring
+// the copier with WithOverwrite(false) and WithSkipEmpty(true) temporarily.
 func (sc *SmartCopier) MergeTo(dest, src interface{}) error {
-	// Merge implies overwrite=false (don't overwrite non-empty dest fields)
-	// AND skipEmptyValue=true (don't copy empty source values over dest)
+	// Save original settings
 	originalOverwrite := sc.overwrite
-	originalSkipEmpty := sc.skipEmptyValue
+	originalSkipEmpty := sc.skipEmptyValue // MergeTo implies skipping empty source values shouldn't happen
+	originalSkipZero := sc.skipZeroValue   // so we only change overwrite.
+
+	// Apply temporary settings for merge behavior
 	sc.overwrite = false
-	sc.skipEmptyValue = true // Crucial for merge behavior
+	// sc.skipEmptyValue = true // Merge doesn't skip empty source, it skips overwriting non-empty dest
+	// sc.skipZeroValue = true // Let's keep skipZero/Empty as configured by user, merge primarily means no overwrite
+
+	// Ensure settings are restored
 	defer func() {
 		sc.overwrite = originalOverwrite
 		sc.skipEmptyValue = originalSkipEmpty
+		sc.skipZeroValue = originalSkipZero
 	}()
-	sc.debug("MergeTo called (overwrite=false, skipEmptyValue=true)")
+
+	sc.debug("MergeTo called (temporarily setting overwrite=false)")
+	// Call CopyTo with the modified settings
 	return sc.CopyTo(dest, src)
 }
 
-// CopyToMultiple copies the first source, then merges subsequent sources.
+// CopyToMultiple copies data from the first source to dest using the standard
+// configuration, then merges data from subsequent sources into dest.
+// Merge behavior uses WithOverwrite(false) and WithSkipEmpty(true) temporarily.
 func (sc *SmartCopier) CopyToMultiple(dest interface{}, sources ...interface{}) error {
 	if len(sources) == 0 {
-		return nil // Nothing to do
+		sc.debug("CopyToMultiple called with no sources.")
+		return nil // Nothing to copy
 	}
+
+	// Validate destination once
 	if dest == nil {
-		return ErrDestinationIsNil
+		return sc.finalizeResult(ErrDestinationIsNil, &mmContext{})
 	}
 	destVal := reflect.ValueOf(dest)
 	if destVal.Kind() != reflect.Ptr || destVal.IsNil() {
-		return ErrDestNotPointer
+		return sc.finalizeResult(ErrDestNotPointer, &mmContext{})
 	}
 	destElem := destVal.Elem()
 	if !destElem.CanSet() {
-		return fmt.Errorf("destination element (type %s) is not settable", destElem.Type())
+		err := fmt.Errorf("destination element (type %s) is not settable", destElem.Type())
+		return sc.finalizeResult(err, &mmContext{})
 	}
 
-	ctx := &copyContext{
+	// Prepare context for the entire multi-copy operation
+	ctx := &mmContext{
 		depth:   0,
-		visited: make(map[visitKey]reflect.Value),
+		visited: make(map[visitKey]reflect.Value), // Reset visited for each full operation
 		errors:  make([]error, 0),
 	}
 
-	var firstErr error
-	// Copy first source normally (respecting current copier settings)
-	sc.debug("CopyToMultiple: Copying first source")
-	if err := sc.copyToInternal(destElem, sources[0], ctx); err != nil {
+	var overallErr error // Tracks the first error if not collecting
+
+	// 1. Copy the first source using current settings
+	sc.debug("CopyToMultiple: Copying first source (%T)", sources[0])
+	firstSrc := sources[0]
+	if err := sc.copyToInternal(destElem, firstSrc, ctx); err != nil {
 		if sc.handlePotentialError(err, ctx) {
 			// Error collected, continue if possible
 		} else {
-			firstErr = err // Store first non-collected error
+			overallErr = err // Store first error if not collecting
+			// If not collecting, stop after the first error
+			if !sc.collectErrors {
+				return sc.finalizeResult(overallErr, ctx)
+			}
 		}
 	}
-	// If we are not collecting errors and got one, stop early
-	if !sc.collectErrors && firstErr != nil {
-		return sc.finalizeResult(firstErr, ctx)
-	}
 
-	// Merge subsequent sources
+	// 2. Merge subsequent sources
 	if len(sources) > 1 {
+		// Save original settings relevant to merging
 		originalOverwrite := sc.overwrite
-		originalSkipEmpty := sc.skipEmptyValue
-		sc.overwrite = false     // Ensure merge behavior
-		sc.skipEmptyValue = true // Ensure merge behavior
-		defer func() {           // Restore original settings
+		originalSkipEmpty := sc.skipEmptyValue // Using skipEmpty during merge
+		originalSkipZero := sc.skipZeroValue   // Using skipZero during merge
+
+		// Apply temporary settings for merge behavior
+		sc.overwrite = false
+		sc.skipEmptyValue = true // Skip empty values from subsequent sources during merge
+		sc.skipZeroValue = true  // Skip zero values from subsequent sources during merge
+
+		// Ensure settings are restored
+		defer func() {
 			sc.overwrite = originalOverwrite
 			sc.skipEmptyValue = originalSkipEmpty
+			sc.skipZeroValue = originalSkipZero
 		}()
-		sc.debug("CopyToMultiple: Merging subsequent sources (overwrite=false, skipEmptyValue=true)")
+
+		sc.debug("CopyToMultiple: Merging subsequent sources (overwrite=false, skipEmpty/Zero=true)")
 		for i := 1; i < len(sources); i++ {
-			if err := sc.copyToInternal(destElem, sources[i], ctx); err != nil {
+			// Reset cycle detection for each merge source? No, keep context across merges.
+			currentSrc := sources[i]
+			sc.debug("CopyToMultiple: Merging source %d (%T)", i+1, currentSrc)
+			if err := sc.copyToInternal(destElem, currentSrc, ctx); err != nil {
 				if sc.handlePotentialError(err, ctx) {
 					// Error collected, continue if possible
-				} else if firstErr == nil { // Store first non-collected error
-					firstErr = err
+				} else if overallErr == nil {
+					overallErr = err // Store first error if not collecting
 				}
-			}
-			// If not collecting errors and got one, stop early
-			if !sc.collectErrors && firstErr != nil {
-				break // Stop processing further sources
+				// If not collecting, stop after the first error
+				if !sc.collectErrors && overallErr != nil {
+					break // Stop processing more sources
+				}
 			}
 		}
 	}
 
-	return sc.finalizeResult(firstErr, ctx)
+	// Finalize the result, considering any collected errors or the first error
+	return sc.finalizeResult(overallErr, ctx)
 }
 
-// --- Internal Implementation ---
-
-func (sc *SmartCopier) copyRecursive(dest, src reflect.Value, ctx *copyContext) (err error) {
-	// Handle maximum depth
+// copyRecursive is the heart of the copier, handling different types recursively.
+func (sc *SmartCopier) copyRecursive(dest, src reflect.Value, ctx *mmContext) error {
+	// --- Pre-checks ---
 	if sc.maxDepth >= 0 && ctx.depth > sc.maxDepth {
 		sc.debug("Depth %d: Max depth (%d) reached, stopping recursion.", ctx.depth, sc.maxDepth)
-		return nil
+		return nil // Stop recursion gracefully
 	}
 
-	// --- Source Validity and Nil/Zero/Empty Checks ---
+	// Check source validity
 	if !src.IsValid() {
-		// This can happen with nil interface elements, etc.
-		if sc.skipNilSrc {
+		if sc.skipNilSrc { // Treat invalid like nil for skipping purposes
 			sc.debug("Depth %d: Source is invalid, skipNilSrc=true, skipping.", ctx.depth)
 			return nil
 		}
-		if sc.overwrite && dest.IsValid() && dest.CanSet() {
-			sc.debug("Depth %d: Source is invalid, overwrite=true, zeroing destination %s.", ctx.depth, dest.Type())
+		if sc.overwrite && dest.CanSet() {
+			sc.debug("Depth %d: Source is invalid, skipNilSrc=false, overwrite=true. Zeroing destination %s.", ctx.depth, dest.Type())
 			dest.Set(reflect.Zero(dest.Type()))
 		} else {
-			sc.debug("Depth %d: Source is invalid, overwrite=false or dest not settable.", ctx.depth)
+			sc.debug("Depth %d: Source is invalid, skipNilSrc=false, overwrite=false. Destination %s remains unchanged.", ctx.depth, dest.Type())
 		}
-		return nil
+		return nil // Handled invalid source
 	}
 
+	// Dereference source pointer/interface *once* for subsequent checks and type dispatching
+	// Keep the original value for cycle detection and potential handler needs.
+	originalSrc := src
 	srcType := src.Type()
-	destType := dest.Type()
-	sc.debug("Depth %d: Enter copyRecursive: Dest: %s(%v) <- Src: %s(%v)", ctx.depth, destType, dest.Kind(), srcType, src.Kind())
-
-	// Dereference source pointer *after* initial IsValid check
-	// Store original src kind for cycle check before potential deref
-	srcKindOriginal := src.Kind()
-	srcPtrOriginal := src
-	if srcKindOriginal == reflect.Ptr {
+	if src.Kind() == reflect.Ptr || src.Kind() == reflect.Interface {
 		if src.IsNil() {
 			if sc.skipNilSrc {
-				sc.debug("Depth %d: Source pointer is nil, skipNilSrc=true, skipping.", ctx.depth)
+				sc.debug("Depth %d: Source pointer/interface is nil, skipNilSrc=true, skipping.", ctx.depth)
 				return nil
 			}
-			if sc.overwrite && dest.IsValid() && dest.CanSet() {
-				sc.debug("Depth %d: Source pointer is nil, overwrite=true, zeroing destination %s.", ctx.depth, destType)
-				dest.Set(reflect.Zero(destType))
+			if sc.overwrite && dest.CanSet() {
+				sc.debug("Depth %d: Source pointer/interface is nil, skipNilSrc=false, overwrite=true. Zeroing destination %s.", ctx.depth, dest.Type())
+				dest.Set(reflect.Zero(dest.Type()))
 			} else {
-				sc.debug("Depth %d: Source pointer is nil, overwrite=false or dest not settable.", ctx.depth)
+				sc.debug("Depth %d: Source pointer/interface is nil, skipNilSrc=false, overwrite=false. Destination %s remains unchanged.", ctx.depth, dest.Type())
 			}
-			return nil
+			return nil // Handled nil pointer/interface
 		}
-		// Dereference non-nil pointer for further checks/copying
+		// Only dereference if not nil
 		src = src.Elem()
-		// Check validity again after dereferencing
+		// Re-check validity after dereferencing, especially for interface{}(nil)
 		if !src.IsValid() {
 			if sc.skipNilSrc {
+				sc.debug("Depth %d: Source dereferenced to invalid, skipNilSrc=true, skipping.", ctx.depth)
 				return nil
-			} // Should be redundant?
-			if sc.overwrite && dest.IsValid() && dest.CanSet() {
-				dest.Set(reflect.Zero(destType))
+			}
+			if sc.overwrite && dest.CanSet() {
+				sc.debug("Depth %d: Source dereferenced to invalid, skipNilSrc=false, overwrite=true. Zeroing destination %s.", ctx.depth, dest.Type())
+				dest.Set(reflect.Zero(dest.Type()))
+			} else {
+				sc.debug("Depth %d: Source dereferenced to invalid, skipNilSrc=false, overwrite=false. Destination %s remains unchanged.", ctx.depth, dest.Type())
 			}
 			return nil
 		}
-		srcType = src.Type() // Update srcType after deref
-		sc.debug("Depth %d: Dereferenced source pointer. New Src: %s(%v)", ctx.depth, srcType, src.Kind())
+		srcType = src.Type() // Update srcType after potential dereference
 	}
 
-	// Apply skipNilSrc, skipZeroValue, skipEmptyValue based on the actual source value (potentially dereferenced)
-	if sc.skipNilSrc {
-		switch src.Kind() {
-		case reflect.Map, reflect.Slice, reflect.Interface, reflect.Chan, reflect.Func:
-			if src.IsNil() {
-				sc.debug("Depth %d: Skipping nil source (%v) due to skipNilSrc", ctx.depth, src.Kind())
-				return nil
-			}
-		}
-	}
+	// Skip source based on zero/empty checks (using the potentially dereferenced value)
 	if sc.skipZeroValue && src.IsZero() {
-		sc.debug("Depth %d: Skipping zero-value source (%v) due to skipZeroValue", ctx.depth, src.Interface())
+		sc.debug("Depth %d: Source is zero value (%v), skipZeroValue=true, skipping.", ctx.depth, src.Interface())
 		return nil
 	}
 	if sc.skipEmptyValue && isEmptyValue(src) {
-		sc.debug("Depth %d: Skipping empty-value source (%v) due to skipEmptyValue", ctx.depth, src.Interface())
+		sc.debug("Depth %d: Source is empty value (%v), skipEmptyValue=true, skipping.", ctx.depth, src.Interface())
 		return nil
 	}
 
-	// --- Destination Validity Check ---
-	if !dest.IsValid() {
-		err = fmt.Errorf("internal error: destination %s became invalid before copy", destType)
-		if sc.handlePotentialError(err, ctx) {
-			return nil
-		}
-		return err
-	}
+	// Check destination settability
 	if !dest.CanSet() {
-		// This check is crucial. If dest isn't settable here, we can't proceed.
-		// This might happen if passing e.g. an unexported struct field value directly.
-		sc.debug("Depth %d: Destination %s (%v) is not settable, skipping.", ctx.depth, destType, dest.Kind())
-		// Don't return an error, just can't perform the copy on this path.
-		// Field-level copies handle settability via getSettableFieldValue.
-		// This guards direct calls like map[int]MyStruct where MyStruct isn't settable.
+		// This might happen if called on an unexported field without unsafe,
+		// or a temporary value that isn't addressable.
+		// We usually check this higher up, but double-check here.
+		sc.debug("Depth %d: Destination %s (%s) is not settable, skipping.", ctx.depth, dest.Type(), dest.Kind())
 		return nil
 	}
+	destType := dest.Type()
 
 	// --- Cycle Detection ---
-	canTrackCycle := false
-	var key visitKey
-	if sc.enableCycleDetect {
-		// Determine the source reference (pointer or addressable value) to track
-		sourceToTrack := srcPtrOriginal // Use original source before potential pointer deref
-		sourceKindToTrack := srcKindOriginal
-		if sourceKindToTrack == reflect.Ptr && sourceToTrack.IsNil() {
-			// Don't track nil pointers
-		} else if sourceKindToTrack == reflect.Interface && sourceToTrack.IsNil() {
-			// Don't track nil interfaces
-		} else {
-			// Track pointers, maps, slices, and addressable structs
-			switch sourceKindToTrack {
-			case reflect.Ptr, reflect.Map, reflect.Slice:
-				if !sourceToTrack.IsNil() { // Extra nil check for map/slice
-					key = visitKey{ptr: sourceToTrack.Pointer(), typ: sourceToTrack.Type()}
-					canTrackCycle = true
-				}
-			case reflect.Struct:
-				if sourceToTrack.CanAddr() {
-					key = visitKey{ptr: sourceToTrack.Addr().Pointer(), typ: sourceToTrack.Addr().Type()}
-					canTrackCycle = true
-				}
-			case reflect.Interface:
-				// Track the concrete value within the interface if possible
-				elem := sourceToTrack.Elem()
-				if elem.IsValid() {
-					elemKind := elem.Kind()
-					if elemKind == reflect.Ptr || elemKind == reflect.Map || elemKind == reflect.Slice {
-						if !elem.IsNil() {
-							key = visitKey{ptr: elem.Pointer(), typ: elem.Type()}
-							canTrackCycle = true
-						}
-					} else if elemKind == reflect.Struct && elem.CanAddr() {
-						key = visitKey{ptr: elem.Addr().Pointer(), typ: elem.Addr().Type()}
-						canTrackCycle = true
-					}
-				}
+	// Use the *original* source value (before dereferencing) for pointer identity.
+	if sc.enableCycleDetect && originalSrc.CanAddr() {
+		// Use CanAddr as a proxy for types that might participate in cycles (pointers, structs).
+		// Using Addr().Pointer() directly is problematic for non-addressable values (like map elements).
+		// A more robust approach might be needed, but pointer equality is the primary goal here.
+		var key visitKey
+		addr := uintptr(0)
+
+		// Get address reliably only for Ptr, Chan, Func, Map, Slice, UnsafePointer
+		// For Structs, use Addr() if possible. Interfaces need Elem() check.
+		kind := originalSrc.Kind()
+		if kind == reflect.Ptr || kind == reflect.Map || kind == reflect.Slice || kind == reflect.Chan || kind == reflect.Func || kind == reflect.UnsafePointer {
+			if !originalSrc.IsNil() {
+				addr = originalSrc.Pointer()
+				key = visitKey{ptr: addr, typ: originalSrc.Type()} // Use pointer type for key
 			}
+		} else if kind == reflect.Interface {
+			if !originalSrc.IsNil() {
+				elem := originalSrc.Elem()
+				if elem.CanAddr() { // Check if the concrete value is addressable
+					// Use the address and type of the *concrete* value
+					addr = elem.Addr().Pointer()
+					key = visitKey{ptr: addr, typ: elem.Type()}
+				} else if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+					// If concrete value is a pointer, use its info
+					addr = elem.Pointer()
+					key = visitKey{ptr: addr, typ: elem.Type()}
+				}
+				// If concrete value not addressable and not pointer, cannot reliably detect cycle via ptr.
+			}
+		} else if kind == reflect.Struct {
+			if originalSrc.CanAddr() {
+				addr = originalSrc.Addr().Pointer()
+				key = visitKey{ptr: addr, typ: originalSrc.Type()}
+			}
+			// If struct not addressable, cannot reliably detect cycle via ptr.
 		}
 
-		if canTrackCycle {
-			if existingDestAddr, visited := ctx.visited[key]; visited {
-				sc.debug("Depth %d: Cycle detected for src ptr %x (%s)", ctx.depth, key.ptr, key.typ)
-				if dest.CanSet() && existingDestAddr.IsValid() {
-					existingDest := existingDestAddr // Assume stored value is address/pointer
-					if !existingDest.IsValid() {     // Defensive check
-						sc.debug("Depth %d: Cycle detected but stored destination is invalid.", ctx.depth)
-						return nil // Or return error?
-					}
-
-					// Try assigning/converting the stored destination (which should be an address/pointer)
-					// or its element to the current destination.
-					if existingDest.Type().AssignableTo(destType) {
-						dest.Set(existingDest)
-						sc.debug("Depth %d: Cycle assignment: Dest %s = Existing %s (assignable Addr)", ctx.depth, destType, existingDest.Type())
-						return nil
-					}
-					if existingDest.Kind() == reflect.Ptr {
-						existingElem := existingDest.Elem()
-						if existingElem.IsValid() && existingElem.Type().AssignableTo(destType) {
-							dest.Set(existingElem)
-							sc.debug("Depth %d: Cycle assignment: Dest %s = Existing %s (assignable Elem)", ctx.depth, destType, existingElem.Type())
-							return nil
-						}
-						// Handle case where dest is a pointer but existing is pointer to different type
-						if dest.Kind() == reflect.Ptr && existingElem.IsValid() && existingElem.Type().AssignableTo(dest.Type().Elem()) {
-							if dest.IsNil() {
-								dest.Set(reflect.New(dest.Type().Elem()))
-							}
-							dest.Elem().Set(existingElem)
-							sc.debug("Depth %d: Cycle assignment: Dest Elem %s = Existing Elem %s (assignable)", ctx.depth, dest.Elem().Type(), existingElem.Type())
-							return nil
-						}
-					}
-
-					// Try conversion (less common for cycles, but possible)
-					converted, convErr := sc.tryConvert(existingDest, destType)
-					if convErr == nil && converted.IsValid() {
-						dest.Set(converted)
-						sc.debug("Depth %d: Cycle assignment: Dest %s = Existing %s (converted Addr)", ctx.depth, destType, existingDest.Type())
-						return nil
-					}
-					if existingDest.Kind() == reflect.Ptr {
-						existingElem := existingDest.Elem()
-						if existingElem.IsValid() {
-							convertedElem, convElemErr := sc.tryConvert(existingElem, destType)
-							if convElemErr == nil && convertedElem.IsValid() {
-								dest.Set(convertedElem)
-								sc.debug("Depth %d: Cycle assignment: Dest %s = Existing %s (converted Elem)", ctx.depth, destType, existingElem.Type())
-								return nil
-							}
-						}
-					}
-
-					// If no assignment/conversion works
-					errMsg := fmt.Sprintf("detected cycle ptr %x type %s, but existing dest addr type %s / elem type %s not assignable or convertible to %s",
-						key.ptr, key.typ, existingDest.Type(), existingDest.Elem().Type(), destType)
-					err = fmt.Errorf("%w: %s", ErrCycleDetected, errMsg)
-					if sc.handlePotentialError(err, ctx) {
-						return nil
-					}
-					return err
+		if key.ptr != 0 { // If we got a valid key
+			if existingDest, ok := ctx.visited[key]; ok {
+				sc.debug("Depth %d: Cycle detected! Source %s (ptr %x) already visited, mapped to dest %s.", ctx.depth, key.typ, key.ptr, existingDest.Type())
+				// Found a cycle. Try to set the current destination 'dest'
+				// to the *existing* destination value we stored earlier.
+				if existingDest.IsValid() && existingDest.Type().AssignableTo(destType) {
+					sc.debug(" -> Assigning existing dest (%s) directly.", existingDest.Type())
+					dest.Set(existingDest)
+					return nil // Cycle handled
 				}
-			} else {
-				// Store the *address* of the destination if possible, otherwise the value itself.
-				// This helps when the cycle needs to assign a pointer back.
-				valueToStore := dest
-				if dest.CanAddr() {
-					valueToStore = dest.Addr()
-					sc.debug("Depth %d: Adding cycle track: src ptr %x (%s) -> dest addr %v (%s)", ctx.depth, key.ptr, key.typ, valueToStore, valueToStore.Type())
-				} else {
-					// Less ideal, might cause issues if cycle needs to assign a pointer later
-					sc.debug("Depth %d: Adding cycle track: src ptr %x (%s) -> dest value %v (%s) (not addressable)", ctx.depth, key.ptr, key.typ, valueToStore, valueToStore.Type())
+				// Handle T vs *T mismatch specifically for cycles
+				if dest.Kind() == reflect.Ptr && existingDest.Type() == destType.Elem() {
+					// Current dest is *T, existing is T. Try assigning address.
+					if existingDest.CanAddr() {
+						sc.debug(" -> Assigning address of existing dest (%s) to pointer dest (%s).", existingDest.Type(), destType)
+						dest.Set(existingDest.Addr())
+						return nil // Cycle handled
+					} else {
+						sc.debug(" -> Cannot assign address of existing dest (%s) to pointer dest (%s) (not addressable).", existingDest.Type(), destType)
+					}
 				}
-				if valueToStore.IsValid() {
-					ctx.visited[key] = valueToStore
+				// Handle *T vs T mismatch (less common, but possible)
+				if existingDest.Kind() == reflect.Ptr && !existingDest.IsNil() && existingDest.Elem().Type() == destType {
+					// Current dest is T, existing is *T. Try assigning dereferenced value.
+					sc.debug(" -> Assigning element of existing pointer dest (%s) to value dest (%s).", existingDest.Type(), destType)
+					dest.Set(existingDest.Elem())
+					return nil // Cycle handled
 				}
+				// Try conversion as a last resort
+				if conv, err := sc.tryConvert(existingDest, destType); err == nil && conv.IsValid() {
+					sc.debug(" -> Assigning converted existing dest (%s -> %s).", existingDest.Type(), destType)
+					dest.Set(conv)
+					return nil // Cycle handled
+				}
+
+				// If we couldn't assign, report error (or collect)
+				err := fmt.Errorf("%w: source %s (ptr %x) already visited, cannot assign existing destination %s to current destination %s",
+					ErrCycleDetected, key.typ, key.ptr, existingDest.Type(), destType)
+				if sc.handlePotentialError(err, ctx) {
+					return nil // Error collected, continue if possible
+				}
+				return err
 			}
+			// Not visited yet, record this source pointer -> destination value mapping.
+			// Store the *current* destination value. If it's a pointer, store the pointer.
+			// If it's a struct, store the struct value.
+			sc.debug("Depth %d: Recording visit: Source %s (ptr %x) -> Dest %s", ctx.depth, key.typ, key.ptr, dest.Type())
+			ctx.visited[key] = dest
 		}
 	}
 
-	// --- Fast Paths (Assignment, Conversion, Unsafe MemCopy) ---
+	// --- Recursive Copy Dispatch ---
+	ctx.depth++
+	defer func() { ctx.depth-- }()
 
-	// 1. Direct Assignment (if types match and dest is settable)
-	if srcType.AssignableTo(destType) {
-		if dest.CanSet() { // Should already be true from check above
-			sc.debug("Depth %d: Setting assignable type %s to %s", ctx.depth, srcType, destType)
+	// --- Type Conversion Check ---
+	// Try custom or built-in converters first if types don't match exactly
+	// Note: We use the potentially dereferenced `src` and its `srcType` here.
+	if srcType != destType {
+		if converted, err := sc.tryConvert(src, destType); err == nil && converted.IsValid() {
+			if !sc.overwrite && dest.IsValid() && !isEmptyValue(dest) {
+				sc.debug("Depth %d: Skipping assignment for converted value: overwrite=false and destination %s is non-empty", ctx.depth, destType)
+				return nil
+			}
+			sc.debug("Depth %d: Converted %s -> %s successfully, assigning.", ctx.depth, srcType, destType)
+			dest.Set(converted)
+			return nil // Conversion successful
+		}
+		// If conversion failed, fall through to kind-based copying, which might still work
+		// (e.g., map[string]interface{} -> struct) or fail with ErrTypeMismatch later.
+		sc.debug("Depth %d: No direct conversion found for %s -> %s. Proceeding with kind-based copy.", ctx.depth, srcType, destType)
+	}
+
+	// --- Kind-based Copying ---
+	// Use dest.Kind() for dispatch as destination structure dictates the copy method
+	switch dest.Kind() {
+	case reflect.Struct:
+		// Source can be Struct or Map
+		if src.Kind() == reflect.Struct {
+			sc.debug("Depth %d: Dispatching to copyStruct (%s <- %s)", ctx.depth, destType, srcType)
+			destInfo := sc.getTypeInfo(destType)
+			return sc.copyStruct(dest, src, ctx, destInfo)
+		}
+		if src.Kind() == reflect.Map {
+			// Check map key type compatibility before proceeding
+			if srcType.Key().Kind() != reflect.String {
+				err := ErrMapKeyNotString
+				if sc.handlePotentialError(err, ctx) {
+					return nil
+				}
+				return err
+			}
+			sc.debug("Depth %d: Dispatching to copyMapToStruct (%s <- %s)", ctx.depth, destType, srcType)
+			destInfo := sc.getTypeInfo(destType)
+			return sc.copyMapToStruct(dest, src, ctx, destInfo)
+		}
+		// Fall through to mismatch error if source is neither struct nor map
+
+	case reflect.Slice:
+		// Source must be Slice
+		if src.Kind() == reflect.Slice {
+			sc.debug("Depth %d: Dispatching to copySlice (%s <- %s)", ctx.depth, destType, srcType)
+			return sc.copySlice(dest, src, ctx)
+		}
+		// Fall through to mismatch error
+
+	case reflect.Map:
+		// Source can be Map or Struct
+		if src.Kind() == reflect.Map {
+			// Check key type compatibility before proceeding
+			if !srcType.Key().AssignableTo(destType.Key()) {
+				// Attempt conversion if not assignable (e.g., int <-> int64)
+				// This requires more complex handling in copyMap, currently assumes assignable/convertible handled by recursive calls on keys.
+				// Let's focus on basic assignability for now.
+				// TODO: Consider adding key conversion support in copyMap if needed.
+				sc.debug("Depth %d: Map key types %s and %s are not assignable.", ctx.depth, srcType.Key(), destType.Key())
+				// Fall through, might fail later or convert if lucky
+			}
+			sc.debug("Depth %d: Dispatching to copyMap (%s <- %s)", ctx.depth, destType, srcType)
+			return sc.copyMap(dest, src, ctx)
+		}
+		if src.Kind() == reflect.Struct {
+			// Check map key type compatibility before proceeding
+			if destType.Key().Kind() != reflect.String {
+				err := ErrMapKeyNotString
+				if sc.handlePotentialError(err, ctx) {
+					return nil
+				}
+				return err
+			}
+			sc.debug("Depth %d: Dispatching to copyStructToMap (%s <- %s)", ctx.depth, destType, srcType)
+			return sc.copyStructToMap(dest, src, ctx)
+		}
+		// Fall through to mismatch error
+
+	case reflect.Ptr:
+		// Destination is a pointer. Source can be pointer or value.
+		// Use the *original* source value here, as copyPtr handles dereferencing.
+		sc.debug("Depth %d: Dispatching to copyPtr (%s <- %s)", ctx.depth, destType, originalSrc.Type())
+		return sc.copyPtr(dest, originalSrc, ctx) // Pass original source
+
+	case reflect.Interface:
+		// Destination is an interface. Source can be anything.
+		// Use the *original* source value here as copyInterface handles interfaces/values.
+		sc.debug("Depth %d: Dispatching to copyInterface (%s <- %s)", ctx.depth, destType, originalSrc.Type())
+		return sc.copyInterface(dest, originalSrc, ctx) // Pass original source
+
+	case reflect.Array:
+		// Source must be Array
+		if src.Kind() == reflect.Array {
+			sc.debug("Depth %d: Dispatching to copyArray (%s <- %s)", ctx.depth, destType, srcType)
+			return sc.copyArray(dest, src, ctx)
+		}
+		// Fall through to mismatch error
+
+	// --- Basic Kind Assignment ---
+	// Handle primitive types and string where direct assignment or conversion might work.
+	// This handles cases where tryConvert didn't apply earlier (e.g. types were identical but
+	// one of the complex handlers above didn't match).
+	default:
+		if srcType.AssignableTo(destType) {
+			sc.debug("Depth %d: Assigning %s to %s directly.", ctx.depth, srcType, destType)
+			if !sc.overwrite && dest.IsValid() && !isEmptyValue(dest) {
+				sc.debug(" -> Skipping assignment: overwrite=false and destination is non-empty")
+				return nil
+			}
 			dest.Set(src)
 			return nil
 		}
+		// Conversion already attempted by tryConvert earlier if types didn't match.
+		// If we reach here, it means types match OR conversion failed OR
+		// it's a kind mismatch not handled above (e.g., struct -> slice).
 	}
 
-	// 2. Unsafe Memory Copy (if enabled, suitable, and configured)
-	destInfo := sc.getTypeInfo(destType)
-	if sc.useUnsafe && destType == srcType && destInfo.canMemCopy {
-		// Check if unexported fields prevent memcopy unless allowed
-		containsUnexported := hasUnexportedFields(destType) // Check destination type
-		if !containsUnexported || (sc.copyUnexported && sc.useUnsafe) {
-			if dest.CanAddr() && src.CanAddr() {
-				copyErr := sc.unsafeMemCopy(dest, src, destInfo)
-				if copyErr == nil {
-					sc.debug("Depth %d: Unsafe memory copy successful for %s", ctx.depth, destType)
-					return nil
-				}
-				sc.debug("Depth %d: Unsafe memory copy failed: %v. Falling back.", ctx.depth, copyErr)
-				// Fall through to reflection copy if memcopy failed unexpectedly
-			} else {
-				sc.debug("Depth %d: Skipping unsafe memory copy for %s (dest or src not addressable)", ctx.depth, destType)
-			}
-		} else {
-			sc.debug("Depth %d: Skipping unsafe memory copy for %s due to unexported fields and config", ctx.depth, destType)
-		}
+	// --- Mismatch Error ---
+	err := fmt.Errorf("%w: cannot copy %s (kind %s) to %s (kind %s) at depth %d",
+		ErrTypeMismatch, srcType, src.Kind(), destType, dest.Kind(), ctx.depth-1) // depth-1 for user context
+	if sc.handlePotentialError(err, ctx) {
+		return nil
 	}
-
-	// 3. Type Conversion (Custom or Go built-in)
-	// Try conversion only if direct assignment didn't work
-	if srcType != destType {
-		converted, convErr := sc.tryConvert(src, destType)
-		if convErr == nil {
-			if dest.CanSet() { // Check again just in case
-				sc.debug("Depth %d: Setting converted type %s to %s", ctx.depth, converted.Type(), destType)
-				dest.Set(converted)
-				return nil
-			}
-		} else if !errors.Is(convErr, ErrNoConverter) {
-			// If conversion failed for a reason other than no converter found
-			err = fmt.Errorf("type conversion failed from %s to %s: %w", srcType, destType, convErr)
-			if sc.handlePotentialError(err, ctx) {
-				return nil
-			}
-			return err
-		}
-		// If no converter and types differ, fall through to kind-specific logic
-		sc.debug("Depth %d: No direct assignment or conversion for %s -> %s. Trying kind-specific copy.", ctx.depth, srcType, destType)
-	}
-
-	// --- Kind-Specific Copy Logic ---
-	ctx.depth++ // Increment depth for recursive calls
-	sc.debug("Depth %d: Entering kind-specific copy for Dest: %s(%v) <- Src: %s(%v)", ctx.depth, destType, dest.Kind(), srcType, src.Kind())
-
-	var copyErr error
-	switch destKind := dest.Kind(); destKind {
-	case reflect.Struct:
-		srcKind := src.Kind()
-		if srcKind == reflect.Struct {
-			copyErr = sc.copyStruct(dest, src, ctx, destInfo)
-		} else if srcKind == reflect.Map {
-			copyErr = sc.copyMapToStruct(dest, src, ctx, destInfo)
-		} else {
-			copyErr = fmt.Errorf("%w: cannot copy %s to struct %s", ErrTypeMismatch, srcKind, destKind)
-		}
-	case reflect.Slice:
-		if src.Kind() == reflect.Slice {
-			copyErr = sc.copySlice(dest, src, ctx)
-		} else {
-			copyErr = fmt.Errorf("%w: cannot copy %s to slice %s", ErrTypeMismatch, src.Kind(), destKind)
-		}
-	case reflect.Map:
-		srcKind := src.Kind()
-		if srcKind == reflect.Map {
-			copyErr = sc.copyMap(dest, src, ctx)
-		} else if srcKind == reflect.Struct {
-			copyErr = sc.copyStructToMap(dest, src, ctx)
-		} else {
-			copyErr = fmt.Errorf("%w: cannot copy %s to map %s", ErrTypeMismatch, srcKind, destKind)
-		}
-	case reflect.Ptr:
-		// Source was already dereferenced if it was a pointer.
-		// We are copying the underlying value *into* the destination pointer's element.
-		copyErr = sc.copyPtr(dest, src, ctx)
-	case reflect.Interface:
-		copyErr = sc.copyInterface(dest, src, ctx)
-	case reflect.Array:
-		if src.Kind() == reflect.Array {
-			copyErr = sc.copyArray(dest, src, ctx)
-		} else {
-			copyErr = fmt.Errorf("%w: cannot copy %s to array %s", ErrTypeMismatch, src.Kind(), destKind)
-		}
-	default: // Handle basic types (int, string, bool, etc.)
-		// We should have already handled assignable/convertible cases.
-		// This path might be hit if types are fundamentally different but share a base kind.
-		// Or if CanSet() was false earlier but somehow became true (unlikely).
-		if dest.CanSet() {
-			// Re-attempt conversion as a last resort for basic kinds
-			converted, convErr := sc.tryConvert(src, destType)
-			if convErr == nil && converted.IsValid() {
-				sc.debug("Depth %d: Default copy: Setting converted type %s to %s (via tryConvert)", ctx.depth-1, converted.Type(), destType)
-				dest.Set(converted)
-			} else {
-				copyErr = fmt.Errorf("%w: unhandled default kind copy from %s (%s) to %s (%s), convErr=%v", ErrTypeMismatch, srcType, src.Kind(), destType, destKind, convErr)
-			}
-		} else {
-			// If somehow dest became non-settable again
-			copyErr = fmt.Errorf("cannot set basic kind %s (value %v) from source type %s", destKind, dest, srcType)
-		}
-	}
-	ctx.depth-- // Decrement depth after returning from recursive call
-
-	// Handle errors from kind-specific logic
-	if copyErr != nil {
-		if sc.handlePotentialError(copyErr, ctx) {
-			return nil // Error was collected
-		}
-		return copyErr // Propagate error
-	}
-
-	sc.debug("Depth %d: Exit copyRecursive: Dest: %s(%v) <- Src: %s(%v)", ctx.depth, destType, dest.Kind(), srcType, src.Kind())
-	return nil // Success
+	return err
 }
 
-// --- Helper Functions ---
-
+// hasUnexportedFields checks if a struct type contains unexported fields.
+// Note: Currently unused, but could be useful for optimizations or checks.
 func hasUnexportedFields(typ reflect.Type) bool {
 	if typ.Kind() != reflect.Struct {
 		return false
 	}
 	for i := 0; i < typ.NumField(); i++ {
-		// PkgPath is empty for exported fields, non-empty for unexported.
-		if typ.Field(i).PkgPath != "" {
+		if !typ.Field(i).IsExported() { // Use IsExported() for clarity
 			return true
 		}
 	}
 	return false
 }
 
-// --- Unsafe & Type Info ---
-
+// unsafeMemCopy performs a raw memory copy using unsafe.
+// WARNING: Use with extreme caution. Only safe for types without pointers
+// or when the pointer semantics are intentionally being duplicated bit-for-bit.
+// Relies on the caller ensuring src and dest are addressable and types are compatible.
 func (sc *SmartCopier) unsafeMemCopy(dest, src reflect.Value, info *typeInfo) error {
-	// Ensure addresses are valid
+	// Basic safety checks (should be guaranteed by caller, but double-check)
 	if !dest.CanAddr() || !src.CanAddr() {
-		return fmt.Errorf("cannot perform memcopy on unaddressable values")
+		return fmt.Errorf("internal error: unsafeMemCopy called on non-addressable values (%s / %s)", dest.Type(), src.Type())
 	}
+	if info.size == 0 {
+		return nil // Nothing to copy
+	}
+	if info.containsPtrs {
+		// Maybe add a specific option to allow unsafe copy even with pointers?
+		// For now, assume it's only called when containsPtrs is false (via isMemCopySuitable).
+		sc.debug("Warning: Attempting unsafeMemCopy on type %s which may contain pointers. This is generally unsafe.", dest.Type())
+		// return fmt.Errorf("unsafeMemCopy rejected for type %s containing pointers", dest.Type())
+	}
+
 	destPtr := unsafe.Pointer(dest.UnsafeAddr())
 	srcPtr := unsafe.Pointer(src.UnsafeAddr())
 	size := info.size
-	if size == 0 {
-		return nil // Nothing to copy
-	}
 
-	// Use a buffer from the pool? Might be overkill for small structs. Direct memmove is usually fine.
-	// buf := sc.bufferPool.Get().([]byte)
-	// if uintptr(len(buf)) < size {
-	//  sc.bufferPool.Put(buf) // Put back small buffer
-	//  buf = make([]byte, size)
-	// } else {
-	//  buf = buf[:size]
-	// }
-	// // Copy src to buffer, then buffer to dest? Or direct memmove?
-	// // Direct memmove is simpler and likely faster unless dealing with overlapping memory regions (not typical here).
-	// sc.bufferPool.Put(buf) // Ensure buffer is returned
+	sc.debug("Performing unsafe memory copy: %d bytes from %s (addr %p) to %s (addr %p)", size, src.Type(), srcPtr, dest.Type(), destPtr)
 
+	// Use a buffer from the pool for potentially larger copies?
+	// Or just use direct memmove? Direct memmove is likely fine.
+	// The buffer pool was likely intended for temporary byte slices during conversion, not memcopy.
 	memmove(destPtr, srcPtr, size)
-	// Keep alive might not be strictly necessary if pointers don't escape,
-	// but safer esp. with unsafe operations.
+
+	// Keep the Go objects alive until the memmove is complete.
 	runtime.KeepAlive(dest.Interface())
 	runtime.KeepAlive(src.Interface())
 	return nil
 }
 
+// --- Type Info Caching ---
+
+// getTypeInfo retrieves cached reflection info for a type, or generates and caches it.
 func (sc *SmartCopier) getTypeInfo(typ reflect.Type) *typeInfo {
+	// Check cache first
 	if cached, ok := sc.typeInfoCache.Load(typ); ok {
 		return cached.(*typeInfo)
 	}
 
+	// Not in cache, analyze the type
+	sc.debug("Analyzing type %s for cache", typ)
 	info := &typeInfo{
 		size:         typ.Size(),
 		alignment:    uintptr(typ.Align()),
@@ -980,9 +1037,10 @@ func (sc *SmartCopier) getTypeInfo(typ reflect.Type) *typeInfo {
 		isPtr:        typ.Kind() == reflect.Ptr,
 		isInterface:  typ.Kind() == reflect.Interface,
 	}
-	// Determine if memory copy is suitable based on type structure (no pointers)
+	// Determine if memory copy is generally suitable for this type
 	info.canMemCopy = isMemCopySuitable(typ)
 
+	// If it's a struct, analyze fields
 	if info.isStruct {
 		info.fields = make(map[string]fieldInfo)
 		numFields := typ.NumField()
@@ -990,11 +1048,11 @@ func (sc *SmartCopier) getTypeInfo(typ reflect.Type) *typeInfo {
 			field := typ.Field(i)
 			fieldName := field.Name
 			tagVal := field.Tag.Get(sc.tagName)
-			tagOpts := parseTagOptions(tagVal) // Use refined tag parsing
-			sc.debug("Parsed tag '%s' for field %s: %v", tagVal, fieldName, tagOpts)
+			tagOpts := parseTagOptions(tagVal)
+			// sc.debug("  Field %s (%s): Tag '%s' -> Options %v", fieldName, field.Type, tagVal, tagOpts)
 
-			isExported := field.PkgPath == ""
-			// Field is settable if exported OR if unexported copy is enabled via unsafe
+			isExported := field.IsExported()
+			// Field is settable if exported OR if unexported copying is enabled via unsafe
 			canSet := isExported || (sc.copyUnexported && sc.useUnsafe)
 
 			fInfo := fieldInfo{
@@ -1003,132 +1061,155 @@ func (sc *SmartCopier) getTypeInfo(typ reflect.Type) *typeInfo {
 				index:       field.Index,
 				offset:      field.Offset,
 				typ:         field.Type,
-				canSet:      canSet,
+				canSet:      canSet, // Store calculated settability
 				tagOpts:     tagOpts,
 			}
-			info.fields[fieldName] = fInfo
 
-			// Check for the unmapped field tag
+			info.fields[fieldName] = fInfo
+			if tagName, ok := tagOpts["name"]; ok {
+				if info.nameToField == nil {
+					info.nameToField = make(map[string]fieldInfo)
+				}
+				info.nameToField[tagName] = fInfo
+			}
+
+			// Check for 'unmapped' tag
 			if _, isUnmapped := tagOpts["unmapped"]; isUnmapped {
 				fieldType := field.Type
-				// Field must be map[string]interface{} or map[string]any
-				if fieldType.Kind() == reflect.Map &&
+				// Validate type: must be map[string]any or map[string]interface{}
+				isValidUnmappedType := fieldType.Kind() == reflect.Map &&
 					fieldType.Key().Kind() == reflect.String &&
-					(fieldType.Elem().Kind() == reflect.Interface || fieldType.Elem().Kind() == reflect.Invalid) { // Allow any/interface{}
+					(fieldType.Elem().Kind() == reflect.Interface || // map[string]interface{}
+						fieldType.Elem().Kind() == reflect.Invalid) // map[string]any (Elem returns Invalid kind)
+
+				if isValidUnmappedType {
 					if info.unmappedField == nil {
-						info.unmappedField = &fInfo
-						sc.debug("Found unmapped field '%s' in type %s", fieldName, typ)
+						info.unmappedField = &fInfo // Store pointer to the fieldInfo
+						sc.debug("  Found valid 'unmapped' field '%s' in type %s", fieldName, typ)
 					} else {
-						// Log warning about multiple unmapped fields, only the first found is used
+						// Log warning if multiple unmapped fields are found
 						log.Printf("[mm copier warning] Multiple fields tagged 'unmapped' in type %s. Using '%s', ignoring '%s'.", typ, info.unmappedField.name, fieldName)
 					}
 				} else {
-					// Log warning about invalid type for unmapped field
+					// Log warning if the type is incorrect
 					log.Printf("[mm copier warning] Field '%s' in type %s tagged 'unmapped' has invalid type %s. It must be map[string]interface{} or map[string]any. Ignoring tag.", fieldName, typ, fieldType)
 				}
 			}
 		}
 	}
 
+	// Store in cache (LoadOrStore handles race condition)
 	actual, _ := sc.typeInfoCache.LoadOrStore(typ, info)
 	return actual.(*typeInfo)
 }
 
-// isMemCopySuitable checks if the raw memory layout is safe to copy directly.
-// Generally true for primitive types and arrays/structs containing only such types.
+// isMemCopySuitable checks if a type is suitable for direct memory copying.
+// Generally true for primitive types, arrays of primitives, and structs
+// containing only memcopy-suitable types (no pointers, interfaces, maps, etc.).
 func isMemCopySuitable(typ reflect.Type) bool {
 	switch typ.Kind() {
-	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
-		return true
+		reflect.Float32, reflect.Float64,
+		reflect.Complex64, reflect.Complex128:
+		return true // Primitive types are safe
 	case reflect.Array:
 		// Array is suitable if its element type is suitable
 		return isMemCopySuitable(typ.Elem())
 	case reflect.Struct:
-		// Struct is suitable only if it contains NO pointers anywhere
+		// Struct is suitable only if it does NOT contain pointers (or types that hide pointers)
 		return !checkContainsPointers(typ)
 	default:
-		// Pointers, slices, maps, channels, funcs, interfaces, strings are NOT suitable
+		// Pointers, slices, maps, chans, funcs, interfaces, strings contain pointers or internal structure
 		return false
 	}
 }
 
-// checkContainsPointers recursively checks if a type contains any pointer types,
-// including slice, map, chan, func, interface, string headers, or actual pointers.
+// checkContainsPointers recursively checks if a type contains any pointers,
+// including those hidden within slices, maps, interfaces, or strings.
 func checkContainsPointers(typ reflect.Type) bool {
 	switch typ.Kind() {
 	case reflect.Ptr, reflect.UnsafePointer,
-		reflect.Map, reflect.Slice, // These contain internal pointers
-		reflect.Chan, reflect.Func, // These are pointers
-		reflect.Interface, // Contains type and data pointers
-		reflect.String:    // Contains data pointer
+		reflect.Map, reflect.Slice, // These inherently contain pointers
+		reflect.Chan, reflect.Func, // Contain pointers internally
+		reflect.Interface, // Can contain pointers
+		reflect.String:    // Contains a pointer to data
 		return true
 	case reflect.Array:
-		// Array contains pointers if its element type does
+		// Array contains pointers if its element type contains pointers
 		return checkContainsPointers(typ.Elem())
 	case reflect.Struct:
-		// Struct contains pointers if any of its fields do
+		// Struct contains pointers if any of its fields contain pointers
 		for i := 0; i < typ.NumField(); i++ {
 			if checkContainsPointers(typ.Field(i).Type) {
 				return true
 			}
 		}
-		return false
+		return false // No pointer fields found
 	default:
-		// Basic types (int, float, bool, complex) do not contain pointers
+		// Other kinds (primitives) do not contain pointers
 		return false
 	}
 }
 
-// --- Kind-Specific Copy Logic ---
-
-// getSettableFieldValue returns a settable reflect.Value for a struct field.
-// It handles exported fields directly and attempts unsafe access for unexported
-// fields if sc.copyUnexported and sc.useUnsafe are enabled.
-// Returns an invalid reflect.Value if the field cannot be made settable.
+// getSettableFieldValue attempts to get a settable reflect.Value for a struct field,
+// using unsafe access if necessary and configured. Returns zero reflect.Value if not possible.
 func (sc *SmartCopier) getSettableFieldValue(structVal reflect.Value, fInfo *fieldInfo) reflect.Value {
+	// Try standard FieldByIndex first
 	fieldVal := structVal.FieldByIndex(fInfo.index)
 
-	// If exported and settable via reflection, return it
-	if fieldVal.CanSet() {
+	// If standard access works and it's settable, return it
+	if fieldVal.IsValid() && fieldVal.CanSet() {
 		return fieldVal
 	}
 
-	// If unexported, attempt unsafe access ONLY if configured
-	isUnexported := fInfo.structField.PkgPath != ""
+	// Standard access failed or field not settable. Try unsafe if applicable.
+	// Need copyUnexported=true, useUnsafe=true, and field must be unexported.
+	isUnexported := !fInfo.structField.IsExported()
 	if isUnexported && sc.copyUnexported && sc.useUnsafe {
+		// Need the struct itself to be addressable to calculate field address
 		if structVal.CanAddr() {
-			fieldPtr := unsafe.Pointer(structVal.UnsafeAddr() + fInfo.offset)
-			// Use reflect.NewAt to create a settable Value pointing to the field's memory
-			// Elem() gets the actual value wrapper from the pointer wrapper NewAt creates.
-			unsafeFieldVal := reflect.NewAt(fInfo.typ, fieldPtr).Elem()
+			// Calculate pointer to the field using offset
+			// Ensure field offset is valid (should be non-negative)
+			if fInfo.offset >= 0 {
+				fieldPtr := unsafe.Pointer(structVal.UnsafeAddr() + fInfo.offset)
+				// Create a reflect.Value pointing to this memory location with the correct type
+				// Use reflect.NewAt(typ, ptr).Elem() to get the value itself
+				unsafeFieldVal := reflect.NewAt(fInfo.typ, fieldPtr).Elem()
 
-			// Double-check if the unsafely obtained value is indeed settable
-			if unsafeFieldVal.CanSet() {
-				sc.debug("Field '%s': unsafe access successful, field is settable.", fInfo.name)
-				return unsafeFieldVal
+				// Check if the unsafely accessed value is settable (it should be)
+				if unsafeFieldVal.IsValid() && unsafeFieldVal.CanSet() {
+					sc.debug("Unsafe access: field '%s' is settable via unsafe ptr %p", fInfo.name, fieldPtr)
+					return unsafeFieldVal
+				} else {
+					sc.debug("Unsafe access: field '%s' value created via unsafe ptr %p is not settable (unexpected)", fInfo.name, fieldPtr)
+				}
+			} else {
+				sc.debug("Unsafe access: field '%s' has invalid offset %d", fInfo.name, fInfo.offset)
 			}
-			sc.debug("Field '%s': unsafe access attempted but resulting value is not settable.", fInfo.name)
 		} else {
-			sc.debug("Field '%s': unsafe access skipped because struct is not addressable.", fInfo.name)
+			sc.debug("Unsafe access: cannot get address of struct %s to access unexported field '%s'", structVal.Type(), fInfo.name)
 		}
 	}
 
-	// If we reach here, the field is not settable (either unexported without permission, or reflection failed)
-	sc.debug("Field '%s': cannot get settable value (Exported: %t, CanSet: %t, Unsafe/Unexported: %t)",
-		fInfo.name, fInfo.structField.PkgPath == "", fieldVal.CanSet(), sc.copyUnexported && sc.useUnsafe)
-	return reflect.Value{} // Return invalid value
+	// If we reach here, the field is not settable
+	sc.debug("Field '%s' in %s is not settable (Exported: %t, CanSet: %t, Unsafe Enabled: %t, Field Unexported: %t)",
+		fInfo.name, structVal.Type(), fInfo.structField.IsExported(), fieldVal.IsValid() && fieldVal.CanSet(), sc.copyUnexported && sc.useUnsafe, isUnexported)
+	return reflect.Value{} // Return zero value to indicate failure
 }
 
-// copyPtr handles copying *into* a destination pointer.
-// The `src` value is the concrete value to be copied (already dereferenced if it was a pointer).
-func (sc *SmartCopier) copyPtr(dest, src reflect.Value, ctx *copyContext) error {
-	destType := dest.Type()         // This is the pointer type (e.g., *SimpleDest)
-	destElemType := destType.Elem() // This is the element type (e.g., SimpleDest)
+// --- Specific Kind Copy Functions ---
+
+func (sc *SmartCopier) copyPtr(dest, src reflect.Value, ctx *mmContext) error {
+	destType := dest.Type()         // e.g., *DestType
+	destElemType := destType.Elem() // e.g., DestType
+
 	sc.debug("Depth %d: copyPtr: Dest: %s <- Src: %s", ctx.depth, destType, src.Type())
 
+	// --- Basic Checks ---
 	if !dest.CanSet() {
+		// Should have been caught earlier, but defense-in-depth
 		err := fmt.Errorf("cannot set destination pointer %s", destType)
 		if sc.handlePotentialError(err, ctx) {
 			return nil
@@ -1136,663 +1217,716 @@ func (sc *SmartCopier) copyPtr(dest, src reflect.Value, ctx *copyContext) error 
 		return err
 	}
 
-	// If source value is invalid (e.g. from nil interface elem), potentially zero dest pointer
+	// --- Handle Nil Source ---
+	// src might be the original value (e.g., *SrcType) or already dereferenced (e.g., SrcType)
+	// Check original source kind and nilness if possible, otherwise check current src
+	isSrcNil := false
 	if !src.IsValid() {
+		isSrcNil = true
+	} else {
+		kind := src.Kind()
+		if kind == reflect.Ptr || kind == reflect.Interface || kind == reflect.Map || kind == reflect.Slice || kind == reflect.Chan || kind == reflect.Func {
+			if src.IsNil() {
+				isSrcNil = true
+			}
+		}
+		// If src is not a nillable kind, it cannot be nil.
+	}
+
+	if isSrcNil {
 		if sc.skipNilSrc {
+			sc.debug(" -> Source is nil, skipNilSrc=true, skipping ptr set.", ctx.depth)
 			return nil
-		} // Already checked earlier but good defense
+		}
 		if sc.overwrite {
-			sc.debug("Depth %d: Source value is invalid, zeroing destination pointer %s", ctx.depth, destType)
-			dest.Set(reflect.Zero(destType)) // Set pointer to nil
+			sc.debug(" -> Source is nil, skipNilSrc=false, overwrite=true. Setting dest ptr %s to nil.", ctx.depth, destType)
+			dest.Set(reflect.Zero(destType)) // Set pointer itself to nil
+		} else {
+			sc.debug(" -> Source is nil, skipNilSrc=false, overwrite=false. Leaving dest ptr %s unchanged.", ctx.depth, destType)
 		}
-		return nil
+		return nil // Handled nil source
 	}
 
-	// Allocate destination pointer if it's nil
+	// --- Prepare Destination Pointer ---
+	// If destination pointer is nil, create a new value for it to point to.
 	if dest.IsNil() {
-		sc.debug("Depth %d: Allocating new pointer for destination %s", ctx.depth, destType)
-		newDestPtr := reflect.New(destElemType) // Create new *SimpleDest
-		dest.Set(newDestPtr)                    // Assign the new pointer to the destination field/variable
+		sc.debug(" -> Dest ptr is nil. Creating new %s.", ctx.depth, destElemType)
+		newPtr := reflect.New(destElemType) // Creates *DestType
+		dest.Set(newPtr)                    // Assign the new pointer to the destination field/variable
 	} else if !sc.overwrite {
-		// If dest pointer exists and we are not overwriting, do nothing more.
-		// The value it points to remains unchanged.
-		sc.debug("Depth %d: Skipping pointer element copy as !overwrite and destination pointer %s is not nil", ctx.depth, destType)
+		// Destination pointer exists, and we are not overwriting. Stop here.
+		sc.debug(" -> Dest ptr exists, overwrite=false. Skipping ptr element copy.", ctx.depth)
 		return nil
 	}
-	// If dest is not nil AND overwrite is true, we proceed to copy into dest.Elem()
+	// Now, dest points to a valid, settable DestType value.
 
-	// Get the element the destination pointer points to
-	destElem := dest.Elem()
-	if !destElem.IsValid() {
-		// Should not happen if dest.Set(reflect.New(...)) worked or if dest was non-nil initially
-		err := fmt.Errorf("internal error: dest pointer elem invalid for %s after allocation/check", destType)
-		if sc.handlePotentialError(err, ctx) {
-			return nil
-		}
-		return err
-	}
+	// --- Get Settable Element and Source Element ---
+	destElem := dest.Elem() // Get the value pointed to (DestType)
 	if !destElem.CanSet() {
-		// This usually means the pointer itself was unexported or part of an unexported chain.
-		err := fmt.Errorf("destination pointer element %s is not settable", destElem.Type())
+		// This should ideally not happen if dest.Set worked, but check defensively
+		err := fmt.Errorf("destination pointer element %s is not settable (after New/Set)", destElem.Type())
 		if sc.handlePotentialError(err, ctx) {
 			return nil
 		}
 		return err
 	}
 
-	sc.debug("Depth %d: Recursively copying element for pointer Dest Elem: %s <- Src: %s", ctx.depth, destElem.Type(), src.Type())
-	// Recursively copy the source value into the destination element
-	return sc.copyRecursive(destElem, src, ctx)
+	// Dereference source *if* it's still a pointer (it might have been dereferenced by copyRecursive)
+	srcElem := src
+	if src.Kind() == reflect.Ptr { // No need to check IsNil again, handled above
+		srcElem = src.Elem()
+	}
+
+	// --- Recursive Copy into Element ---
+	sc.debug(" -> Recursively copying source element %s into dest element %s", ctx.depth, srcElem.Type(), destElem.Type())
+	if err := sc.copyRecursive(destElem, srcElem, ctx); err != nil {
+		// Error handled by copyRecursive or needs bubbling up
+		return fmt.Errorf("copying pointer element %s <- %s: %w", destElem.Type(), srcElem.Type(), err)
+	}
+
+	return nil
 }
 
-func (sc *SmartCopier) copyStruct(dest, src reflect.Value, ctx *copyContext, destInfo *typeInfo) error {
-	sc.debug("Depth %d: copyStruct: Dest: %s <- Src: %s", ctx.depth, dest.Type(), src.Type())
+func (sc *SmartCopier) copyStruct(dest, src reflect.Value, ctx *mmContext, destInfo *typeInfo) error {
 	srcInfo := sc.getTypeInfo(src.Type())
-	usedSrcFields := make(map[string]struct{}) // Track source fields copied to handle unmapped ones
+	sc.debug("Depth %d: copyStruct: Dest: %s <- Src: %s", ctx.depth, dest.Type(), src.Type())
 
-	// --- Handle Unmapped Field Initialization ---
-	var unmappedMap reflect.Value
-	var unmappedValueType reflect.Type
-	var unmappedFieldName string = "<none>"
+	// --- Optimization: Memory Copy ---
+	// If types are identical, no special handling needed (tags, skip, formatters),
+	// and type is suitable, perform a faster memory copy.
+	// Requires careful consideration: Tags, skips, formatters, converters, unmapped fields must be bypassed.
+	// This optimization is complex to get right with all features. Disable for now.
+	// TODO: Revisit memcopy optimization if performance is critical.
+	// if sc.useUnsafe && dest.Type() == src.Type() && destInfo.canMemCopy /* && !hasSpecialHandling(...) */ {
+	// 	sc.debug(" -> Attempting unsafe memory copy for struct %s", dest.Type())
+	// 	err := sc.unsafeMemCopy(dest, src, destInfo)
+	// 	if err == nil {
+	// 		return nil // Memcopy successful
+	// 	}
+	// 	sc.debug(" -> Unsafe memory copy failed: %v. Falling back to field-by-field.", err)
+	// }
+
+	// --- Field-by-Field Copy ---
+	usedSrcFields := make(map[string]struct{}) // Track which source fields were used for mapping/copying
+
+	// --- Prepare Unmapped Field Handling (Destination) ---
+	var unmappedDestMap reflect.Value
+	var unmappedDestValueType reflect.Type
+	var unmappedDestFieldName string
 	if destInfo.unmappedField != nil {
-		fieldInfo := destInfo.unmappedField
-		unmappedFieldName = fieldInfo.name
-		unmappedMap = sc.getSettableFieldValue(dest, fieldInfo) // Get the map field value
-		if unmappedMap.IsValid() {
-			if !unmappedMap.CanSet() {
-				// Should not happen if getSettableFieldValue worked, but check defensively
-				sc.debug("-> Warning: Unmapped field '%s' retrieved but cannot be set. Ignoring.", unmappedFieldName)
-				unmappedMap = reflect.Value{} // Invalidate it
-			} else if unmappedMap.IsNil() {
-				// Initialize the map if it's nil and we can set it
-				sc.debug("-> Initializing unmapped field map '%s' (%s)", unmappedFieldName, fieldInfo.typ)
-				unmappedMap.Set(reflect.MakeMap(fieldInfo.typ))
-			}
-			if unmappedMap.IsValid() {
-				unmappedValueType = fieldInfo.typ.Elem() // Get map value type (e.g., interface{})
+		unmappedDestFieldName = destInfo.unmappedField.name
+		// Get the map field value. Must be settable.
+		mapFieldVal := sc.getSettableFieldValue(dest, destInfo.unmappedField)
+		if mapFieldVal.IsValid() { // Checks CanSet implicitly via getSettableFieldValue
+			// Ensure it's the correct type (already checked in getTypeInfo, but double-check kind)
+			if mapFieldVal.Kind() == reflect.Map {
+				// If nil, create the map
+				if mapFieldVal.IsNil() {
+					sc.debug(" -> Initializing nil 'unmapped' field '%s'", unmappedDestFieldName)
+					mapFieldVal.Set(reflect.MakeMap(mapFieldVal.Type()))
+				}
+				unmappedDestMap = mapFieldVal
+				unmappedDestValueType = mapFieldVal.Type().Elem() // e.g., interface{} or any
+				sc.debug(" -> Will collect unmapped fields into '%s' (type %s)", unmappedDestFieldName, mapFieldVal.Type())
+			} else {
+				// This case should have been caught by the warning in getTypeInfo
+				sc.debug(" -> 'unmapped' field '%s' is not a map, ignoring.", unmappedDestFieldName)
 			}
 		} else {
-			sc.debug("-> Cannot get settable value for unmapped field '%s'. Unmapped source fields will be ignored.", unmappedFieldName)
-			// Keep unmappedMap invalid
+			sc.debug(" -> 'unmapped' field '%s' is not settable, cannot collect.", unmappedDestFieldName)
 		}
 	}
 
-	// --- Build Source Tag Mapping ---
-	// Map source field names to the destination field name specified in the source tag `mm:"DestName"`
-	srcTagToDestName := make(map[string]string)
-	for srcFName, sfInfo := range srcInfo.fields {
-		if tagName, ok := sfInfo.tagOpts["name"]; ok { // Name is explicitly provided in source tag
-			srcTagToDestName[srcFName] = tagName
-		}
-	}
+	// --- Iterate Through Destination Fields ---
+	for destFieldName, destFieldInfo := range destInfo.fields {
+		sc.debug("  Processing dest field: %s", destFieldName)
 
-	// --- Iterate Over Destination Fields ---
-	for destFieldName, dfInfo := range destInfo.fields {
-		sc.debug("-> Processing Dest Field: '%s'", destFieldName)
-
-		// Skip the unmapped field itself
-		if unmappedMap.IsValid() && destFieldName == unmappedFieldName {
-			sc.debug("-> Skipping unmapped field '%s' itself.", destFieldName)
+		// Skip the unmapped field itself if it exists
+		if destFieldName == unmappedDestFieldName {
+			sc.debug("   - Skipping dest field '%s' (used for unmapped data)", destFieldName)
 			continue
 		}
 
-		// --- Check Skip Conditions (Global, Tags) ---
-		if _, shouldSkip := sc.skipFields[destFieldName]; shouldSkip {
-			sc.debug("-> Skip: Global config for dest field '%s'", destFieldName)
-			continue
-		}
-		// Check '-' tag on destination field
-		if _, isMinus := dfInfo.tagOpts["-"]; isMinus {
-			sc.debug("-> Skip: Dest field '%s' has '-' tag.", destFieldName)
+		// Skip based on global skip list
+		if _, skip := sc.skipFields[destFieldName]; skip {
+			sc.debug("   - Skipping dest field '%s' (global skip list)", destFieldName)
 			continue
 		}
 
-		// --- Determine Source Field Name ---
-		sourceFieldName := destFieldName // Default: Match by name
-		// 1. Check destination tag `mm:"SrcName"`
-		if srcNameFromDestTag, ok := dfInfo.tagOpts["name"]; ok {
-			sourceFieldName = srcNameFromDestTag
-			sc.debug("-> Source name mapped via dest tag: '%s' -> '%s'", sourceFieldName, destFieldName)
+		// Skip based on "-" tag
+		if _, ignore := destFieldInfo.tagOpts["-"]; ignore {
+			sc.debug("   - Skipping dest field '%s' (tag '-)", destFieldName)
+			continue
 		}
-		// 2. Check source tag `mm:"DestName"` (overrides dest tag if conflicting)
-		for srcFName, targetDestName := range srcTagToDestName {
-			if targetDestName == destFieldName {
-				sourceFieldName = srcFName
-				sc.debug("-> Source name mapped via source tag: '%s' -> '%s'", sourceFieldName, destFieldName)
-				break // Found mapping from source tag
-			}
+
+		// --- Determine Corresponding Source Field Name ---
+		// Default: Same name
+		srcFieldName := destFieldName
+		// Check destination tag "name" option
+		if tagName, ok := destFieldInfo.tagOpts["name"]; ok {
+			srcFieldName = tagName
+			sc.debug("   - Dest tag 'name' maps dest '%s' to src field '%s'", destFieldName, srcFieldName)
 		}
-		// 3. Check global config mapping (overrides tags)
-		for mapSrc, mapDst := range sc.fieldMappings {
-			if mapDst == destFieldName {
-				sourceFieldName = mapSrc
-				sc.debug("-> Source name mapped via config: '%s' -> '%s'", sourceFieldName, destFieldName)
+
+		for mapSrc, mapDest := range sc.fieldMappings {
+			if mapDest == destFieldName {
+				srcFieldName = mapSrc
 				break
 			}
 		}
 
-		// --- Get Source Field Value ---
-		sfInfo, srcFieldExists := srcInfo.fields[sourceFieldName]
-		if !srcFieldExists {
-			sc.debug("-> Skip: No source field named '%s' found for dest field '%s'", sourceFieldName, destFieldName)
-			continue
-		}
-
-		// Check if source field is unexported and if we can/should access it
-		isSrcUnexported := sfInfo.structField.PkgPath != ""
-		if isSrcUnexported && !(sc.copyUnexported && sc.useUnsafe) {
-			sc.debug("-> Skip: Source field '%s' is unexported and copyUnexported/unsafe config prevents access.", sourceFieldName)
-			continue // Skip this field
-		}
-
-		// Get the source field value (using reflection - might fail for unexported without unsafe)
-		srcField := src.FieldByIndex(sfInfo.index)
-		if !srcField.IsValid() {
-			// This might happen if FieldByIndex fails (e.g., unexported field without unsafe)
-			// We currently don't attempt unsafe *reads* reliably.
-			sc.debug("-> Skip: Could not get valid source field value for '%s' (possibly unexported without unsafe read).", sourceFieldName)
-			continue
-		}
-
-		finalSrcValue := srcField // Start with the retrieved source value
-
-		// --- Apply Source-Based Skip Conditions ('omitempty', skipZero, skipEmpty) ---
-		// These depend on the *source* value.
-		if _, omit := sfInfo.tagOpts["omitempty"]; omit && isEmptyValue(finalSrcValue) {
-			sc.debug("-> Skip: Source value for '%s' is empty and 'omitempty' tag set on source field.", sourceFieldName)
-			usedSrcFields[sourceFieldName] = struct{}{} // Mark used even if skipped by omitempty
-			continue
-		}
-		if sc.skipZeroValue && finalSrcValue.IsZero() {
-			sc.debug("-> Skip: Source field '%s' is zero-valued and skipZeroValue=true.", sourceFieldName)
-			usedSrcFields[sourceFieldName] = struct{}{}
-			continue
-		}
-		if sc.skipEmptyValue && isEmptyValue(finalSrcValue) {
-			sc.debug("-> Skip: Source field '%s' is empty and skipEmptyValue=true.", sourceFieldName)
-			usedSrcFields[sourceFieldName] = struct{}{}
-			continue
-		}
-
-		// --- Get Destination Field and Check Overwrite ---
-		destField := sc.getSettableFieldValue(dest, &dfInfo)
-		if !destField.IsValid() {
-			sc.debug("-> Skip: Cannot get settable destination field '%s' value.", destFieldName)
-			continue // Cannot proceed if destination isn't settable
-		}
-
-		// Check overwrite condition based on *destination* state and *config*
-		// Use isEmptyValue for the check, as MergeTo sets overwrite=false, skipEmpty=true
-		// and expects non-empty dest fields to be kept.
-		if !sc.overwrite && destField.IsValid() && !isEmptyValue(destField) {
-			sc.debug("-> Skip: Destination field '%s' is non-empty and overwrite=false.", destFieldName)
-			continue
-		}
-
-		// --- Apply Formatter ---
-		if formatter, ok := sc.formatters[destFieldName]; ok {
-			if finalSrcValue.CanInterface() {
-				sc.debug("-> Applying formatter to source value for field '%s'", destFieldName)
-				formattedInterface := formatter(finalSrcValue.Interface())
-				// Update finalSrcValue with the result of the formatter
-				if formattedInterface == nil {
-					// Formatter returned nil, treat as zero value for the destination type
-					finalSrcValue = reflect.Zero(dfInfo.typ) // Use dest type's zero
-				} else {
-					finalSrcValue = reflect.ValueOf(formattedInterface)
-				}
-				// Check if formatter returned a compatible type, convert if needed
-				if finalSrcValue.IsValid() && finalSrcValue.Type() != dfInfo.typ {
-					if finalSrcValue.Type().ConvertibleTo(dfInfo.typ) {
-						finalSrcValue = finalSrcValue.Convert(dfInfo.typ)
-					} else {
-						sc.debug("-> Warning: Formatter for '%s' returned incompatible type %s (expected %s). Skipping field.", destFieldName, finalSrcValue.Type(), dfInfo.typ)
-						continue // Skip if formatter result is wrong type
-					}
-				}
-			} else {
-				sc.debug("-> Warning: Cannot call Interface() on source field '%s' for formatter. Skipping formatter.", sourceFieldName)
+		// Check source's nameToField if no global mapping
+		if srcFieldName == destFieldName {
+			if srcFieldInfo, ok := srcInfo.nameToField[destFieldName]; ok {
+				srcFieldName = srcFieldInfo.name
 			}
 		}
-		// Re-check validity after formatter
-		if !finalSrcValue.IsValid() {
-			sc.debug("-> Skip: Source value became invalid after formatting for field '%s'.", destFieldName)
+
+		if _, skip := sc.skipFields[destFieldName]; skip {
+			continue // Skip this destination field
+		}
+
+		// Check global field mappings (src->dest). Does any source map to this destination?
+		// Overrides tag or default name if found.
+		for mapSrc, mapDest := range sc.fieldMappings {
+			if mapDest == destFieldName {
+				// Found a mapping: this source field `mapSrc` maps to our target dest field.
+				// So, we should look for `mapSrc` in the source struct.
+				srcFieldName = mapSrc
+				sc.debug("   - Global mapping maps src field '%s' to dest field '%s'", srcFieldName, destFieldName)
+				break // Found the relevant mapping for this destination field
+			}
+		}
+		// srcFieldName now holds the name of the source field to look for.
+
+		// --- Find Source Field Value ---
+		srcFieldInfo, srcFieldFound := srcInfo.fields[srcFieldName]
+		if !srcFieldFound {
+			sc.debug("   - No corresponding source field '%s' found. Skipping.", srcFieldName)
 			continue
+		}
+
+		// Check if source field is exported or if we can access unexported
+		isSrcUnexported := !srcFieldInfo.structField.IsExported()
+		if isSrcUnexported && !(sc.copyUnexported && sc.useUnsafe) {
+			sc.debug("   - Source field '%s' is unexported and copyUnexported=false. Skipping.", srcFieldName)
+			continue
+		}
+		// If unexported reading is enabled, try to get the value.
+		// Note: Getting unexported fields directly via reflect can be unreliable.
+		// Unsafe is needed even for reading in many cases.
+		var srcVal reflect.Value
+		if isSrcUnexported && sc.copyUnexported && sc.useUnsafe {
+			// Try unsafe reading
+			if src.CanAddr() {
+				srcFieldPtr := unsafe.Pointer(src.UnsafeAddr() + srcFieldInfo.offset)
+				srcVal = reflect.NewAt(srcFieldInfo.typ, srcFieldPtr).Elem()
+				sc.debug("   - Reading unexported src field '%s' via unsafe.", srcFieldName)
+			} else {
+				sc.debug("   - Cannot read unexported src field '%s' (struct not addressable). Skipping.", srcFieldName)
+				continue // Cannot read
+			}
+		} else if !isSrcUnexported {
+			// Read exported field normally
+			srcVal = src.FieldByIndex(srcFieldInfo.index)
+		} else {
+			// Should not happen due to check above, but defensively skip
+			continue
+		}
+
+		if !srcVal.IsValid() {
+			// This might happen if unsafe read failed or field somehow invalid
+			sc.debug("   - Source field '%s' value is invalid. Skipping.", srcFieldName)
+			continue
+		}
+
+		// Mark source field as used
+		usedSrcFields[srcFieldName] = struct{}{}
+
+		// --- Check Source Skip Conditions (omitempty, skipZero, skipEmpty) ---
+		if _, omit := srcFieldInfo.tagOpts["omitempty"]; omit && isEmptyValue(srcVal) {
+			sc.debug("   - Skipping src field '%s': 'omitempty' tag and value is empty.", srcFieldName)
+			continue
+		}
+		// Note: We use the user-configured global skipZero/skipEmpty flags *in addition* to omitempty tag.
+		if sc.skipZeroValue && srcVal.IsZero() {
+			sc.debug("   - Skipping src field '%s': skipZeroValue=true and value is zero.", srcFieldName)
+			continue
+		}
+		if sc.skipEmptyValue && isEmptyValue(srcVal) {
+			sc.debug("   - Skipping src field '%s': skipEmptyValue=true and value is empty.", srcFieldName)
+			continue
+		}
+
+		// --- Get Destination Field Value (Settable) ---
+		destVal := sc.getSettableFieldValue(dest, &destFieldInfo)
+		if !destVal.IsValid() {
+			// If getSettableFieldValue failed (e.g., dest unexported, unsafe off)
+			sc.debug("   - Destination field '%s' is not settable. Skipping.", destFieldName)
+			continue // Cannot set this destination field
+		}
+
+		// --- Check Destination Overwrite Condition ---
+		// If overwrite is disabled, check if the destination already has a non-empty value.
+		if !sc.overwrite && destVal.IsValid() && !isEmptyValue(destVal) {
+			sc.debug("   - Skipping field '%s': overwrite=false and destination is non-empty.", destFieldName)
+			continue
+		}
+
+		// --- Apply Formatter (If Applicable) ---
+		if formatter, ok := sc.formatters[destFieldName]; ok {
+			if !srcVal.CanInterface() {
+				sc.debug("   - Cannot apply formatter to field '%s': source value cannot be interfaced.", destFieldName)
+				// Proceed without formatter? Or error? Let's proceed.
+			} else {
+				formattedSrc := formatter(srcVal.Interface())
+				sc.debug("   - Applied formatter to '%s'. Result: %T (%v)", destFieldName, formattedSrc, formattedSrc)
+				// Handle nil result from formatter
+				if formattedSrc == nil {
+					if sc.overwrite { // Only zero dest if overwriting
+						sc.debug("    - Formatter returned nil. Zeroing destination field '%s'.", destFieldName)
+						destVal.Set(reflect.Zero(destVal.Type()))
+					} else {
+						sc.debug("    - Formatter returned nil. Leaving destination field '%s' unchanged (overwrite=false).", destFieldName)
+					}
+					continue // Skip recursion for this field
+				}
+				// Use the formatted value as the new source for recursion
+				srcVal = reflect.ValueOf(formattedSrc)
+				if !srcVal.IsValid() { // Should not happen if formattedSrc != nil
+					sc.debug("    - Formatted value '%s' is invalid. Skipping.", destFieldName)
+					continue
+				}
+				// Fall through to recursive copy with the new srcVal
+			}
 		}
 
 		// --- Recursive Copy ---
-		sc.debug("-> Recursing copy: Dest: %s (%s) <- Src: %s (%s)", destFieldName, destField.Type(), sourceFieldName, finalSrcValue.Type())
-		usedSrcFields[sourceFieldName] = struct{}{} // Mark source field as used before recursing
-		if err := sc.copyRecursive(destField, finalSrcValue, ctx); err != nil {
-			fieldErr := fmt.Errorf("copying field '%s' <- '%s': %w", destFieldName, sourceFieldName, err)
+		sc.debug("   - Recursively copying field '%s' <- '%s'", destFieldName, srcFieldName)
+		if err := sc.copyRecursive(destVal, srcVal, ctx); err != nil {
+			fieldErr := fmt.Errorf("copying field '%s' <- '%s': %w", destFieldName, srcFieldName, err)
 			if sc.handlePotentialError(fieldErr, ctx) {
-				continue // Continue with next field if error collected
+				continue // Error collected, continue with next field
 			}
-			return fieldErr // Propagate error if not collected
+			return fieldErr // Return immediately if not collecting errors
 		}
-	}
+	} // End loop through destination fields
 
 	// --- Handle Unmapped Source Fields ---
-	if unmappedMap.IsValid() { // Check if unmapped field/map exists and is settable
-		sc.debug("-> Processing unmapped source fields for destination map '%s'", unmappedFieldName)
-		for srcFieldName, sfInfo := range srcInfo.fields {
-			if _, used := usedSrcFields[srcFieldName]; !used {
-				sc.debug(" -> Found unmapped source field: '%s'", srcFieldName)
+	if unmappedDestMap.IsValid() {
+		sc.debug("  Checking for unmapped source fields to put into '%s'", unmappedDestFieldName)
+		for srcFieldName, srcFieldInfo := range srcInfo.fields {
+			// Skip if source field was already used for a mapped destination field
+			if _, used := usedSrcFields[srcFieldName]; used {
+				continue
+			}
+			// Skip if source field has "-" tag
+			if _, ignore := srcFieldInfo.tagOpts["-"]; ignore {
+				continue
+			}
 
-				// Check source field tags like '-', 'omitempty' for unmapped fields too
-				srcTagOpts := sfInfo.tagOpts
-				if _, isMinus := srcTagOpts["-"]; isMinus {
-					continue
-				}
-				if _, omit := srcTagOpts["omitempty"]; omit {
-					srcFieldValCheck := src.FieldByIndex(sfInfo.index)
-					if !srcFieldValCheck.IsValid() || isEmptyValue(srcFieldValCheck) {
-						sc.debug(" -> Skipping unmapped source field '%s' due to 'omitempty' tag and empty value.", srcFieldName)
-						continue
-					}
-				}
-
-				// Check if source is unexported and shouldn't be copied
-				isSrcUnexported := sfInfo.structField.PkgPath != ""
-				if isSrcUnexported && !(sc.copyUnexported && sc.useUnsafe) {
-					sc.debug(" -> Skip unmapped: Source field '%s' is unexported.", srcFieldName)
-					continue
-				}
-
-				// Get source field value
-				srcFieldVal := src.FieldByIndex(sfInfo.index)
-				if !srcFieldVal.IsValid() {
-					// Cannot read unexported without unsafe, skip.
-					sc.debug(" -> Skip unmapped: Cannot get valid value for source field '%s'.", srcFieldName)
-					continue
-				}
-
-				// Skip based on global settings if configured
-				if sc.skipZeroValue && srcFieldVal.IsZero() {
-					continue
-				}
-				if sc.skipEmptyValue && isEmptyValue(srcFieldVal) {
-					continue
-				}
-
-				// Copy the value into the unmapped map
-				mapKey := reflect.ValueOf(srcFieldName)
-				mapValue := reflect.New(unmappedValueType).Elem() // Create holder for map value (e.g., interface{})
-
-				sc.debug("  -> Recursing copy for unmapped: map['%s'] (%s) <- %s (%s)", srcFieldName, mapValue.Type(), srcFieldName, srcFieldVal.Type())
-				if err := sc.copyRecursive(mapValue, srcFieldVal, ctx); err == nil {
-					// Set the value in the map
-					unmappedMap.SetMapIndex(mapKey, mapValue)
+			// Check if source field is readable (exported or unsafe enabled)
+			isSrcUnexported := !srcFieldInfo.structField.IsExported()
+			if isSrcUnexported && !(sc.copyUnexported && sc.useUnsafe) {
+				continue // Cannot read unexported source
+			}
+			// Get source value (handle unsafe if needed)
+			var srcVal reflect.Value
+			if isSrcUnexported {
+				if src.CanAddr() {
+					srcFieldPtr := unsafe.Pointer(src.UnsafeAddr() + srcFieldInfo.offset)
+					srcVal = reflect.NewAt(srcFieldInfo.typ, srcFieldPtr).Elem()
 				} else {
-					unmappedErr := fmt.Errorf("copying unmapped source field '%s' to map '%s': %w", srcFieldName, unmappedFieldName, err)
-					if sc.handlePotentialError(unmappedErr, ctx) {
-						continue // Collect and continue
-					}
-					return unmappedErr // Propagate
+					continue // Cannot read
+				}
+			} else {
+				srcVal = src.FieldByIndex(srcFieldInfo.index)
+			}
+
+			if !srcVal.IsValid() {
+				continue
+			}
+
+			// Skip based on omitempty, skipZero, skipEmpty
+			if _, omit := srcFieldInfo.tagOpts["omitempty"]; omit && isEmptyValue(srcVal) {
+				continue
+			}
+			if sc.skipZeroValue && srcVal.IsZero() {
+				continue
+			}
+			if sc.skipEmptyValue && isEmptyValue(srcVal) {
+				continue
+			}
+
+			// Determine the key for the unmapped map (usually the source field name)
+			mapKey := reflect.ValueOf(srcFieldName)               // Key is string
+			mapValue := reflect.New(unmappedDestValueType).Elem() // Create value of map's elem type
+
+			sc.debug("   - Copying unmapped src field '%s' into map key '%s'", srcFieldName, srcFieldName)
+			// Recursively copy the source value into the newly created map value holder
+			if err := sc.copyRecursive(mapValue, srcVal, ctx); err != nil {
+				mapErr := fmt.Errorf("copying unmapped field '%s' to map key '%s': %w", srcFieldName, srcFieldName, err)
+				if sc.handlePotentialError(mapErr, ctx) {
+					continue // Error collected, continue with next unmapped field
+				}
+				return mapErr // Return immediately
+			}
+
+			// Add to the unmapped destination map
+			// Check overwrite for map entry? If overwrite=false, don't replace existing keys.
+			if !sc.overwrite {
+				if existing := unmappedDestMap.MapIndex(mapKey); existing.IsValid() && !isEmptyValue(existing) {
+					sc.debug("    - Skipping unmapped key '%s': overwrite=false and key exists in map.", srcFieldName)
+					continue
 				}
 			}
+			unmappedDestMap.SetMapIndex(mapKey, mapValue)
 		}
 	}
 
-	return nil
+	return nil // Struct copy successful
 }
 
-func (sc *SmartCopier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *copyContext, destInfo *typeInfo) error {
-	sc.debug("Depth %d: copyMapToStruct: Dest: %s <- Src: %s", ctx.depth, dest.Type(), src.Type())
-	if src.Kind() != reflect.Map { // Defensive check
+func (sc *SmartCopier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *mmContext, destInfo *typeInfo) error {
+	srcType := src.Type()   // Map type
+	destType := dest.Type() // Struct type
+	sc.debug("Depth %d: copyMapToStruct: Dest: %s <- Src: %s", ctx.depth, destType, srcType)
+
+	// --- Basic Checks ---
+	if src.Kind() != reflect.Map { // Should be guaranteed by caller dispatch, but check
 		return fmt.Errorf("%w: source is %s, not map", ErrTypeMismatch, src.Kind())
 	}
-	srcType := src.Type()
-	if srcType.Key().Kind() != reflect.String {
-		err := ErrMapKeyNotString
-		if sc.handlePotentialError(err, ctx) {
-			return nil
-		}
-		return err
+	if srcType.Key().Kind() != reflect.String { // Key must be string
+		return ErrMapKeyNotString
 	}
 	if src.IsNil() {
-		sc.debug("-> Source map is nil, nothing to copy.")
-		return nil // Nothing to copy from nil map
+		sc.debug(" -> Source map is nil, nothing to copy.", ctx.depth)
+		return nil // Nothing to copy from a nil map
 	}
 
-	// --- Handle Unmapped Field Initialization ---
-	var unmappedMap reflect.Value
-	var unmappedValueType reflect.Type
-	var unmappedFieldName string = "<none>"
+	// --- Prepare Unmapped Field Handling (Destination) ---
+	var unmappedDestMap reflect.Value
+	var unmappedDestValueType reflect.Type
+	var unmappedDestFieldName string
 	if destInfo.unmappedField != nil {
-		fieldInfo := destInfo.unmappedField
-		unmappedFieldName = fieldInfo.name
-		unmappedMap = sc.getSettableFieldValue(dest, fieldInfo)
-		if unmappedMap.IsValid() {
-			if !unmappedMap.CanSet() {
-				sc.debug("-> Warning: Unmapped field '%s' retrieved but cannot be set. Ignoring.", unmappedFieldName)
-				unmappedMap = reflect.Value{}
-			} else if unmappedMap.IsNil() {
-				sc.debug("-> Initializing unmapped field map '%s' (%s)", unmappedFieldName, fieldInfo.typ)
-				unmappedMap.Set(reflect.MakeMap(fieldInfo.typ))
+		unmappedDestFieldName = destInfo.unmappedField.name
+		mapFieldVal := sc.getSettableFieldValue(dest, destInfo.unmappedField)
+		if mapFieldVal.IsValid() && mapFieldVal.Kind() == reflect.Map {
+			if mapFieldVal.IsNil() {
+				mapFieldVal.Set(reflect.MakeMap(mapFieldVal.Type()))
 			}
-			if unmappedMap.IsValid() {
-				unmappedValueType = fieldInfo.typ.Elem()
-			}
+			unmappedDestMap = mapFieldVal
+			unmappedDestValueType = mapFieldVal.Type().Elem()
+			sc.debug(" -> Will collect unused map keys into '%s' (type %s)", unmappedDestFieldName, mapFieldVal.Type())
 		} else {
-			sc.debug("-> Cannot get settable value for unmapped field '%s'. Unused map keys will be ignored.", unmappedFieldName)
+			sc.debug(" -> 'unmapped' field '%s' is not a valid map or not settable, ignoring.", unmappedDestFieldName)
 		}
 	}
 
-	usedMapKeys := make(map[string]struct{}) // Track map keys copied to handle unmapped ones
+	usedMapKeys := make(map[string]struct{}) // Track which map keys were used
 
-	// --- Iterate Over Destination Struct Fields ---
-	for destFieldName, dfInfo := range destInfo.fields {
-		sc.debug("-> Processing Dest Field: '%s'", destFieldName)
+	// --- Iterate Through Destination Struct Fields ---
+	for destFieldName, destFieldInfo := range destInfo.fields {
+		sc.debug("  Processing dest field: %s", destFieldName)
 
-		// Skip the unmapped field itself
-		if unmappedMap.IsValid() && destFieldName == unmappedFieldName {
-			sc.debug("-> Skipping unmapped field '%s' itself.", destFieldName)
+		// Skip unmapped field itself
+		if destFieldName == unmappedDestFieldName {
+			continue
+		}
+		// Skip based on global list or "-" tag
+		if _, skip := sc.skipFields[destFieldName]; skip {
+			continue
+		}
+		if _, ignore := destFieldInfo.tagOpts["-"]; ignore {
 			continue
 		}
 
-		// --- Check Skip Conditions (Global, Tags) ---
-		if _, shouldSkip := sc.skipFields[destFieldName]; shouldSkip {
-			sc.debug("-> Skip: Global config for dest field '%s'", destFieldName)
-			continue
+		// --- Determine Corresponding Source Map Key ---
+		srcKeyName := destFieldName                           // Default: field name matches map key
+		if tagName, ok := destFieldInfo.tagOpts["name"]; ok { // Check tag
+			srcKeyName = tagName
 		}
-		if _, isMinus := dfInfo.tagOpts["-"]; isMinus {
-			sc.debug("-> Skip: Dest field '%s' has '-' tag.", destFieldName)
-			continue
-		}
-
-		// --- Determine Source Map Key ---
-		sourceMapKey := destFieldName // Default: Struct field name is map key
-		// Check destination tag `mm:"MapKeyName"`
-		if mapKeyName, ok := dfInfo.tagOpts["name"]; ok {
-			sourceMapKey = mapKeyName
-			sc.debug("-> Source map key mapped via dest tag: '%s'", sourceMapKey)
-		}
-		// Check global config mapping (overrides tag)
-		for mapSrc, mapDst := range sc.fieldMappings {
-			if mapDst == destFieldName {
-				sourceMapKey = mapSrc
-				sc.debug("-> Source map key mapped via config: '%s'", sourceMapKey)
+		// Check global mappings (src->dest, so find src mapping to this dest)
+		for mapSrc, mapDest := range sc.fieldMappings {
+			if mapDest == destFieldName {
+				srcKeyName = mapSrc
 				break
 			}
 		}
+		sc.debug("   - Looking for source map key '%s'", srcKeyName)
+		srcKeyVal := reflect.ValueOf(srcKeyName) // reflect.Value(string)
 
-		// --- Get Source Map Value ---
-		srcMapValue := src.MapIndex(reflect.ValueOf(sourceMapKey))
-		if !srcMapValue.IsValid() {
-			sc.debug("-> Skip: No key '%s' in source map.", sourceMapKey)
-			continue // Key doesn't exist in map
+		// --- Find Source Value in Map ---
+		srcVal := src.MapIndex(srcKeyVal)
+		if !srcVal.IsValid() {
+			sc.debug("   - Key '%s' not found in source map. Skipping.", srcKeyName)
+			continue // Key not found
 		}
+		usedMapKeys[srcKeyName] = struct{}{} // Mark key as used
 
-		// Handle map value being interface{}
-		concreteSrcValue := srcMapValue
-		if srcMapValue.Kind() == reflect.Interface {
-			concreteSrcValue = srcMapValue.Elem()
-			if !concreteSrcValue.IsValid() {
-				sc.debug("-> Skip: Source map value for key '%s' is nil/invalid interface.", sourceMapKey)
-				usedMapKeys[sourceMapKey] = struct{}{} // Mark used even if skipped
+		// --- Handle Interface Value from Map ---
+		// If map is map[string]interface{}, value might be wrapped
+		if srcVal.Kind() == reflect.Interface && !srcVal.IsNil() {
+			srcVal = srcVal.Elem()
+			// Re-check validity after Elem()
+			if !srcVal.IsValid() {
+				sc.debug("   - Value for key '%s' is nil interface or invalid after Elem(). Skipping.", srcKeyName)
 				continue
 			}
-		}
-
-		finalSrcValue := concreteSrcValue // Start with concrete source value
-
-		// --- Apply Source-Based Skip Conditions ('omitempty' on dest tag, skipZero, skipEmpty) ---
-		// These depend on the source value from the map.
-		// Note: 'omitempty' tag on the *destination* struct field controls skipping based on source value.
-		if _, omit := dfInfo.tagOpts["omitempty"]; omit && isEmptyValue(finalSrcValue) {
-			sc.debug("-> Skip: Source value for key '%s' is empty and 'omitempty' tag set on dest field '%s'.", sourceMapKey, destFieldName)
-			usedMapKeys[sourceMapKey] = struct{}{}
-			continue
-		}
-		if sc.skipZeroValue && finalSrcValue.IsZero() {
-			sc.debug("-> Skip: Source value for key '%s' is zero-valued and skipZeroValue=true.", sourceMapKey)
-			usedMapKeys[sourceMapKey] = struct{}{}
-			continue
-		}
-		if sc.skipEmptyValue && isEmptyValue(finalSrcValue) {
-			sc.debug("-> Skip: Source value for key '%s' is empty and skipEmptyValue=true.", sourceMapKey)
-			usedMapKeys[sourceMapKey] = struct{}{}
+		} else if srcVal.Kind() == reflect.Interface && srcVal.IsNil() {
+			sc.debug("   - Value for key '%s' is nil interface. Skipping.", srcKeyName)
 			continue
 		}
 
-		// --- Get Destination Field and Check Overwrite ---
-		destField := sc.getSettableFieldValue(dest, &dfInfo)
-		if !destField.IsValid() {
-			sc.debug("-> Skip: Cannot get settable destination field '%s' value.", destFieldName)
+		// --- Skip Checks (Zero/Empty) ---
+		if sc.skipZeroValue && srcVal.IsZero() {
+			sc.debug("   - Skipping map key '%s': skipZeroValue=true and value is zero.", srcKeyName)
+			continue
+		}
+		if sc.skipEmptyValue && isEmptyValue(srcVal) {
+			sc.debug("   - Skipping map key '%s': skipEmptyValue=true and value is empty.", srcKeyName)
 			continue
 		}
 
-		// Check overwrite condition based on destination state
-		if !sc.overwrite && destField.IsValid() && !isEmptyValue(destField) {
-			sc.debug("-> Skip: Destination field '%s' is non-empty and overwrite=false.", destFieldName)
+		// --- Get Destination Field Value (Settable) ---
+		destVal := sc.getSettableFieldValue(dest, &destFieldInfo)
+		if !destVal.IsValid() {
+			sc.debug("   - Destination field '%s' is not settable. Skipping.", destFieldName)
 			continue
 		}
 
-		// --- Apply Formatter ---
+		// --- Overwrite Check ---
+		if !sc.overwrite && destVal.IsValid() && !isEmptyValue(destVal) {
+			sc.debug("   - Skipping field '%s': overwrite=false and destination is non-empty.", destFieldName)
+			continue
+		}
+
+		// --- Formatter ---
 		if formatter, ok := sc.formatters[destFieldName]; ok {
-			if finalSrcValue.CanInterface() {
-				// ... apply formatter, update finalSrcValue, check type compatibility ... (similar to copyStruct)
-				sc.debug("-> Applying formatter to source map value for key '%s'", sourceMapKey)
-				formattedInterface := formatter(finalSrcValue.Interface())
-				if formattedInterface == nil {
-					finalSrcValue = reflect.Zero(dfInfo.typ)
-				} else {
-					finalSrcValue = reflect.ValueOf(formattedInterface)
-				}
-				if finalSrcValue.IsValid() && finalSrcValue.Type() != dfInfo.typ {
-					if finalSrcValue.Type().ConvertibleTo(dfInfo.typ) {
-						finalSrcValue = finalSrcValue.Convert(dfInfo.typ)
-					} else {
-						sc.debug("-> Warning: Formatter for '%s' returned incompatible type %s (expected %s). Skipping field.", destFieldName, finalSrcValue.Type(), dfInfo.typ)
-						continue
-					}
-				}
+			// Apply formatter logic similar to copyStruct
+			if !srcVal.CanInterface() {
+				sc.debug("   - Cannot apply formatter to field '%s': map value cannot be interfaced.", destFieldName)
 			} else {
-				sc.debug("-> Warning: Cannot call Interface() on map value for key '%s'. Skipping formatter.", sourceMapKey)
+				formattedSrc := formatter(srcVal.Interface())
+				sc.debug("   - Applied formatter to '%s' from key '%s'. Result: %T (%v)", destFieldName, srcKeyName, formattedSrc, formattedSrc)
+				if formattedSrc == nil {
+					if sc.overwrite {
+						destVal.Set(reflect.Zero(destVal.Type()))
+					}
+					continue // Skip recursion
+				}
+				srcVal = reflect.ValueOf(formattedSrc)
+				if !srcVal.IsValid() {
+					continue
+				}
+				// Fall through to recursive copy with formatted srcVal
 			}
-		}
-		if !finalSrcValue.IsValid() {
-			sc.debug("-> Skip: Source value became invalid after formatting for map key '%s'.", sourceMapKey)
-			continue
 		}
 
 		// --- Recursive Copy ---
-		sc.debug("-> Recursing copy: Dest Field: %s (%s) <- Map Key: '%s' (%s)", destFieldName, destField.Type(), sourceMapKey, finalSrcValue.Type())
-		usedMapKeys[sourceMapKey] = struct{}{} // Mark key as used before recursing
-		if err := sc.copyRecursive(destField, finalSrcValue, ctx); err != nil {
-			fieldErr := fmt.Errorf("copying field '%s' <- map['%s']: %w", destFieldName, sourceMapKey, err)
+		sc.debug("   - Recursively copying field '%s' <- map['%s']", destFieldName, srcKeyName)
+		if err := sc.copyRecursive(destVal, srcVal, ctx); err != nil {
+			fieldErr := fmt.Errorf("copying field '%s' <- map['%s']: %w", destFieldName, srcKeyName, err)
 			if sc.handlePotentialError(fieldErr, ctx) {
-				continue
+				continue // Error collected, continue with next field
 			}
-			return fieldErr
+			return fieldErr // Return immediately
 		}
-	}
+	} // End loop through destination fields
 
-	// --- Handle Unmapped Map Keys ---
-	if unmappedMap.IsValid() {
-		sc.debug("-> Processing unmapped map keys for struct field '%s'", unmappedFieldName)
+	// --- Handle Unused Map Keys (Collect into Unmapped Field) ---
+	if unmappedDestMap.IsValid() {
+		sc.debug("  Checking for unused map keys to put into '%s'", unmappedDestFieldName)
 		iter := src.MapRange()
 		for iter.Next() {
-			mapKey := iter.Key()
-			mapKeyStr := mapKey.String() // Assumes string key
-			if _, used := usedMapKeys[mapKeyStr]; !used {
-				sc.debug(" -> Found unmapped map key: '%s'", mapKeyStr)
-				srcMapVal := iter.Value()
+			key := iter.Key() // reflect.Value(string)
+			keyStr := key.String()
 
-				// Handle interface values from map
-				concreteSrcVal := srcMapVal
-				if srcMapVal.Kind() == reflect.Interface {
-					concreteSrcVal = srcMapVal.Elem()
+			// Skip if this key was already mapped to a struct field
+			if _, used := usedMapKeys[keyStr]; used {
+				continue
+			}
+
+			val := iter.Value()
+			// Handle interface value
+			if val.Kind() == reflect.Interface && !val.IsNil() {
+				val = val.Elem()
+			}
+			if !val.IsValid() || (val.Kind() == reflect.Interface && val.IsNil()) {
+				continue // Skip invalid or nil interface values
+			}
+
+			// Skip based on zero/empty
+			if sc.skipZeroValue && val.IsZero() {
+				continue
+			}
+			if sc.skipEmptyValue && isEmptyValue(val) {
+				continue
+			}
+
+			// Create a holder for the map value type
+			mapValueHolder := reflect.New(unmappedDestValueType).Elem()
+
+			sc.debug("   - Copying unused map key '%s' into unmapped field map", keyStr)
+			// Copy the map value into the holder
+			if err := sc.copyRecursive(mapValueHolder, val, ctx); err != nil {
+				mapErr := fmt.Errorf("copying unmapped map key '%s' to map: %w", keyStr, err)
+				if sc.handlePotentialError(mapErr, ctx) {
+					continue // Error collected, continue
 				}
-				// Skip if nil/invalid interface element
-				if !concreteSrcVal.IsValid() {
-					sc.debug(" -> Skipping unmapped map key '%s', value is nil/invalid interface.", mapKeyStr)
+				return mapErr // Return immediately
+			}
+
+			// Add to the destination unmapped map
+			// Check overwrite
+			if !sc.overwrite {
+				if existing := unmappedDestMap.MapIndex(key); existing.IsValid() && !isEmptyValue(existing) {
+					sc.debug("    - Skipping unmapped key '%s': overwrite=false and key exists.", keyStr)
 					continue
-				}
-
-				// Skip based on global settings if configured
-				if sc.skipZeroValue && concreteSrcVal.IsZero() {
-					continue
-				}
-				if sc.skipEmptyValue && isEmptyValue(concreteSrcVal) {
-					continue
-				}
-
-				// Copy the value into the unmapped map field
-				destMapKey := reflect.ValueOf(mapKeyStr)
-				destMapValue := reflect.New(unmappedValueType).Elem() // Holder for map value (e.g., interface{})
-
-				sc.debug("  -> Recursing copy for unmapped: map['%s'] (%s) <- map['%s'] (%s)", mapKeyStr, destMapValue.Type(), mapKeyStr, concreteSrcVal.Type())
-				if err := sc.copyRecursive(destMapValue, concreteSrcVal, ctx); err == nil {
-					unmappedMap.SetMapIndex(destMapKey, destMapValue)
-				} else {
-					unmappedErr := fmt.Errorf("copying unmapped map key '%s' to map field '%s': %w", mapKeyStr, unmappedFieldName, err)
-					if sc.handlePotentialError(unmappedErr, ctx) {
-						continue
-					}
-					return unmappedErr
 				}
 			}
+			unmappedDestMap.SetMapIndex(key, mapValueHolder)
 		}
 	}
 
-	return nil
+	return nil // Map to Struct copy successful
 }
 
-func (sc *SmartCopier) copyStructToMap(dest reflect.Value, src reflect.Value, ctx *copyContext) error {
-	sc.debug("Depth %d: copyStructToMap: Dest: %s <- Src: %s", ctx.depth, dest.Type(), src.Type())
+func (sc *SmartCopier) copyStructToMap(dest, src reflect.Value, ctx *mmContext) error {
+	destType := dest.Type() // Map type
+	srcType := src.Type()   // Struct type
+	sc.debug("Depth %d: copyStructToMap: Dest: %s <- Src: %s", ctx.depth, destType, srcType)
+
+	// --- Basic Checks ---
 	if dest.Kind() != reflect.Map {
-		err := ErrDestNotMap
-		if sc.handlePotentialError(err, ctx) {
-			return nil
-		}
-		return err
-	}
-	destType := dest.Type()
+		return ErrDestNotMap
+	} // Should be guaranteed by caller
 	if destType.Key().Kind() != reflect.String {
-		err := fmt.Errorf("%w: destination map key type must be string, got %s", ErrMapKeyNotString, destType.Key().Kind())
-		if sc.handlePotentialError(err, ctx) {
-			return nil
-		}
-		return err
+		return ErrMapKeyNotString
 	}
 	if !dest.CanSet() {
 		err := fmt.Errorf("cannot set destination map %s", destType)
-		if sc.handlePotentialError(err, ctx) {
-			return nil
+		// No context here yet, but finalizeResult will handle panic
+		if sc.panicOnError {
+			panic(err)
 		}
 		return err
 	}
 
-	// Initialize map if nil, or clear if overwrite=true
+	// --- Initialize Destination Map ---
 	if dest.IsNil() {
-		sc.debug("-> Initializing destination map %s", destType)
-		dest.Set(reflect.MakeMap(destType)) // Use MakeMap, size hint isn't easy here
+		sc.debug(" -> Initializing nil destination map %s", destType)
+		dest.Set(reflect.MakeMap(destType))
 	} else if sc.overwrite {
-		// Clear existing map entries if overwriting
-		sc.debug("-> Clearing destination map %s as overwrite=true", destType)
-		// Iterate and delete keys - using MapRange is safer
-		iter := dest.MapRange()
-		keysToDelete := []reflect.Value{}
-		for iter.Next() {
-			keysToDelete = append(keysToDelete, iter.Key())
-		}
-		for _, k := range keysToDelete {
-			dest.SetMapIndex(k, reflect.Value{}) // Set to zero value to delete
-		}
-		// Alternative: dest.Set(reflect.MakeMap(destType)) might be simpler if allowed
+		// If overwriting, clear existing map? Or just overwrite keys?
+		// Standard behavior is to overwrite/add keys. Let's stick with that.
+		// If a full clear is needed, user should pass an empty map.
+		sc.debug(" -> Overwrite=true. Will overwrite existing keys in dest map %s", destType)
 	}
-	// If !overwrite and map exists, we add/update keys
 
-	destValueType := destType.Elem()
-	srcInfo := sc.getTypeInfo(src.Type())
+	srcInfo := sc.getTypeInfo(srcType)
+	destValueType := destType.Elem() // Type of values in the destination map
 
-	// --- Iterate Over Source Struct Fields ---
-	for srcFieldName, sfInfo := range srcInfo.fields {
-		sc.debug("-> Processing Source Field: '%s'", srcFieldName)
+	// --- Iterate Through Source Struct Fields ---
+	for srcFieldName, srcFieldInfo := range srcInfo.fields {
+		sc.debug("  Processing src field: %s", srcFieldName)
 
-		// --- Check Export Status ---
-		isSrcUnexported := sfInfo.structField.PkgPath != ""
-		if isSrcUnexported { // Always skip unexported source fields when copying TO map
-			sc.debug("-> Skip: Source field '%s' is unexported.", srcFieldName)
+		// Skip unexported unless allowed
+		isSrcUnexported := !srcFieldInfo.structField.IsExported()
+		if isSrcUnexported && !(sc.copyUnexported && sc.useUnsafe) {
+			sc.debug("   - Skipping src field '%s' (unexported)", srcFieldName)
+			continue
+		}
+		// Skip based on "-" tag
+		if _, ignore := srcFieldInfo.tagOpts["-"]; ignore {
+			sc.debug("   - Skipping src field '%s' (tag '-')", srcFieldName)
 			continue
 		}
 
-		// --- Get Source Value ---
-		srcField := src.FieldByIndex(sfInfo.index)
-		if !srcField.IsValid() {
-			sc.debug("-> Skip: Source field '%s' is invalid.", srcFieldName)
+		// --- Get Source Field Value ---
+		var srcVal reflect.Value
+		if isSrcUnexported { // Must use unsafe if enabled
+			if src.CanAddr() {
+				srcFieldPtr := unsafe.Pointer(src.UnsafeAddr() + srcFieldInfo.offset)
+				srcVal = reflect.NewAt(srcFieldInfo.typ, srcFieldPtr).Elem()
+				sc.debug("   - Reading unexported src field '%s' via unsafe.", srcFieldName)
+			} else {
+				sc.debug("   - Cannot read unexported src field '%s' (struct not addressable). Skipping.", srcFieldName)
+				continue
+			}
+		} else {
+			srcVal = src.FieldByIndex(srcFieldInfo.index)
+		}
+
+		if !srcVal.IsValid() {
+			sc.debug("   - Source field '%s' value is invalid. Skipping.", srcFieldName)
 			continue
 		}
 
-		// --- Check Source Tags ('-', 'omitempty') and Skip Options ---
-		tagOpts := sfInfo.tagOpts
-		if _, isMinus := tagOpts["-"]; isMinus {
-			sc.debug("-> Skip: Tag '-' on source field '%s'.", srcFieldName)
+		// --- Skip Checks (omitempty, Zero, Empty) ---
+		if _, omit := srcFieldInfo.tagOpts["omitempty"]; omit && isEmptyValue(srcVal) {
+			sc.debug("   - Skipping src field '%s': 'omitempty' tag and value is empty.", srcFieldName)
 			continue
 		}
-		if _, omit := tagOpts["omitempty"]; omit && isEmptyValue(srcField) {
-			sc.debug("-> Skip: Source value is empty and 'omitempty' tag set on source field '%s'.", srcFieldName)
+		if sc.skipZeroValue && srcVal.IsZero() {
+			sc.debug("   - Skipping src field '%s': skipZeroValue=true and value is zero.", srcFieldName)
 			continue
 		}
-		if sc.skipZeroValue && srcField.IsZero() {
-			sc.debug("-> Skip: Source field '%s' is zero-valued and skipZeroValue=true.", srcFieldName)
-			continue
-		}
-		if sc.skipEmptyValue && isEmptyValue(srcField) {
-			sc.debug("-> Skip: Source field '%s' is empty and skipEmptyValue=true.", srcFieldName)
+		if sc.skipEmptyValue && isEmptyValue(srcVal) {
+			sc.debug("   - Skipping src field '%s': skipEmptyValue=true and value is empty.", srcFieldName)
 			continue
 		}
 
 		// --- Determine Destination Map Key ---
-		destMapKeyName := srcFieldName // Default: use source field name
-		// Check source tag `mm:"DestMapKey"`
-		if tagName, ok := tagOpts["name"]; ok {
-			destMapKeyName = tagName
-			sc.debug("-> Dest key mapped via source tag: '%s'", destMapKeyName)
+		destKeyName := srcFieldName // Default: field name
+		// Check source tag "name" option
+		if tagName, ok := srcFieldInfo.tagOpts["name"]; ok {
+			destKeyName = tagName
+			sc.debug("   - Source tag 'name' maps to dest key '%s'", destKeyName)
 		}
-		// Check global config (overrides tag)
-		if mappedDst, ok := sc.fieldMappings[srcFieldName]; ok {
-			destMapKeyName = mappedDst
-			sc.debug("-> Dest key mapped via config: '%s'", destMapKeyName)
+		// Check global field mappings (src->dest)
+		if mappedName, ok := sc.fieldMappings[srcFieldName]; ok {
+			destKeyName = mappedName
+			sc.debug("   - Global mapping maps src '%s' to dest key '%s'", srcFieldName, destKeyName)
 		}
-		destMapKey := reflect.ValueOf(destMapKeyName)
+		destKeyVal := reflect.ValueOf(destKeyName) // reflect.Value(string)
 
-		// --- Check Overwrite Condition for Map Key ---
-		// If not overwriting, check if the key already exists in the destination map
+		// --- Overwrite Check for Map Key ---
 		if !sc.overwrite {
-			existingVal := dest.MapIndex(destMapKey)
-			if existingVal.IsValid() && !isEmptyValue(existingVal) { // Check if existing value is non-empty
-				sc.debug("-> Skip: Destination map key '%s' exists and is non-empty, and overwrite=false.", destMapKeyName)
+			if existing := dest.MapIndex(destKeyVal); existing.IsValid() && !isEmptyValue(existing) {
+				sc.debug("   - Skipping map key '%s': overwrite=false and key exists with non-empty value.", destKeyName)
 				continue
 			}
 		}
 
-		// --- Recursive Copy ---
-		destMapValue := reflect.New(destValueType).Elem() // Create holder for map value
-		sc.debug("-> Recursing copy: map['%s'] (%s) <- %s (%s)", destMapKeyName, destValueType, srcFieldName, srcField.Type())
-		if err := sc.copyRecursive(destMapValue, srcField, ctx); err == nil {
-			// Set value in map only if recursive copy succeeded
-			dest.SetMapIndex(destMapKey, destMapValue)
-		} else {
-			fieldErr := fmt.Errorf("copying to map key '%s' <- field '%s': %w", destMapKeyName, srcFieldName, err)
-			if sc.handlePotentialError(fieldErr, ctx) {
-				continue // Collect and continue
-			}
-			return fieldErr // Propagate
-		}
-	}
+		// --- Prepare Destination Value Holder ---
+		destMapValueHolder := reflect.New(destValueType).Elem()
 
-	return nil
+		// --- Recursive Copy ---
+		sc.debug("   - Recursively copying src field '%s' into map key '%s'", srcFieldName, destKeyName)
+		if err := sc.copyRecursive(destMapValueHolder, srcVal, ctx); err != nil {
+			fieldErr := fmt.Errorf("copying struct field '%s' to map key '%s': %w", srcFieldName, destKeyName, err)
+			if sc.handlePotentialError(fieldErr, ctx) {
+				continue // Error collected, continue
+			}
+			return fieldErr // Return immediately
+		}
+
+		// --- Set Map Index ---
+		dest.SetMapIndex(destKeyVal, destMapValueHolder)
+
+	} // End loop through source fields
+
+	return nil // Struct to Map copy successful
 }
 
-func (sc *SmartCopier) copySlice(dest, src reflect.Value, ctx *copyContext) error {
+func (sc *SmartCopier) copySlice(dest, src reflect.Value, ctx *mmContext) error {
 	destType := dest.Type()
 	srcType := src.Type()
 	srcLen := src.Len()
 	sc.debug("Depth %d: copySlice: Dest: %s <- Src: %s (len %d)", ctx.depth, destType, srcType, srcLen)
 
+	// --- Basic Checks ---
 	if !dest.CanSet() {
 		err := fmt.Errorf("cannot set destination slice %s", destType)
 		if sc.handlePotentialError(err, ctx) {
@@ -1801,94 +1935,101 @@ func (sc *SmartCopier) copySlice(dest, src reflect.Value, ctx *copyContext) erro
 		return err
 	}
 
-	// Handle destination slice allocation/resizing based on overwrite flag
-	if dest.IsNil() {
-		// If nil, always allocate regardless of overwrite flag
-		sc.debug("-> Initializing destination slice %s with len/cap %d", destType, srcLen)
+	// --- Handle Nil Source ---
+	if src.IsNil() {
+		if sc.skipNilSrc {
+			sc.debug(" -> Source slice is nil, skipNilSrc=true. Skipping.", ctx.depth)
+			return nil
+		}
+		if sc.overwrite {
+			sc.debug(" -> Source slice is nil, overwrite=true. Setting dest slice %s to nil.", ctx.depth, destType)
+			dest.Set(reflect.Zero(destType)) // Set slice itself to nil
+		} else {
+			sc.debug(" -> Source slice is nil, overwrite=false. Leaving dest slice %s unchanged.", ctx.depth, destType)
+		}
+		return nil
+	}
+
+	// --- Prepare Destination Slice ---
+	if dest.IsNil() || sc.overwrite {
+		// Create a new slice with same length and capacity as source
 		newSlice := reflect.MakeSlice(destType, srcLen, srcLen)
+		sc.debug(" -> Created/Replaced dest slice %s with len/cap %d", destType, srcLen)
 		dest.Set(newSlice)
-	} else if sc.overwrite {
-		// If overwriting and dest exists, ensure capacity and length match source
-		if dest.Cap() < srcLen {
-			sc.debug("-> Reallocating destination slice %s to len/cap %d (overwrite=true)", destType, srcLen)
-			newSlice := reflect.MakeSlice(destType, srcLen, srcLen)
-			dest.Set(newSlice) // Replace entirely
-		} else if dest.Len() != srcLen {
-			sc.debug("-> Resizing destination slice %s length to %d (overwrite=true)", destType, srcLen)
-			dest.SetLen(srcLen) // Adjust length if capacity is sufficient
+	} else { // Destination exists and overwrite is false
+		// Merge behavior? For slices, merging usually means appending or updating matching elements.
+		// Current CopyTo logic doesn't support slice merging easily.
+		// With overwrite=false, we could potentially only copy if dest len matches src len,
+		// otherwise do nothing? Let's adopt the latter for now.
+		if dest.Len() != srcLen {
+			sc.debug(" -> Skipping slice copy: overwrite=false and lengths differ (dest %d != src %d)", dest.Len(), srcLen)
+			return nil // Don't copy if lengths differ and not overwriting
 		}
-		// If cap >= srcLen and len == srcLen, do nothing to the slice header itself
-	} else {
-		// If !overwrite and dest is not nil, do nothing (keep existing slice)
-		sc.debug("-> Skipping slice copy as !overwrite and destination slice %s exists", destType)
+		sc.debug(" -> Dest slice exists, overwrite=false, lengths match. Will copy elements recursively (honoring overwrite).", ctx.depth)
+	}
+
+	// If source length is 0, we are done (already handled dest slice creation/clearing)
+	if srcLen == 0 {
 		return nil
 	}
 
-	// --- Perform Element Copy ---
+	// --- Optimization: reflect.Copy ---
+	// Use reflect.Copy if element types are assignable AND memory copy is suitable
+	// (meaning no pointers or complex types requiring deep copies or conversions).
 	destElemType := destType.Elem()
-	srcElemType := srcType.Elem()
-
-	// Optimization: Use reflect.Copy for primitive/simple types if assignable
-	canReflectCopy := false
-	if srcElemType.AssignableTo(destElemType) {
-		// Check if element type is suitable for block copy
-		if isMemCopySuitable(destElemType) {
-			canReflectCopy = true
-		}
-		// Alternative: check specific kinds safe for reflect.Copy
-		// switch destElemType.Kind() {
-		// case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		// 	reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		// 	reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
-		// 	canReflectCopy = true
-		// }
+	// Moved srcElemType declaration inside the if to fix unused variable warning
+	if srcElemType := srcType.Elem(); srcElemType.AssignableTo(destElemType) && isMemCopySuitable(destElemType) {
+		sc.debug(" -> Using reflect.Copy for slice %s (Elem type %s suitable for memcopy)", destType, destElemType)
+		reflect.Copy(dest, src)
+		return nil // Bulk copy done
 	}
 
-	if canReflectCopy {
-		sc.debug("-> Using reflect.Copy for slice %s", destType)
-		reflect.Copy(dest, src) // Fast path for simple slices
-		return nil
-	}
-
-	// Fallback to element-wise recursive copy
-	sc.debug("-> Performing element-wise recursive copy for slice %s", destType)
-	// Iterate up to the length of the *destination* slice (which was set to srcLen if needed)
-	finalLen := dest.Len()
-	for i := 0; i < finalLen; i++ {
-		if i >= src.Len() {
-			break
-		} // Safety break if src is somehow shorter
-
-		destElem := dest.Index(i)
+	// --- Element-by-Element Copy ---
+	sc.debug(" -> Performing element-by-element copy for slice %s", destType)
+	for i := 0; i < srcLen; i++ {
 		srcElem := src.Index(i)
+		destElem := dest.Index(i)
 
+		// --- Destination Element Settability Check ---
+		// While the slice itself is settable, individual elements might not be
+		// if they are complex types obtained in non-settable ways (unlikely here).
 		if !destElem.CanSet() {
-			// Should not happen if slice was created correctly, but check defensively
-			err := fmt.Errorf("cannot set destination slice element at index %d for %s", i, destType)
+			err := fmt.Errorf("cannot set element %d in destination slice %s", i, destType)
 			if sc.handlePotentialError(err, ctx) {
-				continue
+				continue // Skip this element
 			}
 			return err
 		}
 
-		sc.debug(" --> Recursing copy slice index %d: Dest Elem: %s <- Src Elem: %s", i, destElem.Type(), srcElem.Type())
+		// --- Overwrite Check for Element ---
+		// Only perform the copy if overwriting is enabled OR if the destination element is empty.
+		if !sc.overwrite && destElem.IsValid() && !isEmptyValue(destElem) {
+			sc.debug("    - Skipping element %d: overwrite=false and dest element is non-empty.", i)
+			continue
+		}
+
+		// --- Recursive Copy for Element ---
+		// Note: Skip checks (nil/zero/empty) for srcElem are handled within the recursive call
+		sc.debug("    - Recursively copying element %d", i)
 		if err := sc.copyRecursive(destElem, srcElem, ctx); err != nil {
 			elemErr := fmt.Errorf("copying slice index %d: %w", i, err)
 			if sc.handlePotentialError(elemErr, ctx) {
-				continue
-			} // Collect and continue
-			return elemErr // Propagate
+				continue // Error collected, continue with next element
+			}
+			return elemErr // Return immediately
 		}
 	}
-	return nil
+
+	return nil // Slice copy successful
 }
 
-func (sc *SmartCopier) copyMap(dest, src reflect.Value, ctx *copyContext) error {
+func (sc *SmartCopier) copyMap(dest, src reflect.Value, ctx *mmContext) error {
 	destType := dest.Type()
 	srcType := src.Type()
-	srcLen := src.Len()
-	sc.debug("Depth %d: copyMap: Dest: %s <- Src: %s (len %d)", ctx.depth, destType, srcType, srcLen)
+	srcLen := src.Len() // Length for MakeMapWithSize hint
+	sc.debug("Depth %d: copyMap: Dest: %s <- Src: %s (len hint %d)", ctx.depth, destType, srcType, srcLen)
 
+	// --- Basic Checks ---
 	if !dest.CanSet() {
 		err := fmt.Errorf("cannot set destination map %s", destType)
 		if sc.handlePotentialError(err, ctx) {
@@ -1897,82 +2038,121 @@ func (sc *SmartCopier) copyMap(dest, src reflect.Value, ctx *copyContext) error 
 		return err
 	}
 
-	// Handle destination map allocation/clearing
-	if dest.IsNil() {
-		sc.debug("-> Initializing destination map %s with size hint %d", destType, srcLen)
-		dest.Set(reflect.MakeMapWithSize(destType, srcLen))
-	} else if sc.overwrite {
-		sc.debug("-> Clearing destination map %s as overwrite=true", destType)
-		// Clear existing entries efficiently
-		iter := dest.MapRange()
-		keysToDelete := []reflect.Value{}
-		for iter.Next() {
-			keysToDelete = append(keysToDelete, iter.Key())
+	// --- Handle Nil Source ---
+	if src.IsNil() {
+		if sc.skipNilSrc {
+			sc.debug(" -> Source map is nil, skipNilSrc=true. Skipping.", ctx.depth)
+			return nil
 		}
-		for _, k := range keysToDelete {
-			dest.SetMapIndex(k, reflect.Value{}) // Zero value deletes the key
+		if sc.overwrite {
+			sc.debug(" -> Source map is nil, overwrite=true. Setting dest map %s to nil.", ctx.depth, destType)
+			dest.Set(reflect.Zero(destType)) // Set map itself to nil
+		} else {
+			sc.debug(" -> Source map is nil, overwrite=false. Leaving dest map %s unchanged.", ctx.depth, destType)
 		}
+		return nil
 	}
-	// If !overwrite and dest exists, add/update keys below
 
+	// --- Prepare Destination Map ---
+	if dest.IsNil() || sc.overwrite {
+		// Create a new map. Use size hint from source.
+		newMap := reflect.MakeMapWithSize(destType, srcLen)
+		sc.debug(" -> Created/Replaced dest map %s with size hint %d", destType, srcLen)
+		dest.Set(newMap)
+		// If overwrite=true and dest was not nil, the old map is now garbage.
+	} else {
+		// Destination map exists, overwrite is false. We will add/update keys recursively.
+		sc.debug(" -> Dest map exists, overwrite=false. Will merge keys recursively.", ctx.depth)
+	}
+
+	// If source map is empty, we're done.
+	if src.Len() == 0 {
+		return nil
+	}
+
+	// --- Element-by-Element Copy ---
+	sc.debug(" -> Iterating through source map keys for %s", srcType)
 	iter := src.MapRange()
 	destKeyType := destType.Key()
-	destElemType := destType.Elem()
+	destValType := destType.Elem()
 
 	for iter.Next() {
 		srcKey := iter.Key()
-		srcValue := iter.Value()
+		srcVal := iter.Value()
 
-		// Create settable holders for destination key and value
-		newDestKey := reflect.New(destKeyType).Elem()
-		newDestValue := reflect.New(destElemType).Elem()
+		sc.debug("    - Processing source key: %v (%s)", srcKey.Interface(), srcKey.Type())
 
-		// Copy source key to destination key holder
-		sc.debug("-> Copying map key: Dest Key Holder: %s <- Src Key: %s", newDestKey.Type(), srcKey.Type())
-		if err := sc.copyRecursive(newDestKey, srcKey, ctx); err != nil {
-			keyErr := fmt.Errorf("copying map key (%+v): %w", srcKey.Interface(), err)
-			if sc.handlePotentialError(keyErr, ctx) {
-				continue
-			} // Skip this entry if key copy fails
-			return keyErr // Propagate if not collecting
-		}
-		// Check if key is valid after copy
-		if !newDestKey.IsValid() {
-			sc.debug("-> Skipping map entry, key became invalid after copy: %+v", srcKey.Interface())
+		// --- Handle Invalid Source Value ---
+		// Can happen? Maybe if map contains invalid values somehow.
+		if !srcVal.IsValid() {
+			sc.debug("     - Source value for key %v is invalid. Skipping.", srcKey.Interface())
 			continue
 		}
 
-		// Check overwrite condition for the specific key if !overwrite
+		// --- Skip Source Value Checks (Nil/Zero/Empty) ---
+		// These checks apply to the *value* being copied.
+		if sc.skipNilSrc && (srcVal.Kind() == reflect.Ptr || srcVal.Kind() == reflect.Interface || srcVal.Kind() == reflect.Map || srcVal.Kind() == reflect.Slice || srcVal.Kind() == reflect.Chan || srcVal.Kind() == reflect.Func) && srcVal.IsNil() {
+			sc.debug("     - Skipping key %v: skipNilSrc=true and value is nil.", srcKey.Interface())
+			continue
+		}
+		if sc.skipZeroValue && srcVal.IsZero() {
+			sc.debug("     - Skipping key %v: skipZeroValue=true and value is zero.", srcKey.Interface())
+			continue
+		}
+		if sc.skipEmptyValue && isEmptyValue(srcVal) {
+			sc.debug("     - Skipping key %v: skipEmptyValue=true and value is empty.", srcKey.Interface())
+			continue
+		}
+
+		// --- Prepare Destination Key ---
+		// Destination key must be of destKeyType. We need to copy/convert srcKey.
+		destKey := reflect.New(destKeyType).Elem() // Create settable holder for dest key
+		sc.debug("     - Recursively copying source key %s to dest key %s", srcKey.Type(), destKeyType)
+		if err := sc.copyRecursive(destKey, srcKey, ctx); err != nil {
+			// Failed to copy/convert the key itself
+			keyErr := fmt.Errorf("copying map key (%v :: %s -> %s): %w", srcKey.Interface(), srcKey.Type(), destKeyType, err)
+			if sc.handlePotentialError(keyErr, ctx) {
+				continue // Skip this key/value pair
+			}
+			return keyErr
+		}
+		// Now destKey holds the key suitable for the destination map.
+
+		// --- Overwrite Check for Key ---
 		if !sc.overwrite {
-			existingVal := dest.MapIndex(newDestKey)
+			existingVal := dest.MapIndex(destKey)
 			if existingVal.IsValid() && !isEmptyValue(existingVal) {
-				sc.debug("-> Skipping map key '%v' as it exists and is non-empty, and overwrite=false.", newDestKey.Interface())
-				continue
+				sc.debug("     - Skipping key %v: overwrite=false and key exists with non-empty value in dest map.", destKey.Interface())
+				continue // Skip this key/value pair
 			}
 		}
 
-		// Copy source value to destination value holder
-		sc.debug("-> Copying map value for key [%+v]: Dest Val Holder: %s <- Src Val: %s", newDestKey.Interface(), newDestValue.Type(), srcValue.Type())
-		err := sc.copyRecursive(newDestValue, srcValue, ctx)
-		if err != nil {
-			valErr := fmt.Errorf("copying map value for key [%+v]: %w", newDestKey.Interface(), err)
+		// --- Prepare Destination Value ---
+		destValue := reflect.New(destValType).Elem() // Create settable holder for dest value
+		sc.debug("     - Recursively copying source value %s to dest value %s for key %v", srcVal.Type(), destValType, destKey.Interface())
+		if err := sc.copyRecursive(destValue, srcVal, ctx); err != nil {
+			// Failed to copy/convert the value
+			valErr := fmt.Errorf("copying map value for key (%v :: %s -> %s): %w", destKey.Interface(), srcVal.Type(), destValType, err)
 			if sc.handlePotentialError(valErr, ctx) {
-				continue
-			} // Skip this entry if value copy fails
-			return valErr // Propagate if not collecting
+				continue // Skip this key/value pair
+			}
+			return valErr
 		}
 
-		// Set the copied key and value in the destination map
-		sc.debug("-> Setting map index: Key: %v (%s), Value: %v (%s)", newDestKey.Interface(), newDestKey.Type(), newDestValue.Interface(), newDestValue.Type())
-		dest.SetMapIndex(newDestKey, newDestValue)
+		// --- Set Map Index ---
+		sc.debug("     - Setting dest map key %v (%s) to value (%s)", destKey.Interface(), destKey.Type(), destValue.Type())
+		dest.SetMapIndex(destKey, destValue)
 	}
-	return nil
+
+	return nil // Map copy successful
 }
 
-func (sc *SmartCopier) copyInterface(dest, src reflect.Value, ctx *copyContext) error {
-	destType := dest.Type() // The interface type itself
-	sc.debug("Depth %d: copyInterface: Dest: %s <- Src: %s (%s)", ctx.depth, destType, src.Type(), src.Kind())
+func (sc *SmartCopier) copyInterface(dest, src reflect.Value, ctx *mmContext) error {
+	destType := dest.Type() // Interface type (e.g., interface{}, io.Writer)
+	srcType := src.Type()   // Could be interface or concrete type
+	sc.debug("Depth %d: copyInterface: Dest: %s <- Src: %s (%s)", ctx.depth, destType, srcType, src.Kind())
 
+	// --- Basic Checks ---
 	if !dest.CanSet() {
 		err := fmt.Errorf("cannot set destination interface %s", destType)
 		if sc.handlePotentialError(err, ctx) {
@@ -1981,99 +2161,150 @@ func (sc *SmartCopier) copyInterface(dest, src reflect.Value, ctx *copyContext) 
 		return err
 	}
 
-	// Handle source being nil interface or holding nil pointer
-	if src.Kind() == reflect.Interface && src.IsNil() {
-		sc.debug("-> Source is nil interface.")
-		if sc.overwrite && !dest.IsNil() { // Only zero dest if overwriting and dest currently holds something
-			sc.debug("-> Zeroing destination interface %s.", destType)
-			dest.Set(reflect.Zero(destType))
-		}
-		return nil
-	}
-
-	// Get the concrete value from the source interface/value
-	srcConcrete := src
-	if src.Kind() == reflect.Interface {
-		srcConcrete = src.Elem()
-	}
-
-	// Handle invalid concrete value (e.g., interface holding typed nil pointer)
-	if !srcConcrete.IsValid() {
-		sc.debug("-> Source concrete value is invalid (e.g., typed nil).")
-		if sc.overwrite && !dest.IsNil() {
-			sc.debug("-> Zeroing destination interface %s.", destType)
-			dest.Set(reflect.Zero(destType))
-		}
-		return nil
-	}
-
-	srcConcreteType := srcConcrete.Type()
-	sc.debug("-> Source concrete type: %s", srcConcreteType)
-
-	// Create a new value holder of the *source* concrete type.
-	// The recursive call below MUST handle the type transformation if necessary
-	// (e.g., SimpleSrc -> SimpleDest) based on the destination *field* type if known,
-	// or potentially based on registered converters.
-	newDestConcreteHolder := reflect.New(srcConcreteType).Elem()
-
-	sc.debug("-> Recursively copying concrete source value %s into holder %s", srcConcreteType, newDestConcreteHolder.Type())
-	// Crucially, we pass the *holder* as the destination to copyRecursive.
-	// If the source was SimpleSrc and the destination context implies SimpleDest,
-	// copyRecursive (specifically copyStruct) should handle the field mapping.
-	err := sc.copyRecursive(newDestConcreteHolder, srcConcrete, ctx)
-	if err != nil {
-		concErr := fmt.Errorf("copying concrete value (%s) for interface %s: %w", srcConcreteType, destType, err)
-		if sc.handlePotentialError(concErr, ctx) {
+	// --- Handle Nil/Invalid Source ---
+	// Check original source `src` directly
+	if !src.IsValid() || ((src.Kind() == reflect.Interface || src.Kind() == reflect.Ptr) && src.IsNil()) {
+		if sc.skipNilSrc {
+			sc.debug(" -> Source is nil/invalid interface/ptr, skipNilSrc=true. Skipping interface set.", ctx.depth)
 			return nil
 		}
-		return concErr
-	}
-
-	// Now, assign the (potentially transformed) value from the holder to the destination interface.
-	finalValueToAssign := newDestConcreteHolder
-	if !finalValueToAssign.IsValid() {
-		// If recursive copy resulted in invalid value (e.g., nil struct), assign zero interface value
-		sc.debug("-> Recursive copy resulted in invalid value, assigning zero value to interface %s", destType)
-		dest.Set(reflect.Zero(destType))
+		if sc.overwrite {
+			sc.debug(" -> Source is nil/invalid, overwrite=true. Setting dest interface %s to nil.", ctx.depth, destType)
+			dest.Set(reflect.Zero(destType)) // Set interface itself to nil
+		} else {
+			sc.debug(" -> Source is nil/invalid, overwrite=false. Leaving dest interface %s unchanged.", ctx.depth, destType)
+		}
 		return nil
 	}
 
-	// Check if the final value (or a pointer to it) is assignable to the destination interface type.
-	if finalValueToAssign.Type().AssignableTo(destType) {
-		sc.debug("-> Assigning concrete value of type %s to interface %s", finalValueToAssign.Type(), destType)
-		dest.Set(finalValueToAssign)
-	} else if finalValueToAssign.CanAddr() && finalValueToAssign.Addr().Type().AssignableTo(destType) {
-		// Check if a pointer to the result is assignable (very common for interfaces)
-		sc.debug("-> Assigning pointer to concrete value (*%s) to interface %s", finalValueToAssign.Type(), destType)
-		dest.Set(finalValueToAssign.Addr())
-	} else {
-		// Conversion as a last resort? Usually assignment works for interfaces.
-		converted, convErr := sc.tryConvert(finalValueToAssign, destType)
-		if convErr == nil && converted.IsValid() {
-			sc.debug("-> Assigning converted value of type %s to interface %s", converted.Type(), destType)
-			dest.Set(converted)
-		} else {
-			// If still not assignable/convertible, it's an error.
-			errMsg := fmt.Sprintf("copied concrete type %s (or pointer) not assignable/convertible to destination interface %s", finalValueToAssign.Type(), destType)
-			err := fmt.Errorf("%w: %s", ErrTypeMismatch, errMsg)
-			if sc.handlePotentialError(err, ctx) {
+	// --- Get Concrete Source Value ---
+	srcConcreteVal := src
+	if src.Kind() == reflect.Interface {
+		srcConcreteVal = src.Elem()
+		// Check if concrete value inside interface is valid
+		if !srcConcreteVal.IsValid() {
+			if sc.skipNilSrc {
+				sc.debug(" -> Source interface contains invalid value, skipNilSrc=true. Skipping.", ctx.depth)
 				return nil
 			}
-			return err
+			if sc.overwrite {
+				sc.debug(" -> Source interface contains invalid value, overwrite=true. Setting dest interface %s to nil.", ctx.depth, destType)
+				dest.Set(reflect.Zero(destType))
+			} else {
+				sc.debug(" -> Source interface contains invalid value, overwrite=false. Leaving dest interface %s unchanged.", ctx.depth, destType)
+			}
+			return nil
 		}
+		// Handle case where interface contains nil pointer/map/slice etc.
+		concreteKind := srcConcreteVal.Kind()
+		if (concreteKind == reflect.Ptr || concreteKind == reflect.Map || concreteKind == reflect.Slice || concreteKind == reflect.Chan || concreteKind == reflect.Func) && srcConcreteVal.IsNil() {
+			if sc.skipNilSrc {
+				sc.debug(" -> Source interface contains nil pointer/map/slice etc., skipNilSrc=true. Skipping.", ctx.depth)
+				return nil
+			}
+			if sc.overwrite {
+				sc.debug(" -> Source interface contains nil pointer/map/slice etc., overwrite=true. Setting dest interface %s to nil.", ctx.depth, destType)
+				dest.Set(reflect.Zero(destType))
+			} else {
+				sc.debug(" -> Source interface contains nil pointer/map/slice etc., overwrite=false. Leaving dest interface %s unchanged.", ctx.depth, destType)
+			}
+			return nil
+		}
+
+	}
+	srcConcreteType := srcConcreteVal.Type()
+	sc.debug(" -> Concrete source value type: %s", srcConcreteType)
+
+	// --- Skip Concrete Value Checks (Zero/Empty) ---
+	if sc.skipZeroValue && srcConcreteVal.IsZero() {
+		sc.debug(" -> Skipping: skipZeroValue=true and concrete source value is zero.", ctx.depth)
+		return nil
+	}
+	if sc.skipEmptyValue && isEmptyValue(srcConcreteVal) {
+		sc.debug(" -> Skipping: skipEmptyValue=true and concrete source value is empty.", ctx.depth)
+		return nil
 	}
 
-	return nil
+	// --- Overwrite Check ---
+	// If not overwriting, check if the destination interface already holds a non-nil value.
+	if !sc.overwrite && dest.IsValid() && !dest.IsNil() {
+		sc.debug(" -> Skipping interface set: overwrite=false and destination interface %s is non-nil.", destType)
+		return nil
+	}
+
+	// --- Direct Assignment Check ---
+	// Can the concrete source value be assigned directly to the destination interface type?
+	// This checks if the concrete type implements the interface (or if dest is interface{}).
+	if srcConcreteType.AssignableTo(destType) {
+		sc.debug(" -> Concrete source type %s is assignable to dest interface %s. Assigning directly.", srcConcreteType, destType)
+		dest.Set(srcConcreteVal)
+		return nil
+	}
+	// What if the source is *T and the interface requires T? Or vice versa?
+	// Check pointer assignability as well.
+	if srcConcreteVal.CanAddr() && srcConcreteVal.Addr().Type().AssignableTo(destType) {
+		// If pointer to concrete value is assignable (e.g., interface needs *T, source is T)
+		sc.debug(" -> Pointer to concrete source type %s is assignable to dest interface %s. Assigning address.", srcConcreteVal.Addr().Type(), destType)
+		dest.Set(srcConcreteVal.Addr())
+		return nil
+	}
+	if srcConcreteVal.Kind() == reflect.Ptr && !srcConcreteVal.IsNil() && srcConcreteVal.Elem().Type().AssignableTo(destType) {
+		// If element of concrete pointer value is assignable (e.g., interface needs T, source is *T)
+		sc.debug(" -> Element of concrete source pointer type %s is assignable to dest interface %s. Assigning element.", srcConcreteType, destType)
+		dest.Set(srcConcreteVal.Elem())
+		return nil
+	}
+
+	// --- Copy into a New Holder ---
+	// If direct assignment isn't possible, or if we want a deep copy,
+	// we create a new value of the *source concrete type*, copy into it,
+	// and then try to assign that holder to the destination interface.
+	// This preserves the original concrete type within the interface but creates a copy of the data.
+	sc.debug(" -> Direct assignment failed. Creating new holder of type %s for deep copy.", srcConcreteType)
+	holder := reflect.New(srcConcreteType).Elem() // Create settable instance of source concrete type
+
+	sc.debug(" -> Recursively copying concrete source %s into holder %s.", srcConcreteType, holder.Type())
+	if err := sc.copyRecursive(holder, srcConcreteVal, ctx); err != nil {
+		// Failed to copy data into the holder
+		copyErr := fmt.Errorf("copying concrete value (%s) into interface holder (%s): %w", srcConcreteType, holder.Type(), err)
+		// Error handled by copyRecursive or needs bubbling up
+		// No need for handlePotentialError here as copyRecursive already did it.
+		return copyErr
+	}
+
+	// --- Assign Holder to Destination Interface ---
+	// Now try assigning the populated holder to the destination interface.
+	if holder.Type().AssignableTo(destType) {
+		sc.debug(" -> Assigning holder (%s) to destination interface %s.", holder.Type(), destType)
+		dest.Set(holder)
+	} else if holder.CanAddr() && holder.Addr().Type().AssignableTo(destType) {
+		// Assign pointer to holder if that fits the interface
+		sc.debug(" -> Assigning address of holder (%s) to destination interface %s.", holder.Addr().Type(), destType)
+		dest.Set(holder.Addr())
+	} else {
+		// This shouldn't typically happen if the original srcConcreteVal was assignable,
+		// but could occur if copyRecursive somehow changed the holder type incompatibly,
+		// or if the original assignability check missed a case.
+		err := fmt.Errorf("cannot assign copied holder type %s to destination interface %s", holder.Type(), destType)
+		if sc.handlePotentialError(err, ctx) {
+			return nil
+		}
+		return err
+	}
+
+	return nil // Interface copy successful
 }
 
-func (sc *SmartCopier) copyArray(dest, src reflect.Value, ctx *copyContext) error {
-	srcLen, destLen := src.Len(), dest.Len()
+func (sc *SmartCopier) copyArray(dest, src reflect.Value, ctx *mmContext) error {
 	destType := dest.Type()
 	srcType := src.Type()
-	sc.debug("Depth %d: copyArray: Dest: %s[%d] <- Src: %s[%d]", ctx.depth, destType, destLen, srcType, srcLen)
+	destLen := dest.Len()
+	srcLen := src.Len()
+	sc.debug("Depth %d: copyArray: Dest: %s (len %d) <- Src: %s (len %d)", ctx.depth, destType, destLen, srcType, srcLen)
 
+	// --- Basic Checks ---
 	if destLen != srcLen {
-		err := fmt.Errorf("%w: array length mismatch (dest len %d != src len %d) for types %s and %s", ErrTypeMismatch, destLen, srcLen, destType, srcType)
+		err := fmt.Errorf("%w: array length mismatch (dest %d != src %d)", ErrTypeMismatch, destLen, srcLen)
 		if sc.handlePotentialError(err, ctx) {
 			return nil
 		}
@@ -2087,146 +2318,157 @@ func (sc *SmartCopier) copyArray(dest, src reflect.Value, ctx *copyContext) erro
 		return err
 	}
 
-	// Array copy respects overwrite flag - if false and dest has content, skip.
-	// Use IsZero() to check if the array is uninitialized/zeroed.
-	if !sc.overwrite && dest.IsValid() && !dest.IsZero() {
-		sc.debug("-> Skipping array copy as !overwrite and destination array %s is non-zero", destType)
-		return nil
-	}
-
-	// --- Perform Element Copy ---
+	// --- Optimization: MemCopy ---
+	// Use direct memory copy if element types are identical and suitable.
+	// Note: Array elements *are* addressable directly.
 	destElemType := destType.Elem()
-	srcElemType := srcType.Elem()
-
-	// Optimization: Use reflect.Copy if elements are simple and assignable
-	canReflectCopy := false
-	if srcElemType.AssignableTo(destElemType) && isMemCopySuitable(destElemType) {
-		canReflectCopy = true
+	if sc.useUnsafe && destType == srcType && isMemCopySuitable(destElemType) {
+		// Get type info for size (might require caching array types too)
+		// For now, calculate size directly: elemSize * length
+		elemSize := destElemType.Size()
+		totalSize := elemSize * uintptr(destLen)
+		if totalSize > 0 && dest.CanAddr() && src.CanAddr() {
+			sc.debug(" -> Attempting unsafe memory copy for array %s (size %d)", destType, totalSize)
+			destPtr := unsafe.Pointer(dest.UnsafeAddr())
+			srcPtr := unsafe.Pointer(src.UnsafeAddr())
+			memmove(destPtr, srcPtr, totalSize)
+			runtime.KeepAlive(dest.Interface())
+			runtime.KeepAlive(src.Interface())
+			return nil // Memcopy successful
+		}
 	}
 
-	if canReflectCopy {
-		sc.debug("-> Using reflect.Copy for array %s", destType)
-		reflect.Copy(dest, src) // Fast path for simple arrays
-		return nil
-	}
-
-	// Fallback to element-wise recursive copy
-	sc.debug("-> Performing element-wise recursive copy for array %s", destType)
-	for i := 0; i < srcLen; i++ { // Iterate up to shared length
-		destElem := dest.Index(i)
+	// --- Element-by-Element Copy ---
+	sc.debug(" -> Performing element-by-element copy for array %s", destType)
+	for i := 0; i < srcLen; i++ {
 		srcElem := src.Index(i)
+		destElem := dest.Index(i)
 
+		// Destination element settability check (arrays elements are usually settable if array is)
 		if !destElem.CanSet() {
-			err := fmt.Errorf("cannot set destination array element at index %d for %s", i, destType)
+			err := fmt.Errorf("cannot set array element at index %d in %s", i, destType)
 			if sc.handlePotentialError(err, ctx) {
-				continue
+				continue // Skip this element
 			}
 			return err
 		}
 
-		sc.debug(" --> Recursing copy array index %d: Dest Elem: %s <- Src Elem: %s", i, destElem.Type(), srcElem.Type())
+		// --- Overwrite Check for Element ---
+		if !sc.overwrite && destElem.IsValid() && !isEmptyValue(destElem) {
+			sc.debug("    - Skipping element %d: overwrite=false and dest element is non-empty.", i)
+			continue
+		}
+
+		// --- Recursive Copy for Element ---
+		sc.debug("    - Recursively copying element %d", i)
 		if err := sc.copyRecursive(destElem, srcElem, ctx); err != nil {
 			elemErr := fmt.Errorf("copying array index %d: %w", i, err)
 			if sc.handlePotentialError(elemErr, ctx) {
-				continue
-			} // Collect and continue
-			return elemErr // Propagate
+				continue // Error collected, continue
+			}
+			return elemErr // Return immediately
 		}
 	}
-	return nil
+	return nil // Array copy successful
 }
 
+// tryConvert attempts to convert src value to destType using custom converters or Go's built-in Convert().
 func (sc *SmartCopier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.Value, error) {
+	if !src.IsValid() {
+		// Converting invalid value doesn't make sense
+		return reflect.Value{}, fmt.Errorf("cannot convert invalid source value")
+	}
 	srcType := src.Type()
 
-	// 1. Check Custom Converters
+	// 1. Check for Custom Converter
 	if destConvMap, ok := sc.typeConverters[srcType]; ok {
 		if converter, ok := destConvMap[destType]; ok {
-			sc.debug("-> Using custom converter: %s -> %s", srcType, destType)
+			sc.debug(" -> Using custom converter: %s -> %s", srcType, destType)
 			converted, err := converter(src)
 			if err != nil {
 				return reflect.Value{}, fmt.Errorf("custom converter %s -> %s failed: %w", srcType, destType, err)
 			}
-			// Handle nil result from converter carefully
+			// Check if converter returned nil/invalid for non-nillable types
 			if !converted.IsValid() {
-				// If dest is a nillable type, return its zero value (nil)
-				k := destType.Kind()
-				if k == reflect.Ptr || k == reflect.Map || k == reflect.Slice || k == reflect.Interface || k == reflect.Chan || k == reflect.Func {
-					return reflect.Zero(destType), nil
+				kind := destType.Kind()
+				isNillable := kind == reflect.Ptr || kind == reflect.Map || kind == reflect.Slice ||
+					kind == reflect.Interface || kind == reflect.Chan || kind == reflect.Func
+				if !isNillable {
+					return reflect.Value{}, fmt.Errorf("custom converter %s -> %s returned invalid/nil value for non-nillable type %s", srcType, destType, destType)
 				}
-				// Otherwise, nil is invalid for non-nillable types
-				return reflect.Value{}, fmt.Errorf("custom converter %s -> %s returned nil for non-nillable type %s", srcType, destType, destType)
+				// Return zero value for nillable types if converter returned nil
+				return reflect.Zero(destType), nil
 			}
-			// Check if converter returned the exact type or assignable/convertible
-			if converted.Type() == destType {
-				return converted, nil
-			}
+			// Check if returned type is assignable or convertible to the target type
 			if converted.Type().AssignableTo(destType) {
-				sc.debug(" -> Custom converter returned assignable type %s, using for %s", converted.Type(), destType)
+				sc.debug("  -> Custom converter returned assignable type %s", converted.Type())
 				return converted, nil
 			}
 			if converted.Type().ConvertibleTo(destType) {
-				sc.debug(" -> Custom converter returned convertible type %s, converting to %s", converted.Type(), destType)
+				sc.debug("  -> Custom converter returned convertible type %s, converting to %s", converted.Type(), destType)
 				return converted.Convert(destType), nil
 			}
 			return reflect.Value{}, fmt.Errorf("custom converter %s -> %s returned incompatible type %s", srcType, destType, converted.Type())
 		}
 	}
 
-	// 2. Check Go's Built-in Conversion
+	// 2. Check Go's Built-in Convertibility
 	if srcType.ConvertibleTo(destType) {
-		sc.debug("-> Using Go's built-in conversion: %s -> %s", srcType, destType)
+		sc.debug(" -> Using Go's built-in conversion: %s -> %s", srcType, destType)
 		return src.Convert(destType), nil
 	}
 
-	// 3. Handle Interface Source
-	// If source is interface, try converting its concrete element
+	// 3. Handle Conversion from Interface's Concrete Type
+	// If src is an interface containing a value, try converting the concrete value.
 	if src.Kind() == reflect.Interface && !src.IsNil() {
 		srcElem := src.Elem()
-		if srcElem.IsValid() {
-			sc.debug("-> Retrying conversion from concrete type %s (within interface) to %s", srcElem.Type(), destType)
-			// Recursive call to tryConvert with the concrete element
+		if srcElem.IsValid() && srcElem.Type() != srcType { // Avoid infinite recursion if Elem gives same type
+			sc.debug(" -> Retrying conversion from concrete type %s (within interface %s) to %s", srcElem.Type(), srcType, destType)
+			// Recurse using tryConvert, not copyRecursive
 			return sc.tryConvert(srcElem, destType)
 		}
 	}
 
-	// 4. Handle Pointer Source to Pointer Destination
-	// If src is *T1 and dest is *T2, try converting T1 to T2 and wrap in *T2
+	// 4. Handle Conversion Between Pointer Types (by converting elements)
+	// If src is *S and dest is *D, try converting S to D and wrapping in *D.
 	if src.Kind() == reflect.Ptr && !src.IsNil() && destType.Kind() == reflect.Ptr {
 		srcElem := src.Elem()
+		destElemType := destType.Elem()
 		if srcElem.IsValid() {
-			destElemType := destType.Elem()
-			sc.debug("-> Attempting pointer element conversion: %s -> %s", srcElem.Type(), destElemType)
-			convertedElem, err := sc.tryConvert(srcElem, destElemType) // Recursive call for element
+			sc.debug(" -> Attempting pointer element conversion: %s -> %s", srcElem.Type(), destElemType)
+			// Try converting the element
+			convertedElem, err := sc.tryConvert(srcElem, destElemType)
 			if err == nil && convertedElem.IsValid() {
-				// Create new pointer of destination type and set its element
+				// Conversion successful, create new pointer of destination type
 				newDestPtr := reflect.New(destElemType)
-				newDestPtr.Elem().Set(convertedElem)
-				sc.debug(" -> Pointer element conversion successful, returning new %s", newDestPtr.Type())
+				newDestPtr.Elem().Set(convertedElem) // Set the converted value
+				sc.debug("  -> Pointer element conversion successful, returning new %s", newDestPtr.Type())
 				return newDestPtr, nil
 			}
-			sc.debug(" -> Pointer element conversion failed: %v", err)
+			sc.debug("  -> Pointer element conversion failed: %v", err)
 		}
 	}
 
-	// 5. No suitable conversion found
-	sc.debug("-> No converter found for %s -> %s", srcType, destType)
+	// No suitable conversion found
+	sc.debug(" -> No custom or built-in converter found for %s -> %s", srcType, destType)
 	return reflect.Value{}, fmt.Errorf("%w: from %s to %s", ErrNoConverter, srcType, destType)
 }
 
+// --- Utility Functions ---
+
+// debug logs messages if debugMode is enabled.
 func (sc *SmartCopier) debug(format string, args ...interface{}) {
 	if sc.debugMode {
-		// Add indentation based on context depth for readability
-		indent := strings.Repeat("  ", ctxDepth())
-		log.Printf("[mm debug] "+indent+format, args...)
+		// Add prefix for clarity
+		log.Printf("[mm debug] "+format, args...)
 	}
 }
 
-// Helper to get current depth from context (if available)
-// This is a placeholder - context needs to be accessible or passed differently for this to work.
-// For simplicity, we won't use dynamic indentation in this version.
-func ctxDepth() int {
-	// In a real implementation, get depth from context passed around.
-	// For now, return 0.
-	return 0
-}
+// memmove is assumed to be defined elsewhere (e.g., unsafe.go) using linkname or cgo.
+// If not, uncommenting the linkname below might work, but risks conflicts/brittleness.
+// //go:linkname memmove runtime.memmove
+// //go:noescape
+// func memmove(to, from unsafe.Pointer, n uintptr)
+
+// Removed the memmove definition from here to resolve the "redeclared" error.
+// Ensure it's defined in exactly one place accessible to this package, likely via linkname in a separate `unsafe_*.go` file.

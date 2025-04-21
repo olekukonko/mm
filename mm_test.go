@@ -110,12 +110,12 @@ type SourceWithExtras struct {
 type DestWithUnmapped struct {
 	ID        int
 	DestName  string
-	ExtraData map[string]interface{} `mm:",unmaped"` // Collector field
+	ExtraData map[string]interface{} `mm:",unmapped"` // Collector field
 }
 type DestWithWrongUnmapped struct {
 	ID        int
 	DestName  string
-	ExtraData []string `mm:",unmaped"` // Wrong type for unmapped
+	ExtraData []string `mm:",unmapped"` // Wrong type for unmapped
 }
 type MapSource struct { // For struct -> map tests
 	FirstName string
@@ -249,7 +249,7 @@ func TestTypeConversion(t *testing.T) {
 }
 
 func TestUnexportedFields(t *testing.T) {
-	src := UnexportedSrc{Public: "ok", private: "secret"}
+	src := &UnexportedSrc{Public: "ok", private: "secret"}
 	var dest UnexportedDest
 
 	// Test without unexported enabled (DEFAULT)
