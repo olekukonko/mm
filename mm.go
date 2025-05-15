@@ -70,10 +70,10 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 
 	if src == nil {
 		if c.skipNilSrc {
-			c.logger.Debug("CopyWith: Source is nil and skipNilSrc=true, returning zero value for T.")
+			c.logger.Debugf("CopyWith: Source is nil and skipNilSrc=true, returning zero value for T.")
 			return zero, nil
 		}
-		c.logger.Debug("CopyWith: Source is nil and skipNilSrc=false, returning ErrSourceIsNil.")
+		c.logger.Debugf("CopyWith: Source is nil and skipNilSrc=false, returning ErrSourceIsNil.")
 		errToRet := ErrSourceIsNil
 		// Use finalizeResult to handle panicOnError consistently even for this upfront check
 		return zero, c.finalizeResult(errToRet, &SysContext{errors: make([]error, 0)})
@@ -90,10 +90,10 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 
 		if !srcVal.IsValid() {
 			if c.skipNilSrc {
-				c.logger.Debug("CopyWith[interface T]: Source became invalid after Elem() and skipNilSrc=true, returning zero T.")
+				c.logger.Debugf("CopyWith[interface T]: Source became invalid after Elem() and skipNilSrc=true, returning zero T.")
 				return zero, nil
 			}
-			c.logger.Debug("CopyWith[interface T]: Source became invalid after Elem() and skipNilSrc=false, returning ErrSourceIsNil.")
+			c.logger.Debugf("CopyWith[interface T]: Source became invalid after Elem() and skipNilSrc=false, returning ErrSourceIsNil.")
 			errToRet := ErrSourceIsNil
 			return zero, c.finalizeResult(errToRet, &SysContext{errors: make([]error, 0)})
 		}
@@ -106,12 +106,12 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 		if c.enableCycleDetect && srcVal.Kind() == reflect.Ptr && !srcVal.IsNil() {
 			// Ensure concreteDestVal is addressable before taking Addr()
 			if concreteDestVal.CanAddr() {
-				c.logger.Debug("CopyWith[interface T]: Priming cycle detector for top-level ptr source: %p (%s) -> %p (%s)",
+				c.logger.Debugf("CopyWith[interface T]: Priming cycle detector for top-level ptr source: %p (%s) -> %p (%s)",
 					unsafe.Pointer(srcVal.Pointer()), srcVal.Type(),
 					unsafe.Pointer(concreteDestVal.Addr().Pointer()), concreteDestVal.Addr().Type())
 				ctx.detector.Track(srcVal.Pointer(), srcVal.Type().Elem(), concreteDestVal.Addr())
 			} else if concreteDestVal.Kind() == reflect.Ptr { // If concreteDestVal itself is a pointer type (e.g. T is *SomeType)
-				c.logger.Debug("CopyWith[interface T]: Priming cycle detector for top-level ptr source (dest is ptr): %p (%s) -> destVal itself %s",
+				c.logger.Debugf("CopyWith[interface T]: Priming cycle detector for top-level ptr source (dest is ptr): %p (%s) -> destVal itself %s",
 					unsafe.Pointer(srcVal.Pointer()), srcVal.Type(), concreteDestVal.Type())
 				ctx.detector.Track(srcVal.Pointer(), srcVal.Type().Elem(), concreteDestVal) // Track to the pointer value directly
 			}
@@ -142,7 +142,7 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 
 		if c.enableCycleDetect && srcReflectVal.IsValid() && srcReflectVal.Kind() == reflect.Ptr && !srcReflectVal.IsNil() {
 			if srcReflectVal.Type() == destPtr.Type() {
-				c.logger.Debug("CopyWith[struct T]: Priming cycle detector for top-level object: %p (%s) -> %p (%s)",
+				c.logger.Debugf("CopyWith[struct T]: Priming cycle detector for top-level object: %p (%s) -> %p (%s)",
 					unsafe.Pointer(srcReflectVal.Pointer()), srcReflectVal.Type(),
 					unsafe.Pointer(destPtr.Pointer()), destPtr.Type())
 				ctx.detector.Track(srcReflectVal.Pointer(), srcReflectVal.Type().Elem(), destPtr)
@@ -177,7 +177,7 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 			destReflectType.Kind() == reflect.Ptr &&
 			srcReflectVal.IsValid() && srcReflectVal.Kind() == reflect.Ptr && !srcReflectVal.IsNil() &&
 			srcReflectVal.Type() == destReflectType {
-			c.logger.Debug("CopyWith[ptr T, non-special]: Priming cycle detector for top-level pointer object: %p (%s) -> %p (%s)",
+			c.logger.Debugf("CopyWith[ptr T, non-special]: Priming cycle detector for top-level pointer object: %p (%s) -> %p (%s)",
 				unsafe.Pointer(srcReflectVal.Pointer()), srcReflectVal.Type(),
 				unsafe.Pointer(destVal.UnsafeAddr()), destVal.Type()) // Use UnsafeAddr if destVal is a pointer
 			ctx.detector.Track(srcReflectVal.Pointer(), destReflectType.Elem(), destVal)
@@ -278,7 +278,7 @@ func (c *Copier) AddFallbackTagKeys(keys ...string) *Copier {
 
 // Copy copies data from src into dest. dest must be a non-nil pointer.
 func (c *Copier) Copy(dest interface{}, src interface{}) error {
-	c.logger.Debug("Copier.Copy started. Overwrite: %v, Debug: %v", c.overwrite, c.debugMode)
+	c.logger.Debugf("Copier.Copy started. Overwrite: %v, Debug: %v", c.overwrite, c.debugMode)
 	if dest == nil {
 		return c.finalizeResult(ErrDestinationIsNil, &SysContext{errors: make([]error, 0)})
 	}
@@ -290,12 +290,12 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 
 	if src == nil {
 		if c.skipNilSrc {
-			c.logger.Debug("Copy: Source is nil, skipping (skipNilSrc=true).")
+			c.logger.Debugf("Copy: Source is nil, skipping (skipNilSrc=true).")
 			return nil
 		}
-		c.logger.Debug("Copy: Source is nil (skipNilSrc=false, overwrite=%v). Proceeding to copyRecursive (will zero dest or error).", c.overwrite)
+		c.logger.Debugf("Copy: Source is nil (skipNilSrc=false, overwrite=%v). Proceeding to copyRecursive (will zero dest or error).", c.overwrite)
 	} else {
-		c.logger.Debug("Copy: Source is non-nil. Type: %T", src)
+		c.logger.Debugf("Copy: Source is non-nil. Type: %T", src)
 	}
 
 	destElem := destVal.Elem()
@@ -305,7 +305,7 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 			err := fmt.Errorf("destination element (type %s) is not settable and unsafe cannot help", destElem.Type())
 			return c.finalizeResult(err, &SysContext{errors: make([]error, 0)})
 		}
-		c.logger.Debug("Destination element %s not settable via standard means, relying on unsafe.", destElem.Type())
+		c.logger.Debugf("Destination element %s not settable via standard means, relying on unsafe.", destElem.Type())
 	}
 
 	ctx := &SysContext{depth: 0, visited: make(map[visitKey]reflect.Value), errors: make([]error, 0), detector: newCycleDetector()}
@@ -323,7 +323,7 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 	if c.enableCycleDetect && !isSpecialPointerType &&
 		srcReflectVal.IsValid() && srcReflectVal.Kind() == reflect.Ptr && !srcReflectVal.IsNil() {
 		if destVal.Type() == srcReflectVal.Type() && destVal.Type().Elem().Kind() == reflect.Struct {
-			c.logger.Debug("Copier.Copy: Priming cycle detector for top-level object: %p (%s) -> %p (%s)",
+			c.logger.Debugf("Copier.Copy: Priming cycle detector for top-level object: %p (%s) -> %p (%s)",
 				unsafe.Pointer(srcReflectVal.Pointer()), srcReflectVal.Type(),
 				unsafe.Pointer(destVal.Pointer()), destVal.Type())
 			ctx.detector.Track(srcReflectVal.Pointer(), srcReflectVal.Type().Elem(), destVal)
@@ -334,7 +334,7 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 
 	finalErr := c.finalizeResult(err, ctx)
 	if finalErr != nil && c.silentErrors {
-		c.logger.Debug("Copy: Error occurred but suppressed due to silentErrors=true: %v", finalErr)
+		c.logger.Debugf("Copy: Error occurred but suppressed due to silentErrors=true: %v", finalErr)
 		return nil
 	}
 	return finalErr
@@ -358,7 +358,7 @@ func (c *Copier) Merge(dest, src interface{}) error {
 	tempCopier.merging = true
 	tempCopier.debugMode = c.debugMode
 
-	c.logger.Debug("Copier.Merge called. Effective copier config for merge -> Overwrite: %v, Debug: %v", tempCopier.overwrite, tempCopier.debugMode)
+	c.logger.Debugf("Copier.Merge called. Effective copier config for merge -> Overwrite: %v, Debug: %v", tempCopier.overwrite, tempCopier.debugMode)
 	return tempCopier.Copy(dest, src)
 }
 
@@ -394,7 +394,7 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 
 	var overallErr error
 
-	c.logger.Debug("CopyCat: Processing first source...")
+	c.logger.Debugf("CopyCat: Processing first source...")
 	firstSrcReflectVal := reflect.ValueOf(sources[0])
 
 	isSpecialPointerType := false
@@ -415,31 +415,31 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 	err := firstCopier.copyRecursive(destElem, firstSrcReflectVal, ctx)
 	if err != nil {
 		if firstCopier.handlePotentialError(err, ctx) {
-			c.logger.Debug("CopyCat: Error collected from first source, continuing...")
+			c.logger.Debugf("CopyCat: Error collected from first source, continuing...")
 		} else {
 			overallErr = err
 			if !firstCopier.collectErrors {
-				c.logger.Debug("CopyCat: Error from first source, stopping (collectErrors=false).")
+				c.logger.Debugf("CopyCat: Error from first source, stopping (collectErrors=false).")
 				return c.finalizeResult(overallErr, ctx)
 			}
 		}
 	}
 
 	if len(sources) > 1 {
-		c.logger.Debug("CopyCat: Processing subsequent sources for merge...")
+		c.logger.Debugf("CopyCat: Processing subsequent sources for merge...")
 		for i := 1; i < len(sources); i++ {
-			c.logger.Debug("CopyCat: Merging source %d...", i+1)
+			c.logger.Debugf("CopyCat: Merging source %d...", i+1)
 			currentSrcVal := reflect.ValueOf(sources[i])
 			err := mergeCopier.copyRecursive(destElem, currentSrcVal, ctx)
 			if err != nil {
 				if mergeCopier.handlePotentialError(err, ctx) {
-					c.logger.Debug("CopyCat: Error collected from source %d, continuing...", i+1)
+					c.logger.Debugf("CopyCat: Error collected from source %d, continuing...", i+1)
 				} else {
 					if overallErr == nil {
 						overallErr = err
 					}
 					if !mergeCopier.collectErrors {
-						c.logger.Debug("CopyCat: Error from source %d, stopping (collectErrors=false).", i+1)
+						c.logger.Debugf("CopyCat: Error from source %d, stopping (collectErrors=false).", i+1)
 						break
 					}
 				}
@@ -449,7 +449,7 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 
 	finalErr := c.finalizeResult(overallErr, ctx)
 	if finalErr != nil && c.silentErrors {
-		c.logger.Debug("CopyCat: Error occurred but suppressed due to silentErrors=true: %v", finalErr)
+		c.logger.Debugf("CopyCat: Error occurred but suppressed due to silentErrors=true: %v", finalErr)
 		return nil
 	}
 	return finalErr
@@ -458,7 +458,7 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 // Deep creates a deep copy of the input value v.
 // It returns a new value independent of the original.
 func (c *Copier) Deep(v interface{}) (interface{}, error) {
-	c.logger.Debug("Copier.Deep called for type %T", v)
+	c.logger.Debugf("Copier.Deep called for type %T", v)
 	if v == nil {
 		if c.skipNilSrc {
 			return nil, nil
@@ -499,7 +499,7 @@ func (c *Copier) Deep(v interface{}) (interface{}, error) {
 	finalErr := c.finalizeResult(err, ctx)
 	if finalErr != nil {
 		if c.silentErrors {
-			c.logger.Debug("Deep: Error occurred but suppressed due to silentErrors=true: %v", finalErr)
+			c.logger.Debugf("Deep: Error occurred but suppressed due to silentErrors=true: %v", finalErr)
 			return reflect.Zero(destType).Interface(), nil
 		}
 		return nil, finalErr

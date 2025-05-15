@@ -35,7 +35,7 @@ func (c *Copier) processItem(
 	} else {
 		srcTypeStr, srcKindStr = "<invalid_src_type>", "<invalid_src_kind>"
 	}
-	c.logger.Debug("PROCESS_ITEM Start: '%s' (Src: %s, Kind: %s -> BaseDestType: %s, ItemSensitiveFlags: srcItemSensitive=%v)", itemName, srcTypeStr, srcKindStr, baseDestType, isSrcItemSensitive)
+	c.logger.Debugf("PROCESS_ITEM Start: '%s' (Src: %s, Kind: %s -> BaseDestType: %s, ItemSensitiveFlags: srcItemSensitive=%v)", itemName, srcTypeStr, srcKindStr, baseDestType, isSrcItemSensitive)
 
 	defer func() { // Defer logging the result
 		status := "OK"
@@ -48,7 +48,7 @@ func (c *Copier) processItem(
 		if result.valueToSet.IsValid() {
 			valTypeStr = result.valueToSet.Type().String()
 		}
-		c.logger.Debug("PROCESS_ITEM End: '%s'. Status: %s, ShouldSet: %v, ValueToSetType: %s%s", itemName, status, result.shouldSet, valTypeStr, errMsg)
+		c.logger.Debugf("PROCESS_ITEM End: '%s'. Status: %s, ShouldSet: %v, ValueToSetType: %s%s", itemName, status, result.shouldSet, valTypeStr, errMsg)
 	}()
 	// --- End Setup Logging ---
 
@@ -63,32 +63,32 @@ func (c *Copier) processItem(
 
 	// --- 1. Skip Checks ---
 	if isSrcItemSensitive && c.skipSensitive {
-		c.logger.Debug("  Skipping '%s' (sensitive item, skipSensitive=true).", itemName)
+		c.logger.Debugf("  Skipping '%s' (sensitive item, skipSensitive=true).", itemName)
 		// Returning shouldSet=false correctly signifies that the dest should not be touched (or zeroed if struct field + overwrite).
 		return processItemResult{shouldSet: false}
 	}
 	if c.skipZeroValue && isValidSrc && src.IsZero() {
-		c.logger.Debug("  Skipping '%s' (zero value).", itemName)
+		c.logger.Debugf("  Skipping '%s' (zero value).", itemName)
 		return processItemResult{shouldSet: false}
 	}
 	if c.skipEmptyValue && isEmptyValue(src) { // isEmptyValue handles invalid src
-		c.logger.Debug("  Skipping '%s' (empty value).", itemName)
+		c.logger.Debugf("  Skipping '%s' (empty value).", itemName)
 		return processItemResult{shouldSet: false}
 	}
 	if isValidSrc {
 		k := src.Kind()
 		if (k == reflect.Ptr || k == reflect.Interface || k == reflect.Map || k == reflect.Slice || k == reflect.Chan || k == reflect.Func) && src.IsNil() {
 			if c.skipNilSrc {
-				c.logger.Debug("  Skipping '%s' (nil src value, skipNilSrc=true).", itemName)
+				c.logger.Debugf("  Skipping '%s' (nil src value, skipNilSrc=true).", itemName)
 				return processItemResult{shouldSet: false}
 			}
 		}
 	} else { // !isValidSrc (already handled by isEmptyValue if skipEmptyValue is true)
 		if c.skipNilSrc { // Explicit skipNilSrc check for invalid src if skipEmptyValue is false
-			c.logger.Debug("  Skipping '%s' (invalid src value, skipNilSrc=true).", itemName)
+			c.logger.Debugf("  Skipping '%s' (invalid src value, skipNilSrc=true).", itemName)
 			return processItemResult{shouldSet: false}
 		}
-		c.logger.Debug("  Proceeding with invalid src for '%s' (skipNilSrc=false) -> Fallback.", itemName)
+		c.logger.Debugf("  Proceeding with invalid src for '%s' (skipNilSrc=false) -> Fallback.", itemName)
 		goto PrepareFallback // Jump to fallback for invalid source if not skipped
 	}
 	// --- End Skip Checks ---
@@ -105,13 +105,13 @@ func (c *Copier) processItem(
 		// For sensitive items, Copiable MUST exist on src (concrete), dest, or *dest.
 		if canUseSrcConcreteForCopiable {
 			copiableToCallType = srcConcreteForCopiableCheck.Type()
-			c.logger.Debug("   Sensitive item '%s': Using Copiable from source's concrete type %s.", itemName, copiableToCallType)
+			c.logger.Debugf("   Sensitive item '%s': Using Copiable from source's concrete type %s.", itemName, copiableToCallType)
 		} else if baseDestType.Implements(copiableInterfaceType) {
 			copiableToCallType = baseDestType
-			c.logger.Debug("   Sensitive item '%s': Source type %s (or its concrete %s) lacks Copiable, using Copiable from dest type %s.", itemName, srcTypeStr, srcConcreteForCopiableCheck.Type(), baseDestType)
+			c.logger.Debugf("   Sensitive item '%s': Source type %s (or its concrete %s) lacks Copiable, using Copiable from dest type %s.", itemName, srcTypeStr, srcConcreteForCopiableCheck.Type(), baseDestType)
 		} else if reflect.PtrTo(baseDestType).Implements(copiableInterfaceType) {
 			copiableToCallType = reflect.PtrTo(baseDestType)
-			c.logger.Debug("   Sensitive item '%s': Source/Dest lack Copiable, using Copiable from pointer to dest type *%s.", itemName, baseDestType)
+			c.logger.Debugf("   Sensitive item '%s': Source/Dest lack Copiable, using Copiable from pointer to dest type *%s.", itemName, baseDestType)
 		} else {
 			// Error: Sensitive item without any Copiable handler
 			logSrcTypeForError := srcTypeStr
@@ -119,7 +119,7 @@ func (c *Copier) processItem(
 				logSrcTypeForError = fmt.Sprintf("%s (concrete %s)", srcTypeStr, srcConcreteForCopiableCheck.Type())
 			}
 			errMsg := fmt.Sprintf("sensitive item '%s' (src type %s) requires Copiable on source's (concrete) type, dest type (%s), or pointer to dest type (*%s), but none found", itemName, logSrcTypeForError, baseDestType, baseDestType)
-			c.logger.Warn("  -> ERROR: %s.", errMsg)
+			c.logger.Warnf("  -> ERROR: %s.", errMsg)
 			if c.debugMode {
 				log.Printf("[mm debug] %s: %s", itemName, errMsg)
 			}
@@ -142,7 +142,7 @@ func (c *Copier) processItem(
 		}
 		// Log only if a Copiable was actually identified
 		if copiableToCallType != baseDestType || baseDestType.Implements(copiableInterfaceType) {
-			c.logger.Debug("   Non-sensitive item '%s': Chosen type for Copiable check is %s.", itemName, copiableToCallType)
+			c.logger.Debugf("   Non-sensitive item '%s': Chosen type for Copiable check is %s.", itemName, copiableToCallType)
 		}
 	}
 	// --- End Sensitivity/Copiable Check ---
@@ -165,7 +165,7 @@ func (c *Copier) processItem(
 	}
 
 	if canAttemptCopiable {
-		c.logger.Debug("  Attempting Copiable execution for '%s' using Copiable on type %s...", itemName, copiableToCallType)
+		c.logger.Debugf("  Attempting Copiable execution for '%s' using Copiable on type %s...", itemName, copiableToCallType)
 
 		var copiableInst Copiable
 		var okAssert bool
@@ -222,7 +222,7 @@ func (c *Copier) processItem(
 		if ctxCopy.Overwrite {
 			// Check for conflict: Copiable wants overwrite, but copier is merging a sensitive item.
 			if !c.overwrite && isSrcItemSensitive {
-				c.logger.Warn("    Copiable for sensitive '%s' set Overwrite=true, but copier is in Merge mode. This is an error for sensitive items.", itemName)
+				c.logger.Warnf("    Copiable for sensitive '%s' set Overwrite=true, but copier is in Merge mode. This is an error for sensitive items.", itemName)
 				sensitiveErr := fmt.Errorf("sensitive item '%s' (type %s) Copiable wants overwrite, but copier is in Merge mode: %w", itemName, srcTypeStr, ErrSensitiveTypeCopied)
 				if c.handlePotentialError(sensitiveErr, ctxSys) {
 					return processItemResult{shouldSet: false}
@@ -234,17 +234,17 @@ func (c *Copier) processItem(
 			if valueReturnedByCopy != nil {
 				valToRet := reflect.ValueOf(valueReturnedByCopy)
 				if !valToRet.IsValid() { // Check if reflect.ValueOf gives valid value
-					c.logger.Debug("    Copiable for '%s' returned non-nil but reflect.ValueOf is invalid; will set zero of baseDestType %s.", itemName, baseDestType)
+					c.logger.Debugf("    Copiable for '%s' returned non-nil but reflect.ValueOf is invalid; will set zero of baseDestType %s.", itemName, baseDestType)
 					return processItemResult{valueToSet: reflect.Zero(baseDestType), shouldSet: true}
 				}
 				// Check assignability/convertibility to the destination slot type
 				if valToRet.Type().AssignableTo(baseDestType) {
-					c.logger.Debug("    Copiable for '%s' provided assignable value type %s for baseDestType %s.", itemName, valToRet.Type(), baseDestType)
+					c.logger.Debugf("    Copiable for '%s' provided assignable value type %s for baseDestType %s.", itemName, valToRet.Type(), baseDestType)
 					return processItemResult{valueToSet: valToRet, shouldSet: true}
 				}
 				if valToRet.Type().ConvertibleTo(baseDestType) {
 					converted := valToRet.Convert(baseDestType)
-					c.logger.Debug("    Copiable for '%s' provided convertible value type %s, converted to %s for baseDestType %s.", itemName, valToRet.Type(), converted.Type(), baseDestType)
+					c.logger.Debugf("    Copiable for '%s' provided convertible value type %s, converted to %s for baseDestType %s.", itemName, valToRet.Type(), converted.Type(), baseDestType)
 					return processItemResult{valueToSet: converted, shouldSet: true}
 				}
 				// Error: returned type is incompatible
@@ -254,12 +254,12 @@ func (c *Copier) processItem(
 				}
 				return processItemResult{err: itemErr}
 			} else { // Copiable returned nil
-				c.logger.Debug("    Copiable for '%s' wants to set nil/zero value (returned nil) for baseDestType %s.", itemName, baseDestType)
+				c.logger.Debugf("    Copiable for '%s' wants to set nil/zero value (returned nil) for baseDestType %s.", itemName, baseDestType)
 				return processItemResult{valueToSet: reflect.Zero(baseDestType), shouldSet: true}
 			}
 		} else { // Copiable.Overwrite was false
 			if isSrcItemSensitive { // This is an error for sensitive types
-				c.logger.Warn("    Sensitive item '%s' was handled by Copiable, but Copiable.Overwrite was false. This is an error for sensitive items.", itemName)
+				c.logger.Warnf("    Sensitive item '%s' was handled by Copiable, but Copiable.Overwrite was false. This is an error for sensitive items.", itemName)
 				sensitiveErr := fmt.Errorf("sensitive item '%s' (type %s) was handled by Copiable, but Copiable.Overwrite was false: %w", itemName, srcTypeStr, ErrSensitiveTypeCopied)
 				if c.handlePotentialError(sensitiveErr, ctxSys) {
 					return processItemResult{shouldSet: false}
@@ -267,7 +267,7 @@ func (c *Copier) processItem(
 				return processItemResult{err: sensitiveErr}
 			}
 			// Not sensitive, Copiable chose not to overwrite. Correct behavior is to not set.
-			c.logger.Debug("    Copiable for '%s' ran but did not set Overwrite=true. Item will not be set by Copiable path.", itemName)
+			c.logger.Debugf("    Copiable for '%s' ran but did not set Overwrite=true. Item will not be set by Copiable path.", itemName)
 			return processItemResult{shouldSet: false}
 		}
 	}
@@ -277,7 +277,7 @@ PrepareFallback: // Label for goto jump from invalid source handling
 	// If a sensitive item reaches here, it means no Copiable was found or suitable.
 	if isSrcItemSensitive {
 		// This path should only be reached if the Copiable check logic above failed to find one.
-		c.logger.Error("INTERNAL LOGIC WARNING: Sensitive item '%s' (Src: %s) reached recursive copy fallback unexpectedly. This usually indicates a missing Copiable for a sensitive type.", itemName, srcTypeStr)
+		c.logger.Errorf("INTERNAL LOGIC WARNING: Sensitive item '%s' (Src: %s) reached recursive copy fallback unexpectedly. This usually indicates a missing Copiable for a sensitive type.", itemName, srcTypeStr)
 		sensitiveErr := fmt.Errorf("internal error or misconfiguration: sensitive item '%s' (type %s) attempted recursive copy fallback without custom handling: %w", itemName, srcTypeStr, ErrSensitiveTypeCopied)
 		if c.handlePotentialError(sensitiveErr, ctxSys) {
 			return processItemResult{shouldSet: false}
@@ -286,7 +286,7 @@ PrepareFallback: // Label for goto jump from invalid source handling
 	}
 
 	// --- 4. Fallback to Recursive Copy ---
-	c.logger.Debug("  -> Falling back to recursive copy for non-sensitive item '%s'.", itemName)
+	c.logger.Debugf("  -> Falling back to recursive copy for non-sensitive item '%s'.", itemName)
 
 	if baseDestType == nil || baseDestType.Kind() == reflect.Invalid {
 		itemErr := fmt.Errorf("internal error: cannot create holder for invalid baseDestType for item '%s'", itemName)
@@ -306,7 +306,7 @@ PrepareFallback: // Label for goto jump from invalid source handling
 		return processItemResult{err: itemErr}
 	}
 
-	c.logger.Debug("  Recursive copy for '%s' successful. Holder type: %s", itemName, holder.Type())
+	c.logger.Debugf("  Recursive copy for '%s' successful. Holder type: %s", itemName, holder.Type())
 	return processItemResult{valueToSet: holder, shouldSet: true}
 	// --- End Fallback ---
 }

@@ -17,7 +17,7 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 	concreteType := typ
 	if concreteType.Kind() == reflect.Ptr {
 		if concreteType.Elem() == nil {
-			c.logger.Warn("getTypeInfo: encountered pointer type %s with nil element type", typ)
+			c.logger.Warnf("getTypeInfo: encountered pointer type %s with nil element type", typ)
 			return &TypeInfo{fields: make(map[string]FieldInfo)}
 		}
 		concreteType = concreteType.Elem()
@@ -42,7 +42,7 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 		return cached.(*TypeInfo)
 	}
 
-	c.logger.Debug("getTypeInfo: Analyzing struct type %s (concrete: %s)", typ, concreteType)
+	c.logger.Debugf("getTypeInfo: Analyzing struct type %s (concrete: %s)", typ, concreteType)
 	info := &TypeInfo{
 		fields:       make(map[string]FieldInfo),
 		size:         typ.Size(),
@@ -58,10 +58,10 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 
 	for i := 0; i < concreteType.NumField(); i++ {
 		f := concreteType.Field(i)
-		c.logger.Debug("getTypeInfo: Processing field %s.%s", concreteType.Name(), f.Name)
+		c.logger.Debugf("getTypeInfo: Processing field %s.%s", concreteType.Name(), f.Name)
 
 		if f.PkgPath != "" && !c.copyUnexported {
-			c.logger.Debug("getTypeInfo:     Skipping unexported field '%s'.", f.Name)
+			c.logger.Debugf("getTypeInfo:     Skipping unexported field '%s'.", f.Name)
 			continue
 		}
 
@@ -76,24 +76,24 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 			if name, ok := parsedOpts["name"]; ok {
 				effectiveName = name
 				chosenTagOptions = parsedOpts
-				c.logger.Debug("getTypeInfo:     Primary tag ('%s') provided name: '%s', options: %v", c.tagName, effectiveName, chosenTagOptions)
+				c.logger.Debugf("getTypeInfo:     Primary tag ('%s') provided name: '%s', options: %v", c.tagName, effectiveName, chosenTagOptions)
 			} else if _, ignorePresent := parsedOpts["-"]; ignorePresent {
 				isIgnoredByTag = true
 				chosenTagOptions = parsedOpts
-				c.logger.Debug("getTypeInfo:     Primary tag ('%s') IGNORED field '%s'.", c.tagName, f.Name)
+				c.logger.Debugf("getTypeInfo:     Primary tag ('%s') IGNORED field '%s'.", c.tagName, f.Name)
 			} else { // Primary tag exists but only contains flags (like "omitempty", "sensitive")
 				chosenTagOptions = parsedOpts
-				c.logger.Debug("getTypeInfo:     Primary tag ('%s') provided only flags: %v for field '%s'. Effective name remains '%s'.", c.tagName, chosenTagOptions, f.Name, effectiveName)
+				c.logger.Debugf("getTypeInfo:     Primary tag ('%s') provided only flags: %v for field '%s'. Effective name remains '%s'.", c.tagName, chosenTagOptions, f.Name, effectiveName)
 			}
 		} else {
-			c.logger.Debug("getTypeInfo:     Primary tag ('%s') not found or empty for field %s.", c.tagName, f.Name)
+			c.logger.Debugf("getTypeInfo:     Primary tag ('%s') not found or empty for field %s.", c.tagName, f.Name)
 		}
 
 		shouldTryFallbacksForName := !isIgnoredByTag && c.tagResolution &&
 			(chosenTagOptions == nil || (chosenTagOptions != nil && effectiveName == f.Name && chosenTagOptions["name"] == ""))
 
 		if shouldTryFallbacksForName {
-			c.logger.Debug("getTypeInfo:     Tag resolution ON for field %s. Trying fallbacks for name/ignore: %v", f.Name, c.fallbackTagKeys)
+			c.logger.Debugf("getTypeInfo:     Tag resolution ON for field %s. Trying fallbacks for name/ignore: %v", f.Name, c.fallbackTagKeys)
 			for _, fallbackKey := range c.fallbackTagKeys {
 				fallbackTagValue := f.Tag.Get(fallbackKey)
 				if fallbackTagValue != "" {
@@ -102,16 +102,16 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 						effectiveName = name
 						chosenTagOptions = parsedFallbackOpts
 						isIgnoredByTag = false
-						c.logger.Debug("getTypeInfo:       Fallback tag '%s' provided name: '%s'. Options from this tag: %v.", fallbackKey, effectiveName, chosenTagOptions)
+						c.logger.Debugf("getTypeInfo:       Fallback tag '%s' provided name: '%s'. Options from this tag: %v.", fallbackKey, effectiveName, chosenTagOptions)
 						break
 					} else if _, ignorePresent := parsedFallbackOpts["-"]; ignorePresent {
 						isIgnoredByTag = true
 						chosenTagOptions = parsedFallbackOpts
-						c.logger.Debug("getTypeInfo:       Fallback tag '%s' IGNORED field '%s'.", fallbackKey, f.Name)
+						c.logger.Debugf("getTypeInfo:       Fallback tag '%s' IGNORED field '%s'.", fallbackKey, f.Name)
 						break
 					} else if len(parsedFallbackOpts) > 0 && chosenTagOptions == nil {
 						chosenTagOptions = parsedFallbackOpts
-						c.logger.Debug("getTypeInfo:       Fallback tag '%s' provided only flags: %v for field '%s'. Effective name remains '%s'.", fallbackKey, chosenTagOptions, f.Name, effectiveName)
+						c.logger.Debugf("getTypeInfo:       Fallback tag '%s' provided only flags: %v for field '%s'. Effective name remains '%s'.", fallbackKey, chosenTagOptions, f.Name, effectiveName)
 						// Note: We don't break here, primary tag options might still be preferred if they existed without a name.
 					}
 				}
@@ -139,28 +139,28 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 		_, isUnmapped := chosenTagOptions["unmapped"]
 		if isUnmapped {
 			if info.unmappedField != nil && info.unmappedField.structField.Name != f.Name {
-				c.logger.Warn("[mm warning] Multiple unmapped fields ('%s', '%s') in %s, ignoring current field '%s'",
+				c.logger.Warnf("[mm warning] Multiple unmapped fields ('%s', '%s') in %s, ignoring current field '%s'",
 					info.unmappedField.structField.Name, f.Name, concreteType.Name(), f.Name)
 			} else {
 				info.unmappedField = &fInfo
-				c.logger.Debug("getTypeInfo:     Field '%s' (Go name) is designated as UNMAPPED field. Effective name: '%s'.", f.Name, effectiveName)
+				c.logger.Debugf("getTypeInfo:     Field '%s' (Go name) is designated as UNMAPPED field. Effective name: '%s'.", f.Name, effectiveName)
 			}
 		} else if isIgnoredByTag {
-			c.logger.Debug("getTypeInfo:     Field '%s' (Go name) is IGNORED due to tag '-' (effective name was to be '%s').", f.Name, effectiveName)
+			c.logger.Debugf("getTypeInfo:     Field '%s' (Go name) is IGNORED due to tag '-' (effective name was to be '%s').", f.Name, effectiveName)
 		} else {
 			if existingGoName, duplicate := processedEffectiveNames[effectiveName]; duplicate {
-				c.logger.Warn("[mm warning] Duplicate effective field name '%s' in type %s. Field '%s' conflicts with already processed field '%s'. Skipping field '%s'.",
+				c.logger.Warnf("[mm warning] Duplicate effective field name '%s' in type %s. Field '%s' conflicts with already processed field '%s'. Skipping field '%s'.",
 					effectiveName, concreteType.Name(), f.Name, existingGoName, f.Name)
 			} else {
 				info.fields[effectiveName] = fInfo
 				processedEffectiveNames[effectiveName] = f.Name
-				c.logger.Debug("getTypeInfo:     Field '%s' (Go name) mapped to effective name '%s'. Added to TypeInfo.", f.Name, effectiveName)
+				c.logger.Debugf("getTypeInfo:     Field '%s' (Go name) mapped to effective name '%s'. Added to TypeInfo.", f.Name, effectiveName)
 			}
 		}
 	}
 	info.canMemCopy = isMemCopySuitable(concreteType)
 	c.typeInfoCache.Store(concreteType, info)
-	c.logger.Debug("getTypeInfo: Finished analyzing type %s (concrete: %s). Fields: %d, Unmapped: %v",
+	c.logger.Debugf("getTypeInfo: Finished analyzing type %s (concrete: %s). Fields: %d, Unmapped: %v",
 		typ, concreteType, len(info.fields), info.unmappedField != nil)
 	return info
 }
@@ -173,7 +173,7 @@ func (c *Copier) handlePotentialError(err error, ctx *SysContext) bool {
 		panic(fmt.Sprintf("mm copy panic: %v", err))
 	}
 	if c.collectErrors {
-		c.logger.Debug("Collecting error: %v", err)
+		c.logger.Debugf("Collecting error: %v", err)
 		ctx.errors = append(ctx.errors, err)
 		return true
 	}
@@ -200,7 +200,7 @@ func (c *Copier) finalizeResult(returnedErr error, ctx *SysContext) error {
 func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.Value, bool, error) {
 	tryConvertDepthPrefix := "    "
 	if !src.IsValid() {
-		c.logger.Debug("%stryConvert: Source is invalid, cannot convert.", tryConvertDepthPrefix)
+		c.logger.Debugf("%stryConvert: Source is invalid, cannot convert.", tryConvertDepthPrefix)
 		return reflect.Value{}, false, ErrSourceIsNil
 	}
 	srcType := src.Type()
@@ -210,46 +210,46 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 	} else {
 		srcInterfaceVal = "<uninterfaceable_src>"
 	}
-	c.logger.Debug("%sTRYCONVERT_ENTRY: Src: %s (%v), DestType: %s", tryConvertDepthPrefix, srcType, srcInterfaceVal, destType)
+	c.logger.Debugf("%sTRYCONVERT_ENTRY: Src: %s (%v), DestType: %s", tryConvertDepthPrefix, srcType, srcInterfaceVal, destType)
 
 	if srcType.AssignableTo(destType) {
-		c.logger.Debug("%s  tryConvert: Src type %s is directly assignable to dest type %s.", tryConvertDepthPrefix, srcType, destType)
+		c.logger.Debugf("%s  tryConvert: Src type %s is directly assignable to dest type %s.", tryConvertDepthPrefix, srcType, destType)
 		return src, true, nil
 	}
 
 	if converters, ok := c.typeConverters[srcType]; ok {
 		if converter, exists := converters[destType]; exists {
-			c.logger.Debug("%s  tryConvert: Using custom converter %s -> %s", tryConvertDepthPrefix, srcType, destType)
+			c.logger.Debugf("%s  tryConvert: Using custom converter %s -> %s", tryConvertDepthPrefix, srcType, destType)
 			converted, errConvert := converter(src)
 			if errConvert != nil {
-				c.logger.Debug("%s    tryConvert: Custom converter FAILED: %v", tryConvertDepthPrefix, errConvert)
+				c.logger.Debugf("%s    tryConvert: Custom converter FAILED: %v", tryConvertDepthPrefix, errConvert)
 				return reflect.Value{}, false, fmt.Errorf("type converter %s -> %s failed: %w", srcType, destType, errConvert)
 			}
 			if !converted.IsValid() {
-				c.logger.Debug("%s    tryConvert: Custom converter for %s -> %s returned an invalid reflect.Value.", tryConvertDepthPrefix, srcType, destType)
+				c.logger.Debugf("%s    tryConvert: Custom converter for %s -> %s returned an invalid reflect.Value.", tryConvertDepthPrefix, srcType, destType)
 				return reflect.Value{}, false, fmt.Errorf("type converter %s -> %s returned invalid value", srcType, destType)
 			}
 			if !converted.Type().AssignableTo(destType) {
 				if converted.Type().ConvertibleTo(destType) {
-					c.logger.Debug("%s    tryConvert: Custom converter for %s -> %s returned %s, converting to %s.", tryConvertDepthPrefix, srcType, destType, converted.Type(), destType)
+					c.logger.Debugf("%s    tryConvert: Custom converter for %s -> %s returned %s, converting to %s.", tryConvertDepthPrefix, srcType, destType, converted.Type(), destType)
 					finalConverted := converted.Convert(destType)
 					if !finalConverted.Type().AssignableTo(destType) {
-						c.logger.Debug("%s      tryConvert: Post-Go-conversion type %s is STILL not assignable to %s.", tryConvertDepthPrefix, finalConverted.Type(), destType)
+						c.logger.Debugf("%s      tryConvert: Post-Go-conversion type %s is STILL not assignable to %s.", tryConvertDepthPrefix, finalConverted.Type(), destType)
 						return reflect.Value{}, false, fmt.Errorf("type converter %s -> %s returned %s, and after Go conversion to %s, it's still not assignable to %s", srcType, destType, converted.Type(), finalConverted.Type(), destType)
 					}
-					c.logger.Debug("%s    tryConvert: Custom converter SUCCESS (with Go conversion). Result type: %s", tryConvertDepthPrefix, finalConverted.Type())
+					c.logger.Debugf("%s    tryConvert: Custom converter SUCCESS (with Go conversion). Result type: %s", tryConvertDepthPrefix, finalConverted.Type())
 					return finalConverted, true, nil
 				}
-				c.logger.Debug("%s    tryConvert: Custom converter for %s -> %s returned type %s, which is not assignable or convertible to %s.", tryConvertDepthPrefix, srcType, destType, converted.Type(), destType)
+				c.logger.Debugf("%s    tryConvert: Custom converter for %s -> %s returned type %s, which is not assignable or convertible to %s.", tryConvertDepthPrefix, srcType, destType, converted.Type(), destType)
 				return reflect.Value{}, false, fmt.Errorf("type converter %s -> %s returned %s, not assignable/convertible to %s", srcType, destType, converted.Type(), destType)
 			}
-			c.logger.Debug("%s    tryConvert: Custom converter SUCCESS. Result type: %s", tryConvertDepthPrefix, converted.Type())
+			c.logger.Debugf("%s    tryConvert: Custom converter SUCCESS. Result type: %s", tryConvertDepthPrefix, converted.Type())
 			return converted, true, nil
 		}
 	}
 
 	if srcType.ConvertibleTo(destType) {
-		c.logger.Debug("%s  tryConvert: Using Go's conversion %s -> %s", tryConvertDepthPrefix, srcType, destType)
+		c.logger.Debugf("%s  tryConvert: Using Go's conversion %s -> %s", tryConvertDepthPrefix, srcType, destType)
 		return src.Convert(destType), true, nil
 	}
 
@@ -258,28 +258,28 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 		destElemType := destType.Elem()
 		if convMap, ok := c.typeConverters[srcType]; ok {
 			if _, specificConvExists := convMap[destElemType]; specificConvExists {
-				c.logger.Debug("%s  tryConvert: Found custom converter for src %s -> destElem %s. Attempting T -> *U.", tryConvertDepthPrefix, srcType, destElemType)
+				c.logger.Debugf("%s  tryConvert: Found custom converter for src %s -> destElem %s. Attempting T -> *U.", tryConvertDepthPrefix, srcType, destElemType)
 				convertedElem, elemOk, elemErr := c.tryConvert(src, destElemType)
 				if elemOk && elemErr == nil {
 					newPtr := reflect.New(destElemType)
 					newPtr.Elem().Set(convertedElem)
-					c.logger.Debug("%s    tryConvert: Successfully created *%s from %s via element conversion.", tryConvertDepthPrefix, destElemType, srcType)
+					c.logger.Debugf("%s    tryConvert: Successfully created *%s from %s via element conversion.", tryConvertDepthPrefix, destElemType, srcType)
 					return newPtr, true, nil
 				}
 				if elemErr != nil {
-					c.logger.Debug("%s    tryConvert: Element conversion for T -> *U (src %s to elem %s) failed: %v", tryConvertDepthPrefix, srcType, destElemType, elemErr)
+					c.logger.Debugf("%s    tryConvert: Element conversion for T -> *U (src %s to elem %s) failed: %v", tryConvertDepthPrefix, srcType, destElemType, elemErr)
 				}
 			}
 		}
 		if srcType.Kind() != reflect.Ptr {
 			if srcType.AssignableTo(destElemType) {
-				c.logger.Debug("%s  tryConvert: Assigning %s to *%s (elem assignable)", tryConvertDepthPrefix, srcType, destElemType)
+				c.logger.Debugf("%s  tryConvert: Assigning %s to *%s (elem assignable)", tryConvertDepthPrefix, srcType, destElemType)
 				newPtr := reflect.New(destElemType)
 				newPtr.Elem().Set(src)
 				return newPtr, true, nil
 			}
 			if srcType.ConvertibleTo(destElemType) {
-				c.logger.Debug("%s  tryConvert: Converting %s to *%s (elem convertible)", tryConvertDepthPrefix, srcType, destElemType)
+				c.logger.Debugf("%s  tryConvert: Converting %s to *%s (elem convertible)", tryConvertDepthPrefix, srcType, destElemType)
 				newPtr := reflect.New(destElemType)
 				newPtr.Elem().Set(src.Convert(destElemType))
 				return newPtr, true, nil
@@ -294,17 +294,17 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 		if destType.Kind() != reflect.Ptr {
 			if convMap, ok := c.typeConverters[srcElemType]; ok {
 				if _, specificConvExists := convMap[destType]; specificConvExists {
-					c.logger.Debug("%s  tryConvert: Found custom converter for srcElem %s -> dest %s. Attempting *T -> U.", tryConvertDepthPrefix, srcElemType, destType)
+					c.logger.Debugf("%s  tryConvert: Found custom converter for srcElem %s -> dest %s. Attempting *T -> U.", tryConvertDepthPrefix, srcElemType, destType)
 					return c.tryConvert(srcElem, destType)
 				}
 			}
 		}
 		if srcElemType.AssignableTo(destType) {
-			c.logger.Debug("%s  tryConvert: Assigning *%s to %s (deref assignable)", tryConvertDepthPrefix, srcElemType, destType)
+			c.logger.Debugf("%s  tryConvert: Assigning *%s to %s (deref assignable)", tryConvertDepthPrefix, srcElemType, destType)
 			return srcElem, true, nil
 		}
 		if srcElemType.ConvertibleTo(destType) {
-			c.logger.Debug("%s  tryConvert: Converting *%s to %s (deref convertible)", tryConvertDepthPrefix, srcElemType, destType)
+			c.logger.Debugf("%s  tryConvert: Converting *%s to %s (deref convertible)", tryConvertDepthPrefix, srcElemType, destType)
 			return srcElem.Convert(destType), true, nil
 		}
 	}
@@ -315,7 +315,7 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 		if srcElem.IsValid() {
 			convertedElem, okElem, errElem := c.tryConvert(srcElem, destType)
 			if okElem && errElem == nil {
-				c.logger.Debug("%s  tryConvert: Converting interface concrete type %s to %s", tryConvertDepthPrefix, srcElem.Type(), destType)
+				c.logger.Debugf("%s  tryConvert: Converting interface concrete type %s to %s", tryConvertDepthPrefix, srcElem.Type(), destType)
 				return convertedElem, true, nil
 			}
 			if errElem != nil && !errors.Is(errElem, ErrNoConverter) {
@@ -324,7 +324,7 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 		}
 	}
 
-	c.logger.Debug("%s  tryConvert: No conversion path found for %s -> %s", tryConvertDepthPrefix, srcType, destType)
+	c.logger.Debugf("%s  tryConvert: No conversion path found for %s -> %s", tryConvertDepthPrefix, srcType, destType)
 	return reflect.Value{}, false, ErrNoConverter
 }
 
@@ -399,7 +399,7 @@ func (c *Copier) readSourceFieldValue(srcStruct reflect.Value, fi *FieldInfo) (r
 	if fi.structField.PkgPath != "" { // Unexported
 		if c.useUnsafe && c.copyUnexported {
 			if !concreteSrcStruct.CanAddr() {
-				c.logger.Debug("   readSourceFieldValue: Struct %s (field '%s') not addressable for unsafe read.", concreteSrcStruct.Type(), fi.name)
+				c.logger.Debugf("   readSourceFieldValue: Struct %s (field '%s') not addressable for unsafe read.", concreteSrcStruct.Type(), fi.name)
 				return reflect.Value{}, false
 			}
 			fieldPtr := unsafe.Pointer(concreteSrcStruct.UnsafeAddr() + fi.offset)
@@ -407,15 +407,15 @@ func (c *Copier) readSourceFieldValue(srcStruct reflect.Value, fi *FieldInfo) (r
 			if fUnsafe.IsValid() {
 				return fUnsafe, true
 			}
-			c.logger.Debug("   readSourceFieldValue: Unsafe read for '%s' of %s yielded invalid value.", fi.name, concreteSrcStruct.Type())
+			c.logger.Debugf("   readSourceFieldValue: Unsafe read for '%s' of %s yielded invalid value.", fi.name, concreteSrcStruct.Type())
 			return reflect.Value{}, false
 		}
-		c.logger.Debug("   readSourceFieldValue: Field '%s' of %s unexported and unsafe/copyUnexported not enabled.", fi.name, concreteSrcStruct.Type())
+		c.logger.Debugf("   readSourceFieldValue: Field '%s' of %s unexported and unsafe/copyUnexported not enabled.", fi.name, concreteSrcStruct.Type())
 		return reflect.Value{}, false
 	}
 
 	// Exported but cannot interface (rare)
-	c.logger.Debug("   readSourceFieldValue: Exported field '%s' of %s cannot be read via CanInterface().", fi.name, concreteSrcStruct.Type())
+	c.logger.Debugf("   readSourceFieldValue: Exported field '%s' of %s cannot be read via CanInterface().", fi.name, concreteSrcStruct.Type())
 	return reflect.Value{}, false
 }
 

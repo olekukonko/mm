@@ -19,7 +19,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 	var unmappedDestValueType reflect.Type
 
 	c.logger.Indent(ctx.depth)
-	c.logger.Debug("Copying Map -> Struct (%s -> %s) | Overwrite: %v", src.Type(), dest.Type(), c.overwrite)
+	c.logger.Debugf("Copying Map -> Struct (%s -> %s) | Overwrite: %v", src.Type(), dest.Type(), c.overwrite)
 
 	if destInfo.unmappedField != nil {
 		unmappedDestFieldName = destInfo.unmappedField.name
@@ -40,16 +40,16 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 			} else {
 				warnMsg := fmt.Sprintf("[mm warning] %s: dest unmapped field '%s' has type %s.", ErrUnmappedFieldType, unmappedDestFieldName, fieldType)
 				log.Print(warnMsg)
-				c.logger.Warn("   Warning: %s", warnMsg)
+				c.logger.Warnf("   Warning: %s", warnMsg)
 			}
 		} else if mapFieldValErr != nil {
 			if !errors.Is(mapFieldValErr, ErrUnexportedField) || c.collectErrors {
 				errUnmapped := fmt.Errorf("getting unmapped dest field '%s': %w", unmappedDestFieldName, mapFieldValErr)
 				if !c.handlePotentialError(errUnmapped, ctx) {
-					c.logger.Warn("   Error initializing unmapped dest field '%s': %v.", unmappedDestFieldName, mapFieldValErr)
+					c.logger.Warnf("   Error initializing unmapped dest field '%s': %v.", unmappedDestFieldName, mapFieldValErr)
 				}
 			} else {
-				c.logger.Debug("   Unmapped dest field '%s' is unexported or not settable.", unmappedDestFieldName)
+				c.logger.Debugf("   Unmapped dest field '%s' is unexported or not settable.", unmappedDestFieldName)
 			}
 		}
 		processedDestFields[unmappedDestFieldName] = struct{}{}
@@ -59,15 +59,15 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 		if destFieldEffectiveName == unmappedDestFieldName {
 			continue
 		}
-		c.logger.Debug(" Processing destination field '%s' (Go name: '%s')", destFieldEffectiveName, destFieldInfo.structField.Name)
+		c.logger.Debugf(" Processing destination field '%s' (Go name: '%s')", destFieldEffectiveName, destFieldInfo.structField.Name)
 
 		if _, skip := c.skipFields[destFieldEffectiveName]; skip {
-			c.logger.Debug("   -> Skipping dest field '%s' (explicit global skip).", destFieldEffectiveName)
+			c.logger.Debugf("   -> Skipping dest field '%s' (explicit global skip).", destFieldEffectiveName)
 			processedDestFields[destFieldEffectiveName] = struct{}{}
 			continue
 		}
 		if _, ignore := destFieldInfo.tagOpts["-"]; ignore {
-			c.logger.Debug("   -> Skipping dest field '%s' (tag '-' on destination field).", destFieldEffectiveName)
+			c.logger.Debugf("   -> Skipping dest field '%s' (tag '-' on destination field).", destFieldEffectiveName)
 			processedDestFields[destFieldEffectiveName] = struct{}{}
 			continue
 		}
@@ -104,7 +104,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 		processedDestFields[destFieldEffectiveName] = struct{}{} // Mark as processed (attempted to source)
 
 		if !foundSrcKeyInMap {
-			c.logger.Debug("   -> Key '%s' not found in source map for dest field '%s'.", srcKeyNameForThisDestField, destFieldEffectiveName)
+			c.logger.Debugf("   -> Key '%s' not found in source map for dest field '%s'.", srcKeyNameForThisDestField, destFieldEffectiveName)
 			// If overwrite is true, the final loop will zero this dest field as it wasn't processed by a source.
 			continue
 		}
@@ -134,7 +134,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 					}
 				} else {
 					if c.skipNilSrc {
-						c.logger.Debug("     Formatter returned nil for '%s', skipping due to skipNilSrc=true.", destFieldEffectiveName)
+						c.logger.Debugf("     Formatter returned nil for '%s', skipping due to skipNilSrc=true.", destFieldEffectiveName)
 						// If overwriting, zero the field as formatter + skipNilSrc effectively "removed" the source value.
 						if c.overwrite && destVal.CanSet() {
 							destVal.Set(reflect.Zero(destVal.Type()))
@@ -147,7 +147,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 		}
 
 		if !c.overwrite && destVal.IsValid() && !(isBasicTypeZero(destVal) || isEmptyValue(destVal)) {
-			c.logger.Debug("   -> MERGE SKIP for field '%s'. Dest field non-empty.", destFieldEffectiveName)
+			c.logger.Debugf("   -> MERGE SKIP for field '%s'. Dest field non-empty.", destFieldEffectiveName)
 			continue
 		}
 
@@ -170,17 +170,17 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 				} else {
 					destVal.Set(reflect.Zero(destVal.Type()))
 				}
-				c.logger.Debug("   -> Field '%s' set by processItem from map key '%s'.", destFieldEffectiveName, srcKeyNameForThisDestField)
+				c.logger.Debugf("   -> Field '%s' set by processItem from map key '%s'.", destFieldEffectiveName, srcKeyNameForThisDestField)
 			} else { // processItem decided not to set (e.g. src value was skipped by skipNil, skipZero etc.)
 				if c.overwrite { // If overwriting and processItem skipped the value, zero the field.
 					destVal.Set(reflect.Zero(destVal.Type()))
-					c.logger.Debug("   -> Field '%s' ZEROED: processItem returned shouldSet=false for map key '%s', and overwrite=true.", destFieldEffectiveName, srcKeyNameForThisDestField)
+					c.logger.Debugf("   -> Field '%s' ZEROED: processItem returned shouldSet=false for map key '%s', and overwrite=true.", destFieldEffectiveName, srcKeyNameForThisDestField)
 				} else { // Merge mode: field remains untouched.
-					c.logger.Debug("   -> Field '%s' NOT SET: processItem returned shouldSet=false for map key '%s', and overwrite=false (merge).", destFieldEffectiveName, srcKeyNameForThisDestField)
+					c.logger.Debugf("   -> Field '%s' NOT SET: processItem returned shouldSet=false for map key '%s', and overwrite=false (merge).", destFieldEffectiveName, srcKeyNameForThisDestField)
 				}
 			}
 		} else {
-			c.logger.Error("   Internal error: destVal for field '%s' non-settable.", destFieldEffectiveName)
+			c.logger.Infof("   Internal error: destVal for field '%s' non-settable.", destFieldEffectiveName)
 		}
 	}
 
@@ -228,12 +228,12 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 				destValToZero, dvOk, _ := c.getSettableFieldValue(dest, &destFieldInfoToZero)
 				if dvOk && destValToZero.CanSet() {
 					destValToZero.Set(reflect.Zero(destValToZero.Type()))
-					c.logger.Debug("   Post-iteration: Zeroing untargeted dest field '%s'.", destFieldEffectiveNameToZero)
+					c.logger.Debugf("   Post-iteration: Zeroing untargeted dest field '%s'.", destFieldEffectiveNameToZero)
 				}
 			}
 		}
 	}
-	c.logger.Debug("Finished copyMapToStruct (%s -> %s)", src.Type(), dest.Type())
+	c.logger.Debugf("Finished copyMapToStruct (%s -> %s)", src.Type(), dest.Type())
 	return nil
 }
 
@@ -243,7 +243,7 @@ func (c *Copier) copyMapToSlice(dest, src reflect.Value, ctx *SysContext) error 
 	destElemType := destType.Elem()
 	srcType := src.Type()
 	c.logger.Indent(ctx.depth)
-	c.logger.Debug("Copying Map -> Slice (%s -> %s)", srcType, destType)
+	c.logger.Debugf("Copying Map -> Slice (%s -> %s)", srcType, destType)
 	if !src.IsValid() || src.IsNil() {
 		if c.skipNilSrc {
 			return nil

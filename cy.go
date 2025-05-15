@@ -46,7 +46,7 @@ func (d *cycleDetector) Check(srcPtr uintptr, srcElemType reflect.Type) (reflect
 			}
 		}
 		// Use d.logger directly
-		d.logger.Debug("Check: FOUND srcPtr %p (ElemType %s) -> existingDest %s (addr/ptr: %p)",
+		d.logger.Debugf("Check: FOUND srcPtr %p (ElemType %s) -> existingDest %s (addr/ptr: %p)",
 			unsafe.Pointer(srcPtr), srcElemType.String(), existingDest.Type().String(), unsafe.Pointer(existingDestPtr))
 	}
 	return existingDest, ok
@@ -57,7 +57,7 @@ func (d *cycleDetector) Track(srcPtr uintptr, srcElemType reflect.Type, destVal 
 	vk := visitKey{ptr: srcPtr, typ: srcElemType}
 	if _, exists := d.visited[vk]; !exists {
 		if !destVal.IsValid() {
-			d.logger.Warn("Track: Attempted to track an invalid destVal for srcPtr %p (ElemType %s). Skipping track.", unsafe.Pointer(srcPtr), srcElemType.String())
+			d.logger.Warnf("Track: Attempted to track an invalid destVal for srcPtr %p (ElemType %s). Skipping track.", unsafe.Pointer(srcPtr), srcElemType.String())
 			return
 		}
 		d.visited[vk] = destVal
@@ -69,11 +69,11 @@ func (d *cycleDetector) Track(srcPtr uintptr, srcElemType reflect.Type, destVal 
 				destValAddr = destVal.UnsafeAddr()
 			}
 		}
-		d.logger.Debug("Track: STORED srcPtr %p (ElemType %s) -> destVal %s (addr/ptr: %p)",
+		d.logger.Debugf("Track: STORED srcPtr %p (ElemType %s) -> destVal %s (addr/ptr: %p)",
 			unsafe.Pointer(srcPtr), srcElemType.String(), destVal.Type().String(), unsafe.Pointer(destValAddr))
 	} else {
 		// Optionally log if trying to overwrite, but for now, first entry wins.
-		d.logger.Debug("Track: srcPtr %p (ElemType %s) already tracked. Current destVal %s ignored.",
+		d.logger.Debugf("Track: srcPtr %p (ElemType %s) already tracked. Current destVal %s ignored.",
 			unsafe.Pointer(srcPtr), srcElemType.String(), destVal.Type().String())
 	}
 }
