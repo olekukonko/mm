@@ -21,7 +21,7 @@ func (c *Copier) processItem(
 	itemName string, // Name for logging/context (e.g., field name, slice index)
 	baseDestType reflect.Type, // The expected type for the destination slot
 	isSrcItemSensitive bool, // Pre-calculated sensitivity (e.g., from field tag + src value check)
-	ctxSys *SysContext, // System context for recursion depth, cycle detection, errors
+	ctxSys *SysContext, // System context for recursion depth, cycle detection, Errors
 ) (result processItemResult) {
 
 	c.logger.Indent(ctxSys.depth + 1)
@@ -300,9 +300,9 @@ PrepareFallback: // Label for goto jump from invalid source handling
 
 	// Perform the recursive copy into the holder.
 	// Pass the original `src` value (which might be an interface, pointer, etc.)
-	if errRec := c.copyRecursive(holder, src, ctxSys); errRec != nil {
+	if errRec := c.CopyRecursive(holder, src, ctxSys); errRec != nil {
 		itemErr := fmt.Errorf("recursive copy for '%s' (Src: %s -> DestHolder: %s) failed: %w", itemName, srcTypeStr, holder.Type(), errRec)
-		// Let the caller (copyRecursive) handle potential collection/panic of this error
+		// Let the caller (CopyRecursive) handle potential collection/panic of this error
 		return processItemResult{err: itemErr}
 	}
 

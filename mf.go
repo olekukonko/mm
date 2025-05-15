@@ -174,17 +174,17 @@ func (c *Copier) handlePotentialError(err error, ctx *SysContext) bool {
 	}
 	if c.collectErrors {
 		c.logger.Debugf("Collecting error: %v", err)
-		ctx.errors = append(ctx.errors, err)
+		ctx.Errors = append(ctx.Errors, err)
 		return true
 	}
 	return false
 }
 
 func (c *Copier) finalizeResult(returnedErr error, ctx *SysContext) error {
-	if c.collectErrors && len(ctx.errors) > 0 {
-		finalErr := errors.Join(ctx.errors...)
+	if c.collectErrors && len(ctx.Errors) > 0 {
+		finalErr := errors.Join(ctx.Errors...)
 		if c.panicOnError {
-			panic(fmt.Sprintf("mm copy failed with %d error(s): %v", len(ctx.errors), finalErr))
+			panic(fmt.Sprintf("mm copy failed with %d error(s): %v", len(ctx.Errors), finalErr))
 		}
 		return finalErr
 	}

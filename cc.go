@@ -13,7 +13,7 @@ import (
 	"unsafe"
 )
 
-func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err error) {
+func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err error) {
 	c.logger.Indent(ctx.depth)
 	if c.logger != nil {
 		var srcTypeStr, srcKindStr string
@@ -162,7 +162,7 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 
 		if srcPtrForCycle != 0 {
-			if existingDestVal, visited := ctx.detector.Check(srcPtrForCycle, srcTypeForCycleKey); visited {
+			if existingDestVal, visited := ctx.Detector.Check(srcPtrForCycle, srcTypeForCycleKey); visited {
 				var edvTypeStr, edvKindStr string
 				if existingDestVal.IsValid() {
 					edvTypeStr = existingDestVal.Type().String()
@@ -250,7 +250,7 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 						}
 					}
 				} else {
-					c.logger.Debugf("  Cycle REASSIGN: existingDestVal from detector is invalid. Cannot assign.")
+					c.logger.Debugf("  Cycle REASSIGN: existingDestVal from Detector is invalid. Cannot assign.")
 				}
 
 				if assigned {
@@ -319,12 +319,12 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				}
 
 				if srcPtrForCycle != 0 && destToTrackForMarshal.IsValid() {
-					if _, visited := ctx.detector.Check(srcPtrForCycle, srcTypeForCycleKey); !visited {
-						ctx.detector.Track(srcPtrForCycle, srcTypeForCycleKey, destToTrackForMarshal)
+					if _, visited := ctx.Detector.Check(srcPtrForCycle, srcTypeForCycleKey); !visited {
+						ctx.Detector.Track(srcPtrForCycle, srcTypeForCycleKey, destToTrackForMarshal)
 					}
 				}
 			}
-			return c.copyRecursive(dest, reflect.ValueOf(serialized), ctx)
+			return c.CopyRecursive(dest, reflect.ValueOf(serialized), ctx)
 		}
 	}
 	if dest.CanAddr() && dest.Addr().CanInterface() {
@@ -359,7 +359,7 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			srcTypeForCycleKey = originalSrcForInterfaceChecks.Type()
 		}
 
-		destToActuallyTrack := dest // `dest` here is the argument to copyRecursive.
+		destToActuallyTrack := dest // `dest` here is the argument to CopyRecursive.
 		// If `dest` is a pointer (e.g. holder for *T, or actual *T from Deep()), track it.
 		// If `dest` is a value (e.g. struct field, slice element that's a struct), track its address.
 		if dest.Kind() != reflect.Ptr && dest.Kind() != reflect.Interface && dest.CanAddr() {
@@ -370,10 +370,10 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 
 		if srcPtrForCycle != 0 && destToActuallyTrack.IsValid() &&
 			(destToActuallyTrack.Kind() == reflect.Ptr || destToActuallyTrack.Kind() == reflect.Map || destToActuallyTrack.Kind() == reflect.Slice) { // Only track if dest is also a trackable kind
-			if _, visited := ctx.detector.Check(srcPtrForCycle, srcTypeForCycleKey); !visited {
+			if _, visited := ctx.Detector.Check(srcPtrForCycle, srcTypeForCycleKey); !visited {
 				// Check if destToActuallyTrack is non-nil before tracking.
 				// This is important if copyPtr initialized a nil 'dest' holder and then set it.
-				// The 'dest' to copyRecursive might still be the reflect.Value of that initially nil ptr.
+				// The 'dest' to CopyRecursive might still be the reflect.Value of that initially nil ptr.
 				// We must track the value that 'dest' points to *after* it's been (potentially) allocated.
 				// This means this Track call should arguably be *after* copyPtr sets the dest.
 				// This is a key challenge.
@@ -399,7 +399,7 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				c.logger.Debugf("  Cycle TRACK: Storing srcPtr %p (keyType %s) -> destToTrack %s (%s) ptr/addr %s",
 					unsafe.Pointer(srcPtrForCycle), srcTypeForCycleKey,
 					trackedDestTypeStr, trackedDestKindStr, trackedDestPtrStr)
-				ctx.detector.Track(srcPtrForCycle, srcTypeForCycleKey, destToActuallyTrack)
+				ctx.Detector.Track(srcPtrForCycle, srcTypeForCycleKey, destToActuallyTrack)
 			}
 		}
 	}

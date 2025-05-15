@@ -49,12 +49,12 @@ type Sensitivity interface {
 // CopiableDeprecated defines an interface for types that handle their own type-level copying logic.
 // Deprecated: Use the new Copiable interface for field-level copying or MarshalCopier/UnmarshalCopier for type-level transformations.
 type CopiableDeprecated interface {
-	// Copy receives the original source value (before any potential dereferencing by copyRecursive)
+	// Copy receives the original source value (before any potential dereferencing by CopyRecursive)
 	// and the active Copier instance.
 	// The receiver of this method should populate itself based on the src value.
-	// It can use c.copyRecursive for nested fields or access c's configuration.
+	// It can use c.CopyRecursive for nested fields or access c's configuration.
 	// Returning an error will halt the copy process unless the Copier is configured
-	// to collect errors.
+	// to collect Errors.
 	Copy(c *Copier, src reflect.Value) error
 }
 
@@ -92,9 +92,9 @@ type CopyContext struct {
 
 type SysContext struct {
 	depth    int
-	detector *cycleDetector
-	visited  map[visitKey]reflect.Value
-	errors   []error
+	Detector *cycleDetector
+	Visited  map[VisitKey]reflect.Value
+	Errors   []error
 }
 type TypeInfo struct {
 	fields                                       map[string]FieldInfo

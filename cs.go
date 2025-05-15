@@ -405,8 +405,8 @@ func (c *Copier) copyStructToMap(dest, src reflect.Value, ctx *SysContext) error
 			destKeyVal = reflect.ValueOf(destKeyName)
 		} else {
 			tempKeyHolder := reflect.New(destMapKeyType).Elem()
-			keyConvCtx := &SysContext{depth: ctx.depth + 1, detector: newCycleDetector(), errors: ctx.errors}
-			if err := c.copyRecursive(tempKeyHolder, reflect.ValueOf(destKeyName), keyConvCtx); err != nil {
+			keyConvCtx := &SysContext{depth: ctx.depth + 1, Detector: NewCycleDetector(), Errors: ctx.Errors}
+			if err := c.CopyRecursive(tempKeyHolder, reflect.ValueOf(destKeyName), keyConvCtx); err != nil {
 				c.logger.Debugf("   -> Skipping map key conversion for '%s': %v", destKeyName, err)
 				continue
 			}
@@ -513,10 +513,10 @@ func (c *Copier) copyMap(dest, src reflect.Value, ctx *SysContext) error {
 
 		// Copy/convert source key to destination key type
 		destKeyHolder := reflect.New(destKeyType).Elem()
-		// Use a fresh cycle detector for key copying, as keys are usually simple and less prone to complex cycles
+		// Use a fresh cycle Detector for key copying, as keys are usually simple and less prone to complex cycles
 		// with the main data graph, but could have their own internal complexities if they are structs.
-		keyCopyCtx := &SysContext{depth: ctx.depth + 1, detector: newCycleDetector(), errors: ctx.errors}
-		if err := c.copyRecursive(destKeyHolder, srcKey, keyCopyCtx); err != nil {
+		keyCopyCtx := &SysContext{depth: ctx.depth + 1, Detector: NewCycleDetector(), Errors: ctx.Errors}
+		if err := c.CopyRecursive(destKeyHolder, srcKey, keyCopyCtx); err != nil {
 			keyErr := fmt.Errorf("failed to copy/convert map key '%v' (type %s) to type %s: %w", srcKeyInterface(srcKey), srcKey.Type(), destKeyType, err)
 			if c.handlePotentialError(keyErr, ctx) {
 				continue
@@ -533,7 +533,7 @@ func (c *Copier) copyMap(dest, src reflect.Value, ctx *SysContext) error {
 		}
 		itemName := fmt.Sprintf("mapValue[key:%s]", srcKeyInterface(destKey))
 		srcValIsDynamicallySensitive := c.checkIsSensitive(srcVal)
-		// Note: Key sensitivity is not explicitly handled here, but copyRecursive for the key might handle it.
+		// Note: Key sensitivity is not explicitly handled here, but CopyRecursive for the key might handle it.
 		// For map values, sensitivity is checked on srcVal.
 
 		res := c.processItem(srcVal, itemName, destValType, srcValIsDynamicallySensitive, ctx)

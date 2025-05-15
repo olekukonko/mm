@@ -76,7 +76,7 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 		c.logger.Debugf("CopyWith: Source is nil and skipNilSrc=false, returning ErrSourceIsNil.")
 		errToRet := ErrSourceIsNil
 		// Use finalizeResult to handle panicOnError consistently even for this upfront check
-		return zero, c.finalizeResult(errToRet, &SysContext{errors: make([]error, 0)})
+		return zero, c.finalizeResult(errToRet, &SysContext{Errors: make([]error, 0)})
 	}
 
 	// Handle T being an interface type (e.g., any)
@@ -95,29 +95,29 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 			}
 			c.logger.Debugf("CopyWith[interface T]: Source became invalid after Elem() and skipNilSrc=false, returning ErrSourceIsNil.")
 			errToRet := ErrSourceIsNil
-			return zero, c.finalizeResult(errToRet, &SysContext{errors: make([]error, 0)})
+			return zero, c.finalizeResult(errToRet, &SysContext{Errors: make([]error, 0)})
 		}
 
 		concreteDestVal := reflect.New(srcVal.Type()).Elem()
-		ctx := &SysContext{depth: 0, visited: make(map[visitKey]reflect.Value), errors: make([]error, 0), detector: newCycleDetector()}
+		ctx := &SysContext{depth: 0, Visited: make(map[VisitKey]reflect.Value), Errors: make([]error, 0), Detector: NewCycleDetector()}
 
 		// For interface T, if srcVal is a pointer, we track it to the new concreteDestVal's address
 		// This helps if the interface T is expected to hold a pointer that might be part of a cycle.
 		if c.enableCycleDetect && srcVal.Kind() == reflect.Ptr && !srcVal.IsNil() {
 			// Ensure concreteDestVal is addressable before taking Addr()
 			if concreteDestVal.CanAddr() {
-				c.logger.Debugf("CopyWith[interface T]: Priming cycle detector for top-level ptr source: %p (%s) -> %p (%s)",
+				c.logger.Debugf("CopyWith[interface T]: Priming cycle Detector for top-level ptr source: %p (%s) -> %p (%s)",
 					unsafe.Pointer(srcVal.Pointer()), srcVal.Type(),
 					unsafe.Pointer(concreteDestVal.Addr().Pointer()), concreteDestVal.Addr().Type())
-				ctx.detector.Track(srcVal.Pointer(), srcVal.Type().Elem(), concreteDestVal.Addr())
+				ctx.Detector.Track(srcVal.Pointer(), srcVal.Type().Elem(), concreteDestVal.Addr())
 			} else if concreteDestVal.Kind() == reflect.Ptr { // If concreteDestVal itself is a pointer type (e.g. T is *SomeType)
-				c.logger.Debugf("CopyWith[interface T]: Priming cycle detector for top-level ptr source (dest is ptr): %p (%s) -> destVal itself %s",
+				c.logger.Debugf("CopyWith[interface T]: Priming cycle Detector for top-level ptr source (dest is ptr): %p (%s) -> destVal itself %s",
 					unsafe.Pointer(srcVal.Pointer()), srcVal.Type(), concreteDestVal.Type())
-				ctx.detector.Track(srcVal.Pointer(), srcVal.Type().Elem(), concreteDestVal) // Track to the pointer value directly
+				ctx.Detector.Track(srcVal.Pointer(), srcVal.Type().Elem(), concreteDestVal) // Track to the pointer value directly
 			}
 		}
 
-		err := c.copyRecursive(concreteDestVal, reflect.ValueOf(src), ctx)
+		err := c.CopyRecursive(concreteDestVal, reflect.ValueOf(src), ctx)
 		finalErr := c.finalizeResult(err, ctx)
 		if finalErr != nil {
 			return zero, finalErr
@@ -138,18 +138,18 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 		destPtr := reflect.New(destReflectType)
 		destElem := destPtr.Elem()
 
-		ctx := &SysContext{depth: 0, visited: make(map[visitKey]reflect.Value), errors: make([]error, 0), detector: newCycleDetector()}
+		ctx := &SysContext{depth: 0, Visited: make(map[VisitKey]reflect.Value), Errors: make([]error, 0), Detector: NewCycleDetector()}
 
 		if c.enableCycleDetect && srcReflectVal.IsValid() && srcReflectVal.Kind() == reflect.Ptr && !srcReflectVal.IsNil() {
 			if srcReflectVal.Type() == destPtr.Type() {
-				c.logger.Debugf("CopyWith[struct T]: Priming cycle detector for top-level object: %p (%s) -> %p (%s)",
+				c.logger.Debugf("CopyWith[struct T]: Priming cycle Detector for top-level object: %p (%s) -> %p (%s)",
 					unsafe.Pointer(srcReflectVal.Pointer()), srcReflectVal.Type(),
 					unsafe.Pointer(destPtr.Pointer()), destPtr.Type())
-				ctx.detector.Track(srcReflectVal.Pointer(), srcReflectVal.Type().Elem(), destPtr)
+				ctx.Detector.Track(srcReflectVal.Pointer(), srcReflectVal.Type().Elem(), destPtr)
 			}
 		}
 
-		err := c.copyRecursive(destElem, srcReflectVal, ctx)
+		err := c.CopyRecursive(destElem, srcReflectVal, ctx)
 		finalErr := c.finalizeResult(err, ctx)
 		if finalErr != nil {
 			return zero, finalErr
@@ -161,9 +161,9 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 		return finalDest, nil
 	} else { // T is not struct, not interface (e.g. slice, map, ptr, basic)
 		destVal := reflect.New(destReflectType).Elem() // Create element of type T
-		ctx := &SysContext{depth: 0, visited: make(map[visitKey]reflect.Value), errors: make([]error, 0), detector: newCycleDetector()}
+		ctx := &SysContext{depth: 0, Visited: make(map[VisitKey]reflect.Value), Errors: make([]error, 0), Detector: NewCycleDetector()}
 
-		// Prime cycle detector for top-level pointers, but NOT for special pointer types like *bytes.Buffer
+		// Prime cycle Detector for top-level pointers, but NOT for special pointer types like *bytes.Buffer
 		// which have their own explicit handling that shouldn't be short-circuited by cycle detection at the top level.
 		isSpecialPointerType := false
 		if destReflectType.Kind() == reflect.Ptr {
@@ -177,13 +177,13 @@ func CopyWith[T any](c *Copier, src interface{}) (T, error) {
 			destReflectType.Kind() == reflect.Ptr &&
 			srcReflectVal.IsValid() && srcReflectVal.Kind() == reflect.Ptr && !srcReflectVal.IsNil() &&
 			srcReflectVal.Type() == destReflectType {
-			c.logger.Debugf("CopyWith[ptr T, non-special]: Priming cycle detector for top-level pointer object: %p (%s) -> %p (%s)",
+			c.logger.Debugf("CopyWith[ptr T, non-special]: Priming cycle Detector for top-level pointer object: %p (%s) -> %p (%s)",
 				unsafe.Pointer(srcReflectVal.Pointer()), srcReflectVal.Type(),
 				unsafe.Pointer(destVal.UnsafeAddr()), destVal.Type()) // Use UnsafeAddr if destVal is a pointer
-			ctx.detector.Track(srcReflectVal.Pointer(), destReflectType.Elem(), destVal)
+			ctx.Detector.Track(srcReflectVal.Pointer(), destReflectType.Elem(), destVal)
 		}
 
-		err := c.copyRecursive(destVal, srcReflectVal, ctx)
+		err := c.CopyRecursive(destVal, srcReflectVal, ctx)
 		finalErr := c.finalizeResult(err, ctx)
 		if finalErr != nil {
 			return zero, finalErr
@@ -280,12 +280,12 @@ func (c *Copier) AddFallbackTagKeys(keys ...string) *Copier {
 func (c *Copier) Copy(dest interface{}, src interface{}) error {
 	c.logger.Debugf("Copier.Copy started. Overwrite: %v, Debug: %v", c.overwrite, c.debugMode)
 	if dest == nil {
-		return c.finalizeResult(ErrDestinationIsNil, &SysContext{errors: make([]error, 0)})
+		return c.finalizeResult(ErrDestinationIsNil, &SysContext{Errors: make([]error, 0)})
 	}
 	destVal := reflect.ValueOf(dest)
 
 	if destVal.Kind() != reflect.Ptr || destVal.IsNil() {
-		return c.finalizeResult(ErrDestNotPointer, &SysContext{errors: make([]error, 0)})
+		return c.finalizeResult(ErrDestNotPointer, &SysContext{Errors: make([]error, 0)})
 	}
 
 	if src == nil {
@@ -293,7 +293,7 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 			c.logger.Debugf("Copy: Source is nil, skipping (skipNilSrc=true).")
 			return nil
 		}
-		c.logger.Debugf("Copy: Source is nil (skipNilSrc=false, overwrite=%v). Proceeding to copyRecursive (will zero dest or error).", c.overwrite)
+		c.logger.Debugf("Copy: Source is nil (skipNilSrc=false, overwrite=%v). Proceeding to CopyRecursive (will zero dest or error).", c.overwrite)
 	} else {
 		c.logger.Debugf("Copy: Source is non-nil. Type: %T", src)
 	}
@@ -303,12 +303,12 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 		canPotentiallySet := c.useUnsafe && destElem.CanAddr()
 		if !canPotentiallySet {
 			err := fmt.Errorf("destination element (type %s) is not settable and unsafe cannot help", destElem.Type())
-			return c.finalizeResult(err, &SysContext{errors: make([]error, 0)})
+			return c.finalizeResult(err, &SysContext{Errors: make([]error, 0)})
 		}
 		c.logger.Debugf("Destination element %s not settable via standard means, relying on unsafe.", destElem.Type())
 	}
 
-	ctx := &SysContext{depth: 0, visited: make(map[visitKey]reflect.Value), errors: make([]error, 0), detector: newCycleDetector()}
+	ctx := &SysContext{depth: 0, Visited: make(map[VisitKey]reflect.Value), Errors: make([]error, 0), Detector: NewCycleDetector()}
 
 	srcReflectVal := reflect.ValueOf(src)
 
@@ -323,14 +323,14 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 	if c.enableCycleDetect && !isSpecialPointerType &&
 		srcReflectVal.IsValid() && srcReflectVal.Kind() == reflect.Ptr && !srcReflectVal.IsNil() {
 		if destVal.Type() == srcReflectVal.Type() && destVal.Type().Elem().Kind() == reflect.Struct {
-			c.logger.Debugf("Copier.Copy: Priming cycle detector for top-level object: %p (%s) -> %p (%s)",
+			c.logger.Debugf("Copier.Copy: Priming cycle Detector for top-level object: %p (%s) -> %p (%s)",
 				unsafe.Pointer(srcReflectVal.Pointer()), srcReflectVal.Type(),
 				unsafe.Pointer(destVal.Pointer()), destVal.Type())
-			ctx.detector.Track(srcReflectVal.Pointer(), srcReflectVal.Type().Elem(), destVal)
+			ctx.Detector.Track(srcReflectVal.Pointer(), srcReflectVal.Type().Elem(), destVal)
 		}
 	}
 
-	err := c.copyRecursive(destElem, srcReflectVal, ctx)
+	err := c.CopyRecursive(destElem, srcReflectVal, ctx)
 
 	finalErr := c.finalizeResult(err, ctx)
 	if finalErr != nil && c.silentErrors {
@@ -370,22 +370,22 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 	}
 
 	if dest == nil {
-		return c.finalizeResult(ErrDestinationIsNil, &SysContext{errors: make([]error, 0)})
+		return c.finalizeResult(ErrDestinationIsNil, &SysContext{Errors: make([]error, 0)})
 	}
 	destVal := reflect.ValueOf(dest)
 	if destVal.Kind() != reflect.Ptr || destVal.IsNil() {
-		return c.finalizeResult(ErrDestNotPointer, &SysContext{errors: make([]error, 0)})
+		return c.finalizeResult(ErrDestNotPointer, &SysContext{Errors: make([]error, 0)})
 	}
 	destElem := destVal.Elem()
 	if !destElem.CanSet() {
 		canPotentiallySet := c.useUnsafe && destElem.CanAddr()
 		if !canPotentiallySet {
 			err := fmt.Errorf("destination element (type %s) is not settable and unsafe cannot help", destElem.Type())
-			return c.finalizeResult(err, &SysContext{errors: make([]error, 0)})
+			return c.finalizeResult(err, &SysContext{Errors: make([]error, 0)})
 		}
 	}
 
-	ctx := &SysContext{depth: 0, visited: make(map[visitKey]reflect.Value), errors: make([]error, 0), detector: newCycleDetector()}
+	ctx := &SysContext{depth: 0, Visited: make(map[VisitKey]reflect.Value), Errors: make([]error, 0), Detector: NewCycleDetector()}
 	firstCopier := *c
 	mergeCopier := *c
 	mergeCopier.overwrite = false
@@ -408,11 +408,11 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 	if c.enableCycleDetect && !isSpecialPointerType &&
 		firstSrcReflectVal.IsValid() && firstSrcReflectVal.Kind() == reflect.Ptr && !firstSrcReflectVal.IsNil() {
 		if destVal.Type() == firstSrcReflectVal.Type() && destVal.Type().Elem().Kind() == reflect.Struct {
-			ctx.detector.Track(firstSrcReflectVal.Pointer(), firstSrcReflectVal.Type().Elem(), destVal)
+			ctx.Detector.Track(firstSrcReflectVal.Pointer(), firstSrcReflectVal.Type().Elem(), destVal)
 		}
 	}
 
-	err := firstCopier.copyRecursive(destElem, firstSrcReflectVal, ctx)
+	err := firstCopier.CopyRecursive(destElem, firstSrcReflectVal, ctx)
 	if err != nil {
 		if firstCopier.handlePotentialError(err, ctx) {
 			c.logger.Debugf("CopyCat: Error collected from first source, continuing...")
@@ -430,7 +430,7 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 		for i := 1; i < len(sources); i++ {
 			c.logger.Debugf("CopyCat: Merging source %d...", i+1)
 			currentSrcVal := reflect.ValueOf(sources[i])
-			err := mergeCopier.copyRecursive(destElem, currentSrcVal, ctx)
+			err := mergeCopier.CopyRecursive(destElem, currentSrcVal, ctx)
 			if err != nil {
 				if mergeCopier.handlePotentialError(err, ctx) {
 					c.logger.Debugf("CopyCat: Error collected from source %d, continuing...", i+1)
@@ -464,23 +464,23 @@ func (c *Copier) Deep(v interface{}) (interface{}, error) {
 			return nil, nil
 		}
 		errToRet := ErrSourceIsNil
-		return nil, c.finalizeResult(errToRet, &SysContext{errors: make([]error, 0)})
+		return nil, c.finalizeResult(errToRet, &SysContext{Errors: make([]error, 0)})
 	}
 	srcVal := reflect.ValueOf(v)
 	if !srcVal.IsValid() {
 		err := fmt.Errorf("cannot deep copy an invalid source value (was not nil, but reflect.Value is invalid)")
-		return nil, c.finalizeResult(err, &SysContext{errors: make([]error, 0)})
+		return nil, c.finalizeResult(err, &SysContext{Errors: make([]error, 0)})
 	}
 
 	destType := srcVal.Type()
 	destVal := reflect.New(destType).Elem()
 
-	ctx := &SysContext{depth: 0, visited: make(map[visitKey]reflect.Value), errors: make([]error, 0), detector: newCycleDetector()}
+	ctx := &SysContext{depth: 0, Visited: make(map[VisitKey]reflect.Value), Errors: make([]error, 0), Detector: NewCycleDetector()}
 
 	// For Deep(), avoid pre-tracking the top-level source pointer if it's a special type
-	// like *bytes.Buffer, as these have dedicated handlers in copyRecursive that
+	// like *bytes.Buffer, as these have dedicated handlers in CopyRecursive that
 	// will perform the correct allocation and setting. Pre-tracking can cause the
-	// cycle detector to short-circuit to the initially nil destVal.
+	// cycle Detector to short-circuit to the initially nil destVal.
 	isSpecialPointerType := false
 	if c.enableCycleDetect && srcVal.Kind() == reflect.Ptr && !srcVal.IsNil() {
 		elemType := srcVal.Type().Elem()
@@ -490,11 +490,11 @@ func (c *Copier) Deep(v interface{}) (interface{}, error) {
 		if !isSpecialPointerType {
 			// Track src pointer, its element type, to the new destination pointer
 			// (which is destVal itself if destType is a Ptr)
-			ctx.detector.Track(srcVal.Pointer(), elemType, destVal)
+			ctx.Detector.Track(srcVal.Pointer(), elemType, destVal)
 		}
 	}
 
-	err := c.copyRecursive(destVal, srcVal, ctx)
+	err := c.CopyRecursive(destVal, srcVal, ctx)
 
 	finalErr := c.finalizeResult(err, ctx)
 	if finalErr != nil {
@@ -519,4 +519,8 @@ func (c *Copier) MustDeep(v interface{}) interface{} {
 		panic(fmt.Sprintf("mm.MustDeep failed: %v", err))
 	}
 	return val
+}
+
+func (c *Copier) DebugMode() bool {
+	return c.debugMode
 }

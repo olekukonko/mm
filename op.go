@@ -126,7 +126,7 @@ func WithSkipPanic(skip bool) Option {
 	}
 }
 
-// WithSkipSilent enables silent errors if skip is false.
+// WithSkipSilent enables silent Errors if skip is false.
 func WithSkipSilent(skip bool) Option {
 	return func(c *Copier) {
 		c.silentErrors = !skip
@@ -172,6 +172,18 @@ func WithFallbackTagKeysFrom(keys ...string) Option {
 func WithErrors(collect bool) Option {
 	return func(c *Copier) {
 		c.collectErrors = collect
+	}
+}
+
+func WithPanicOnError() Option {
+	return func(c *Copier) {
+		c.panicOnError = true
+	}
+}
+
+func WithCollectErrors() Option {
+	return func(c *Copier) {
+		c.collectErrors = true
 	}
 }
 
@@ -232,7 +244,7 @@ func WithPanic(panicOnError bool) Option {
 	}
 }
 
-// WithSilentErrors enables or disables silent errors.
+// WithSilentErrors enables or disables silent Errors.
 func WithSilentErrors(silent bool) Option {
 	return func(c *Copier) {
 		c.silentErrors = silent
@@ -362,5 +374,15 @@ func (c *Copier) WithLogger(logger *ll.Logger) *Copier {
 
 func (c *Copier) WithSkipSensitive(skip bool) *Copier {
 	WithSkipSensitive(skip)(c)
+	return c
+}
+
+func (c *Copier) WithPanicOnError(enable bool) *Copier {
+	c.panicOnError = enable
+	return c
+}
+
+func (c *Copier) WithCollectErrors(enable bool) *Copier {
+	c.collectErrors = enable
 	return c
 }

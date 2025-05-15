@@ -100,7 +100,7 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		destElem = newAllocatedPtr.Elem()
 	} else {
 		destElem = dest.Elem()
-		// No need to log here, copyRecursive would have logged original dest. Elem info if needed.
+		// No need to log here, CopyRecursive would have logged original dest. Elem info if needed.
 		if !c.overwrite && destElem.IsValid() && !isBasicTypeZero(destElem) && !isEmptyValue(destElem) {
 			c.logger.Debugf("   -> Skipping Ptr element assign: Overwrite=false and dest element non-zero/non-empty.")
 			return nil
@@ -206,7 +206,7 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 	}
 
 	c.logger.Debugf("   Recursing on dest element (%s) <- src value (%s)", destElem.Type(), src.Type())
-	return c.copyRecursive(destElem, src, ctx)
+	return c.CopyRecursive(destElem, src, ctx)
 }
 
 // copyInterface handles copying a source value into a destination interface.
@@ -246,9 +246,9 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 	if c.enableCycleDetect && actualSrcForCycleCheck.Kind() == reflect.Ptr && !actualSrcForCycleCheck.IsNil() {
 		srcPtr := actualSrcForCycleCheck.Pointer()
 		srcElemTypeForKey := actualSrcForCycleCheck.Type().Elem()
-		if existingDestPointer, visited := ctx.detector.Check(srcPtr, srcElemTypeForKey); visited {
+		if existingDestPointer, visited := ctx.Detector.Check(srcPtr, srcElemTypeForKey); visited {
 			if existingDestPointer.IsValid() && existingDestPointer.Type().AssignableTo(dest.Type()) {
-				c.logger.Debugf("   Cycle REASSIGN (Interface): Dest %s set with existing visited Ptr %s.", dest.Type(), existingDestPointer.Type())
+				c.logger.Debugf("   Cycle REASSIGN (Interface): Dest %s set with existing Visited Ptr %s.", dest.Type(), existingDestPointer.Type())
 				dest.Set(existingDestPointer)
 				return nil
 			} else {
@@ -490,7 +490,7 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 			// holder = reflect.New(*SimpleDest.Elem()) which is reflect.New(SimpleDest) -> *SimpleDest
 			holder = reflect.New(typeForHolder.Elem()) // holder is *T
 			if valueToCopyIntoHolder.Kind() == reflect.Ptr && !valueToCopyIntoHolder.IsNil() {
-				if errRec := c.copyRecursive(holder.Elem(), valueToCopyIntoHolder.Elem(), ctx); errRec != nil {
+				if errRec := c.CopyRecursive(holder.Elem(), valueToCopyIntoHolder.Elem(), ctx); errRec != nil {
 					return fmt.Errorf("deep copying to Ptr holder.Elem (typeForHolder was Ptr) for interface: %w", errRec)
 				}
 			} else if valueToCopyIntoHolder.Kind() != reflect.Ptr { // Converter returned *T, but valueToCopy is T. This shouldn't happen with good converter.
@@ -509,13 +509,13 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 		} else if shouldHolderBePointer { // Original was pointer, or converter implies pointer result for interface
 			holder = reflect.New(typeForHolder) // Holder is *T
 			c.logger.Debugf("   Interface: Creating Ptr holder *%s.", typeForHolder)
-			if errRec := c.copyRecursive(holder.Elem(), valueToCopyIntoHolder, ctx); errRec != nil {
+			if errRec := c.CopyRecursive(holder.Elem(), valueToCopyIntoHolder, ctx); errRec != nil {
 				return fmt.Errorf("deep copying to Ptr holder.Elem for interface: %w", errRec)
 			}
 		} else { // Value type for holder
 			holder = reflect.New(typeForHolder).Elem() // Holder is T
 			c.logger.Debugf("   Interface: Creating Value holder %s.", typeForHolder)
-			if errRec := c.copyRecursive(holder, valueToCopyIntoHolder, ctx); errRec != nil {
+			if errRec := c.CopyRecursive(holder, valueToCopyIntoHolder, ctx); errRec != nil {
 				return fmt.Errorf("deep copying to Value holder for interface: %w", errRec)
 			}
 		}
@@ -526,7 +526,7 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 				trackableDest = holder.Addr()
 			}
 			if trackableDest.IsValid() && (trackableDest.Kind() == reflect.Ptr || trackableDest.Kind() == reflect.Interface) {
-				ctx.detector.Track(actualSrcForCycleCheck.Pointer(), actualSrcForCycleCheck.Type().Elem(), trackableDest)
+				ctx.Detector.Track(actualSrcForCycleCheck.Pointer(), actualSrcForCycleCheck.Type().Elem(), trackableDest)
 			}
 		}
 		valueToSetInInterface = holder

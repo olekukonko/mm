@@ -8,33 +8,33 @@ import (
 	// No longer needs to import a parent logger or the Copier struct for logging
 )
 
-type visitKey struct {
+type VisitKey struct {
 	ptr uintptr
 	typ reflect.Type
 }
 
 type cycleDetector struct {
-	visited map[visitKey]reflect.Value
+	visited map[VisitKey]reflect.Value
 	logger  *ll.Logger // This will be its own namespaced logger
 }
 
-// newCycleDetector now creates its own logger internally.
-func newCycleDetector() *cycleDetector {
+// NewCycleDetector now creates its own logger internally.
+func NewCycleDetector() *cycleDetector {
 	// Create a namespaced logger specifically for the cycleDetector.
 	// It will use the global DefaultLogger's settings for enabled status and level,
 	// unless specifically configured otherwise after creation if needed.
 	detectorLogger := logger.Namespace("cycle") // Uses your package-level LogWithNamespace
 
 	return &cycleDetector{
-		visited: make(map[visitKey]reflect.Value),
+		visited: make(map[VisitKey]reflect.Value),
 		logger:  detectorLogger,
 	}
 }
 
-// Check checks if a source pointer has been visited.
+// Check checks if a source pointer has been Visited.
 // If so, it returns the already created destination reflect.Value and true.
 func (d *cycleDetector) Check(srcPtr uintptr, srcElemType reflect.Type) (reflect.Value, bool) {
-	vk := visitKey{ptr: srcPtr, typ: srcElemType}
+	vk := VisitKey{ptr: srcPtr, typ: srcElemType}
 	existingDest, ok := d.visited[vk]
 	if ok {
 		var existingDestPtr uintptr
@@ -54,7 +54,7 @@ func (d *cycleDetector) Check(srcPtr uintptr, srcElemType reflect.Type) (reflect
 
 // Track records that a source pointer now corresponds to a specific destination value/pointer.
 func (d *cycleDetector) Track(srcPtr uintptr, srcElemType reflect.Type, destVal reflect.Value) {
-	vk := visitKey{ptr: srcPtr, typ: srcElemType}
+	vk := VisitKey{ptr: srcPtr, typ: srcElemType}
 	if _, exists := d.visited[vk]; !exists {
 		if !destVal.IsValid() {
 			d.logger.Warnf("Track: Attempted to track an invalid destVal for srcPtr %p (ElemType %s). Skipping track.", unsafe.Pointer(srcPtr), srcElemType.String())
