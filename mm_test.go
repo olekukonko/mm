@@ -959,7 +959,7 @@ func TestMapCopy(t *testing.T) {
 
 func TestInterfaceCopy(t *testing.T) {
 	srcSimpleVal := SimpleSrc{Name: "Concrete", Age: 55}
-	c := NewCopier().WithDebug(true).WithTypeConverter(
+	c := NewCopier().WithDebug(false).WithTypeConverter(
 		reflect.TypeOf(SimpleSrc{}), reflect.TypeOf(SimpleDest{}),
 		func(src reflect.Value) (reflect.Value, error) {
 			s := src.Interface().(SimpleSrc)

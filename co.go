@@ -2,25 +2,21 @@
 package mm
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
-	"unsafe"
 )
 
 func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
-	// ... (copyPtr logic remains largely the same as previous corrected version) ...
-	// Ensure logging indent/dedent matches entry/exit
 	destType := dest.Type()
 	if destType.Kind() != reflect.Ptr {
 		return fmt.Errorf("copyPtr: destination type %s is not a pointer", destType)
 	}
 	destElemType := destType.Elem()
 	c.logger.Indent(ctx.depth + 1)
-	defer c.logger.Indent(ctx.depth) // Ensure reset on exit
+	defer c.logger.Indent(ctx.depth)
 	c.logger.Debug("Copying -> Ptr (dest ptr type: %s, src value for elem: %s)", destType, src.Type())
 
-	if !src.IsValid() { /* ... (handle invalid src) ... */
+	if !src.IsValid() {
 		c.logger.Debug("   Source value (for Ptr element) is invalid.")
 		if c.skipNilSrc {
 			return nil
@@ -32,7 +28,7 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		return nil
 	}
 	srcKind := src.Kind()
-	if (srcKind == reflect.Ptr || srcKind == reflect.Interface || srcKind == reflect.Slice || srcKind == reflect.Map || srcKind == reflect.Chan || srcKind == reflect.Func) && src.IsNil() { /* ... (handle nil src value) ... */
+	if (srcKind == reflect.Ptr || srcKind == reflect.Interface || srcKind == reflect.Slice || srcKind == reflect.Map || srcKind == reflect.Chan || srcKind == reflect.Func) && src.IsNil() {
 		c.logger.Debug("   Source value (for Ptr element) is a nil pointer/interface/collection.")
 		if c.skipNilSrc {
 			return nil
@@ -44,8 +40,8 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		return nil
 	}
 
-	isSensitive := c.checkIsSensitive(src) // Use helper
-	if isSensitive && c.skipSensitive {    /* ... (handle skip sensitive) ... */
+	isSensitive := c.checkIsSensitive(src)
+	if isSensitive && c.skipSensitive {
 		c.logger.Debug("   -> SKIPPING Sensitive src value for Ptr element (c.skipSensitive=true).")
 		if c.overwrite && dest.CanSet() && !dest.IsNil() {
 			dest.Set(reflect.Zero(destType))
@@ -53,26 +49,34 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		return nil
 	}
 
-	copiableToCallType := destElemType
-	if isSensitive && src.IsValid() && src.Type().Implements(reflect.TypeOf((*Copiable)(nil)).Elem()) {
-		copiableToCallType = src.Type()
+	copiableInterface := reflect.TypeOf((*Copiable)(nil)).Elem()
+	copiableToCallType := destElemType // Default to Copiable on destination element type
+	if src.IsValid() && src.Type().Implements(copiableInterface) {
+		copiableToCallType = src.Type() // Prefer Copiable on source value's type
+	} else if destElemType.Implements(copiableInterface) {
+		// copiableToCallType is already destElemType
+	} else if reflect.PtrTo(destElemType).Implements(copiableInterface) { // Check *DestElemType
+		copiableToCallType = reflect.PtrTo(destElemType)
 	}
 
-	if isSensitive && !copiableToCallType.Implements(reflect.TypeOf((*Copiable)(nil)).Elem()) { /* ... (handle sensitive + no Copiable error) ... */
-		c.logger.Debug("   -> SKIPPING Sensitive src value for Ptr element: Type %s (chosen for Copiable) has no Copiable.", copiableToCallType)
-		if c.overwrite && dest.CanSet() && !dest.IsNil() {
-			dest.Set(reflect.Zero(destType))
+	if isSensitive && !copiableToCallType.Implements(copiableInterface) {
+		errMsg := fmt.Sprintf("sensitive pointer's element (dest type %s from src type %s) has no Copiable implementation on relevant types (%s, %s, *%s)", destElemType, src.Type(), src.Type(), destElemType, destElemType)
+		c.logger.Warn("   -> ERROR: %s", errMsg)
+		errSensitive := fmt.Errorf("%s: %w", errMsg, ErrSensitiveTypeCopied)
+		if c.handlePotentialError(errSensitive, ctx) {
+			return nil
 		}
-		return nil
+		return errSensitive
 	}
-	if c.skipZeroValue && src.IsValid() && src.IsZero() { /* ... (handle skip zero) ... */
+
+	if c.skipZeroValue && src.IsValid() && src.IsZero() {
 		c.logger.Debug("   -> Skipping Ptr element assign: Src value for element is zero.")
 		if c.overwrite && dest.CanSet() && !dest.IsNil() {
 			dest.Set(reflect.Zero(destType))
 		}
 		return nil
 	}
-	if c.skipEmptyValue && isEmptyValue(src) { /* ... (handle skip empty) ... */
+	if c.skipEmptyValue && isEmptyValue(src) {
 		c.logger.Debug("   -> Skipping Ptr element assign: Src value for element is empty.")
 		if c.overwrite && dest.CanSet() && !dest.IsNil() {
 			dest.Set(reflect.Zero(destType))
@@ -81,30 +85,22 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 	}
 
 	var destElem reflect.Value
+
 	if !dest.IsValid() {
 		return fmt.Errorf("destination pointer value invalid in copyPtr (original dest type: %s)", destType)
 	}
 
-	if dest.IsNil() { /* ... (initialize nil pointer dest) ... */
+	if dest.IsNil() {
 		if !dest.CanSet() {
 			return fmt.Errorf("cannot set nil pointer dest %s", destType)
 		}
 		c.logger.Debug("   Initializing nil dest Ptr %s of elem type %s", destType, destElemType)
-		newDestPtr := reflect.New(destElemType)
-		dest.Set(newDestPtr)
-		destElem = newDestPtr.Elem()
-		var elemAddr uintptr
-		if destElem.CanAddr() {
-			elemAddr = destElem.UnsafeAddr()
-		}
-		c.logger.Debug("   Initialized nil dest Ptr %s, Elem is %s (addr of Elem: %p, Ptr itself: %p)", destType, destElem.Type(), unsafe.Pointer(elemAddr), unsafe.Pointer(newDestPtr.Pointer()))
-	} else { /* ... (handle non-nil pointer dest) ... */
+		newAllocatedPtr := reflect.New(destElemType)
+		dest.Set(newAllocatedPtr)
+		destElem = newAllocatedPtr.Elem()
+	} else {
 		destElem = dest.Elem()
-		var elemAddr uintptr
-		if destElem.CanAddr() {
-			elemAddr = destElem.UnsafeAddr()
-		}
-		c.logger.Debug("   Dest Ptr %s is not nil. Elem is %s (addr of Elem: %p, Ptr itself: %p)", destType, destElem.Type(), unsafe.Pointer(elemAddr), unsafe.Pointer(dest.Pointer()))
+		// No need to log here, copyRecursive would have logged original dest. Elem info if needed.
 		if !c.overwrite && destElem.IsValid() && !isBasicTypeZero(destElem) && !isEmptyValue(destElem) {
 			c.logger.Debug("   -> Skipping Ptr element assign: Overwrite=false and dest element non-zero/non-empty.")
 			return nil
@@ -118,22 +114,25 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		return fmt.Errorf("cannot set pointer element of type %s (destination element not settable)", destElem.Type())
 	}
 
-	// --- Copiable on Element Type or Src Value's Type ---
 	copiableUsed := false
-	if copiableToCallType.Implements(reflect.TypeOf((*Copiable)(nil)).Elem()) && src.IsValid() && src.CanInterface() {
+	if copiableToCallType.Implements(copiableInterface) && src.IsValid() && src.CanInterface() {
 		c.logger.Debug("   Src value (type %s) to be handled by Copiable on type %s for Ptr's element (%s)...", src.Type(), copiableToCallType, destElem.Type())
-		// ... (Copiable instantiation logic - reuse the corrected one from processItem conceptually) ...
 		var copiableInst Copiable
 		var okAssert bool
 		receiverProvider := reflect.New(copiableToCallType)
-		if receiverProvider.CanInterface() {
-			copiableInst, okAssert = receiverProvider.Interface().(Copiable)
-		}
-		if !okAssert && copiableToCallType.Kind() != reflect.Interface {
+		if copiableToCallType.Kind() == reflect.Ptr {
+			if receiverProvider.CanInterface() {
+				copiableInst, okAssert = receiverProvider.Interface().(Copiable)
+			}
+		} else {
 			if receiverProvider.Elem().CanInterface() {
 				copiableInst, okAssert = receiverProvider.Elem().Interface().(Copiable)
 			}
+			if !okAssert && receiverProvider.CanInterface() {
+				copiableInst, okAssert = receiverProvider.Interface().(Copiable)
+			}
 		}
+
 		if !okAssert {
 			err = fmt.Errorf("Copiable (copyPtr): failed to assert instance of %s for item %s", copiableToCallType, dest.Type().String()+".Elem")
 			if c.handlePotentialError(err, ctx) {
@@ -145,9 +144,9 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		ctxCopy := &CopyContext{
 			FieldName: dest.Type().String() + ".Elem",
 			Settings:  struct{ Overwrite, SkipEmpty, SkipZero, SkipNil bool }{c.overwrite, c.skipEmptyValue, c.skipZeroValue, c.skipNilSrc},
-			Overwrite: false, // Copiable implementer sets this
+			Overwrite: false,
 			Copier:    c,
-			SetValue: func(valueFromCopiable interface{}) error { /* ... (SetValue logic - same as before) ... */
+			SetValue: func(valueFromCopiable interface{}) error {
 				if !destElem.CanSet() {
 					return fmt.Errorf("Copiable.SetValue: cannot set pointer element of type %s", destElem.Type())
 				}
@@ -174,7 +173,7 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 			},
 		}
 		valueReturnedByCopiable, errCopy := copiableInst.Copy(ctxCopy, src.Interface())
-		if errCopy != nil { /* ... (handle Copiable.Copy error) ... */
+		if errCopy != nil {
 			copyErr := fmt.Errorf("Copiable.Copy for pointer's element (dest type %s) failed: %w", destElem.Type(), errCopy)
 			if c.handlePotentialError(copyErr, ctx) {
 				return nil
@@ -184,14 +183,14 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 
 		if ctxCopy.Overwrite {
 			copiableUsed = true
-			if errSetValue := ctxCopy.SetValue(valueReturnedByCopiable); errSetValue != nil { /* ... (handle SetValue error) ... */
+			if errSetValue := ctxCopy.SetValue(valueReturnedByCopiable); errSetValue != nil {
 				setErr := fmt.Errorf("setting value from Copiable.Copy for pointer's element: %w", errSetValue)
 				if c.handlePotentialError(setErr, ctx) {
 					return nil
 				}
 				return setErr
 			}
-		} else if isSensitive { /* ... (handle sensitive + no overwrite error) ... */
+		} else if isSensitive {
 			sensitiveErr := fmt.Errorf("sensitive pointer's element (dest type %s) not overwritten by Copiable: %w", destElem.Type(), ErrSensitiveTypeCopied)
 			if c.handlePotentialError(sensitiveErr, ctx) {
 				return nil
@@ -207,39 +206,43 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 	}
 
 	c.logger.Debug("   Recursing on dest element (%s) <- src value (%s)", destElem.Type(), src.Type())
-	return c.copyRecursive(destElem, src, ctx) // src is already the concrete value for the element
+	return c.copyRecursive(destElem, src, ctx)
 }
 
+// copyInterface handles copying a source value into a destination interface.
+// `src` is the original source value passed for the interface slot (could be anything).
+// `dest` is the interface slot itself.
 func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err error) {
 	c.logger.Indent(ctx.depth + 1)
-	defer c.logger.Indent(ctx.depth) // Ensure reset on exit
+	defer c.logger.Indent(ctx.depth)
 	c.logger.Debug("Copying -> Interface (src type: %s (kind %s) -> dest type: %s)", src.Type(), src.Kind(), dest.Type())
 
 	if !dest.CanSet() {
 		return fmt.Errorf("destination interface %s is not settable", dest.Type())
 	}
 
-	// Handle nil/invalid source
+	// Handle nil/invalid source for the interface
 	if !src.IsValid() || ((src.Kind() == reflect.Interface || src.Kind() == reflect.Ptr) && src.IsNil()) {
 		logMsg := "invalid"
-		if src.IsValid() {
+		if src.IsValid() { // It's valid but a nil pointer/interface
 			logMsg = "nil pointer/interface"
 		}
 		c.logger.Debug("   Source (for Interface dest) is %s.", logMsg)
 		if c.skipNilSrc {
-			return nil
+			return nil // Skip setting the interface
 		}
-		if c.overwrite && dest.IsValid() && !dest.IsNil() {
+		if c.overwrite && dest.IsValid() && !dest.IsNil() { // If overwriting, set interface to its zero value (nil interface)
 			dest.Set(reflect.Zero(dest.Type()))
 		}
 		return nil
 	}
 
-	// Cycle detection (same as before)
+	// actualSrcForCycleCheck is src or src.Elem() if src is interface, used for cycle keying.
 	actualSrcForCycleCheck := src
 	if src.Kind() == reflect.Interface && !src.IsNil() {
 		actualSrcForCycleCheck = src.Elem()
 	}
+	// Cycle detection for pointers being put into interfaces
 	if c.enableCycleDetect && actualSrcForCycleCheck.Kind() == reflect.Ptr && !actualSrcForCycleCheck.IsNil() {
 		srcPtr := actualSrcForCycleCheck.Pointer()
 		srcElemTypeForKey := actualSrcForCycleCheck.Type().Elem()
@@ -249,29 +252,33 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 				dest.Set(existingDestPointer)
 				return nil
 			} else {
-				c.logger.Debug("     Cycle (Interface): Cannot assign existing Ptr %s to interface type %s. Fall through.", existingDestPointer.Type(), dest.Type())
+				c.logger.Debug("     Cycle (Interface): Cannot assign existing Ptr type %s to interface type %s. Fall through.", existingDestPointer.Type(), dest.Type())
 			}
 		}
 	}
 
-	// Get concrete value from src
-	srcConcreteVal := src
-	originalSrcKindBeforeDeref := src.Kind()
-	if srcConcreteVal.Kind() == reflect.Interface && !srcConcreteVal.IsNil() {
-		srcConcreteVal = srcConcreteVal.Elem()
-		originalSrcKindBeforeDeref = srcConcreteVal.Kind()
-	}
-	isSrcConcretePtr := false
-	if srcConcreteVal.Kind() == reflect.Ptr {
-		isSrcConcretePtr = true
-		if !srcConcreteVal.IsNil() {
-			srcConcreteVal = srcConcreteVal.Elem()
-		} else {
-			srcConcreteVal = reflect.Value{}
+	// Determine the concrete value and its original structure (pointer or value) from the source 'src'.
+	// 'srcToProcess' is what we'll examine for Copiable and concrete type.
+	srcToProcess := src
+	var ultimateSrcConcreteVal reflect.Value = srcToProcess
+	originalSrcKindBeforeUltimateDeref := ultimateSrcConcreteVal.Kind() // Kind of srcToProcess
+
+	for ultimateSrcConcreteVal.Kind() == reflect.Interface || ultimateSrcConcreteVal.Kind() == reflect.Ptr {
+		if ultimateSrcConcreteVal.IsNil() {
+			ultimateSrcConcreteVal = reflect.Value{}
+			break
+		}
+		if ultimateSrcConcreteVal.Kind() == reflect.Ptr && originalSrcKindBeforeUltimateDeref != reflect.Ptr {
+			// Update only if we encounter a pointer for the first time at this level of deref
+			originalSrcKindBeforeUltimateDeref = reflect.Ptr
+		}
+		ultimateSrcConcreteVal = ultimateSrcConcreteVal.Elem()
+		if !ultimateSrcConcreteVal.IsValid() {
+			break
 		}
 	}
 
-	if !srcConcreteVal.IsValid() { /* ... (handle invalid concrete source) ... */
+	if !ultimateSrcConcreteVal.IsValid() {
 		c.logger.Debug("   Source concrete value (for interface) is invalid after dereferencing.")
 		if c.skipNilSrc {
 			return nil
@@ -282,38 +289,54 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 		return nil
 	}
 
-	// Sensitivity & Skip checks on concrete value (same as before)
-	isSensitive := c.checkIsSensitive(srcConcreteVal)
-	if isSensitive && c.skipSensitive { /* ... skip ... */
-		c.logger.Debug("   SKIPPING Sensitive src concrete (type %s) for Interface (skipSensitive=true)", srcConcreteVal.Type())
-		if c.overwrite && dest.IsValid() && !dest.IsNil() {
-			dest.Set(reflect.Zero(dest.Type()))
-		}
-		return nil
+	isSensitive := c.checkIsSensitive(ultimateSrcConcreteVal)
+	copiableInterfaceType := reflect.TypeOf((*Copiable)(nil)).Elem()
+
+	copiableTargetVal := ultimateSrcConcreteVal
+	copiableTargetType := ultimateSrcConcreteVal.Type()
+
+	if srcToProcess.IsValid() && srcToProcess.Kind() == reflect.Interface && !srcToProcess.IsNil() &&
+		srcToProcess.Type().Implements(copiableInterfaceType) {
+		copiableTargetVal = srcToProcess
+		copiableTargetType = srcToProcess.Type()
+		c.logger.Debug("   Chosen Copiable target: original interface type %s", copiableTargetType)
+	} else if ultimateSrcConcreteVal.Type().Implements(copiableInterfaceType) {
+		c.logger.Debug("   Chosen Copiable target: ultimate concrete type %s", copiableTargetType)
+	} else {
+		copiableTargetType = nil
 	}
-	if isSensitive && !srcConcreteVal.Type().Implements(reflect.TypeOf((*Copiable)(nil)).Elem()) { /* ... skip ... */
-		c.logger.Debug("   SKIPPING Sensitive src concrete (type %s) for Interface: Type has no Copiable", srcConcreteVal.Type())
-		if c.overwrite && dest.IsValid() && !dest.IsNil() {
-			dest.Set(reflect.Zero(dest.Type()))
-		}
-		return nil
-	}
-	if c.skipZeroValue && srcConcreteVal.IsZero() { /* ... skip ... */
-		c.logger.Debug("   Skipping interface assign: Src concrete (type %s) is zero.", srcConcreteVal.Type())
-		if c.overwrite && dest.IsValid() && !dest.IsNil() {
-			dest.Set(reflect.Zero(dest.Type()))
-		}
-		return nil
-	}
-	if c.skipEmptyValue && isEmptyValue(srcConcreteVal) { /* ... skip ... */
-		c.logger.Debug("   Skipping interface assign: Src concrete (type %s) is empty.", srcConcreteVal.Type())
+
+	if isSensitive && c.skipSensitive {
+		c.logger.Debug("   SKIPPING Sensitive src concrete (type %s) for Interface (skipSensitive=true)", ultimateSrcConcreteVal.Type())
 		if c.overwrite && dest.IsValid() && !dest.IsNil() {
 			dest.Set(reflect.Zero(dest.Type()))
 		}
 		return nil
 	}
 
-	// Overwrite check for destination interface (same as before)
+	if isSensitive && (copiableTargetType == nil || !copiableTargetType.Implements(copiableInterfaceType)) {
+		errSensitive := fmt.Errorf("sensitive interface source (concrete %s, original src type %s) lacks a suitable Copiable implementation: %w", ultimateSrcConcreteVal.Type(), srcToProcess.Type(), ErrSensitiveTypeCopied)
+		if c.handlePotentialError(errSensitive, ctx) {
+			return nil
+		}
+		return errSensitive
+	}
+
+	if c.skipZeroValue && ultimateSrcConcreteVal.IsValid() && ultimateSrcConcreteVal.IsZero() {
+		c.logger.Debug("   Skipping interface assign: Src concrete (type %s) is zero.", ultimateSrcConcreteVal.Type())
+		if c.overwrite && dest.IsValid() && !dest.IsNil() {
+			dest.Set(reflect.Zero(dest.Type()))
+		}
+		return nil
+	}
+	if c.skipEmptyValue && isEmptyValue(ultimateSrcConcreteVal) {
+		c.logger.Debug("   Skipping interface assign: Src concrete (type %s) is empty.", ultimateSrcConcreteVal.Type())
+		if c.overwrite && dest.IsValid() && !dest.IsNil() {
+			dest.Set(reflect.Zero(dest.Type()))
+		}
+		return nil
+	}
+
 	if !c.overwrite && dest.IsValid() && !dest.IsNil() {
 		if destElemIf := dest.Elem(); destElemIf.IsValid() && !isEmptyValue(destElemIf) {
 			c.logger.Debug("   Skipping interface assign: Overwrite=false, dest interface non-empty (contains %s).", destElemIf.Type())
@@ -321,16 +344,15 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 	}
 
-	// Handle Stringer/error to empty interface{} (same as before)
 	isDestEmptyInterface := dest.Type().NumMethod() == 0 && dest.Type().Name() == ""
-	if isDestEmptyInterface && srcConcreteVal.CanInterface() {
-		if stringer, ok := srcConcreteVal.Interface().(fmt.Stringer); ok {
-			c.logger.Debug("   Interface: Source (type %s) is fmt.Stringer, dest is empty interface. Setting string value.", srcConcreteVal.Type())
+	if isDestEmptyInterface && ultimateSrcConcreteVal.CanInterface() {
+		if stringer, ok := ultimateSrcConcreteVal.Interface().(fmt.Stringer); ok {
+			c.logger.Debug("   Interface: Source (type %s) is fmt.Stringer, dest is empty interface. Setting string value.", ultimateSrcConcreteVal.Type())
 			dest.Set(reflect.ValueOf(stringer.String()))
 			return nil
 		}
-		if errInterface, ok := srcConcreteVal.Interface().(error); ok {
-			c.logger.Debug("   Interface: Source (type %s) is error, dest is empty interface. Setting error string value.", srcConcreteVal.Type())
+		if errInterface, ok := ultimateSrcConcreteVal.Interface().(error); ok {
+			c.logger.Debug("   Interface: Source (type %s) is error, dest is empty interface. Setting error string value.", ultimateSrcConcreteVal.Type())
 			dest.Set(reflect.ValueOf(errInterface.Error()))
 			return nil
 		}
@@ -339,29 +361,45 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 	var valueToSetInInterface reflect.Value
 	copiableUsed := false
 
-	// Copiable on concrete source type (same as before)
-	if srcConcreteVal.Type().Implements(reflect.TypeOf((*Copiable)(nil)).Elem()) && srcConcreteVal.CanInterface() { /* ... (Copiable logic remains same) ... */
-		c.logger.Debug("   Src concrete value (type %s) implements Copiable for interface assignment...", srcConcreteVal.Type())
+	if copiableTargetType != nil && copiableTargetType.Implements(copiableInterfaceType) && copiableTargetVal.CanInterface() {
+		c.logger.Debug("   Src value (type %s) implements Copiable for interface assignment...", copiableTargetType)
 		var copiableInst Copiable
 		var okAssert bool
-		receiverForCopiable := reflect.New(srcConcreteVal.Type())
-		if receiverForCopiable.CanInterface() {
-			copiableInst, okAssert = receiverForCopiable.Interface().(Copiable)
+
+		receiverProvider := reflect.New(copiableTargetType)
+		if copiableTargetType.Kind() == reflect.Ptr || copiableTargetType.Kind() == reflect.Interface {
+			if receiverProvider.CanInterface() {
+				copiableInst, okAssert = receiverProvider.Interface().(Copiable)
+			}
+		} else {
+			if receiverProvider.Elem().CanInterface() {
+				copiableInst, okAssert = receiverProvider.Elem().Interface().(Copiable)
+			}
+			if !okAssert && receiverProvider.CanInterface() {
+				copiableInst, okAssert = receiverProvider.Interface().(Copiable)
+			}
 		}
-		if !okAssert && receiverForCopiable.Elem().CanInterface() {
-			copiableInst, okAssert = receiverForCopiable.Elem().Interface().(Copiable)
-		}
+
 		if !okAssert {
-			err = fmt.Errorf("Copiable (copyInterface): failed assert %s", srcConcreteVal.Type())
+			err = fmt.Errorf("Copiable (copyInterface): failed assert %s to Copiable", copiableTargetType)
 			if c.handlePotentialError(err, ctx) {
 				return nil
 			}
 			return err
 		}
-		ctxCopy := &CopyContext{Settings: struct{ Overwrite, SkipEmpty, SkipZero, SkipNil bool }{c.overwrite, c.skipEmptyValue, c.skipZeroValue, c.skipNilSrc}, Overwrite: false, Copier: c, SetValue: func(valFromCopiable interface{}) error { /*...*/ return nil }}
-		valueReturnedByCopiable, errCopy := copiableInst.Copy(ctxCopy, srcConcreteVal.Interface())
+		ctxCopy := &CopyContext{
+			FieldName: "interfaceValue",
+			Settings:  struct{ Overwrite, SkipEmpty, SkipZero, SkipNil bool }{c.overwrite, c.skipEmptyValue, c.skipZeroValue, c.skipNilSrc},
+			Overwrite: false, Copier: c,
+			SetValue: func(valFromCopiable interface{}) error { return nil }}
+
+		valueReturnedByCopiable, errCopy := copiableInst.Copy(ctxCopy, copiableTargetVal.Interface())
 		if errCopy != nil {
-			return fmt.Errorf("Copiable.Copy for interface value (src type %s): %w", srcConcreteVal.Type(), errCopy)
+			err = fmt.Errorf("Copiable.Copy for interface value (src type %s): %w", copiableTargetType, errCopy)
+			if c.handlePotentialError(err, ctx) {
+				return nil
+			}
+			return err
 		}
 
 		if ctxCopy.Overwrite {
@@ -371,84 +409,154 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 			} else {
 				valueToSetInInterface = reflect.ValueOf(valueReturnedByCopiable)
 			}
-			if valueToSetInInterface.IsValid() && !valueToSetInInterface.Type().AssignableTo(dest.Type()) {
-				err = fmt.Errorf("Copiable for interface (src %s) returned %s, not assignable to dest interface %s", srcConcreteVal.Type(), valueToSetInInterface.Type(), dest.Type())
+			// Ensure the value from Copiable is assignable to the destination interface
+			if valueToSetInInterface.IsValid() { // It can be an invalid value if reflect.Zero(interfaceType) was used
+				if !valueToSetInInterface.Type().AssignableTo(dest.Type()) {
+					err = fmt.Errorf("Copiable for interface (src %s) returned %s, not assignable to dest interface %s", copiableTargetType, valueToSetInInterface.Type(), dest.Type())
+					if c.handlePotentialError(err, ctx) {
+						return nil
+					}
+					return err
+				}
+			} else if valueToSetInInterface.Kind() == reflect.Invalid && dest.Type().Kind() == reflect.Interface {
+				// This is fine, reflect.Zero(interfaceType) is an invalid value, representing typed nil interface
+			} else {
+				// This case (invalid value but not for an interface type) should ideally not happen
+				err = fmt.Errorf("Copiable for interface (src %s) resulted in an unexpected invalid value for dest interface %s", copiableTargetType, dest.Type())
 				if c.handlePotentialError(err, ctx) {
 					return nil
 				}
 				return err
 			}
-			c.logger.Debug("     Copiable.Copy provided value of type %s for interface %s.", valueToSetInInterface.Type(), dest.Type())
+			c.logger.Debug("     Copiable.Copy provided value of type %v for interface %s.", valueToSetInInterface.Type(), dest.Type())
 		} else if isSensitive {
-			return fmt.Errorf("sensitive interface value (src type %s) not overwritten by Copiable: %w", srcConcreteVal.Type(), ErrSensitiveTypeCopied)
+			err = fmt.Errorf("sensitive interface value (src type %s, concrete %s) not overwritten by Copiable: %w", srcToProcess.Type(), ultimateSrcConcreteVal.Type(), ErrSensitiveTypeCopied)
+			if c.handlePotentialError(err, ctx) {
+				return nil
+			}
+			return err
 		}
 	}
 
-	// *** FIX for Interface Copy Type Mismatch ***
 	if !copiableUsed {
-		// Determine the target type for the holder.
-		// If a converter exists from srcConcrete to dest.Type(), use dest.Type().
-		// Otherwise, use srcConcrete's type.
-		finalTargetElemType := srcConcreteVal.Type() // Default to source concrete type
-		convertedSrcVal := srcConcreteVal            // Use original concrete val by default
+		typeForHolder := ultimateSrcConcreteVal.Type()
+		valueToCopyIntoHolder := ultimateSrcConcreteVal
 
-		// Check for type converter: srcConcreteType -> destType (the interface itself)
-		// This allows converting src to something assignable to the dest interface.
-		if converted, canConvert, convErr := c.tryConvert(srcConcreteVal, dest.Type()); canConvert && convErr == nil {
-			c.logger.Debug("   Interface: Using converted value type %s for destination interface %s.", converted.Type(), dest.Type())
-			finalTargetElemType = converted.Type()
-			convertedSrcVal = converted // Use the converted value for the copy
-		} else if convErr != nil && !errors.Is(convErr, ErrNoConverter) {
-			return convErr // Propagate real conversion error
-		} else {
-			c.logger.Debug("   Interface: No specific converter found for %s -> %s. Using source concrete type %s.", srcConcreteVal.Type(), dest.Type(), finalTargetElemType)
+		// Attempt to use type converters
+		// We want to see if ultimateSrcConcreteVal can be converted to *any* type X,
+		// such that X (or *X) is assignable to dest.Type() (the interface).
+		convertedSuccessfully := false
+		if convMap, ok := c.typeConverters[ultimateSrcConcreteVal.Type()]; ok {
+			for destConvType, converterFunc := range convMap {
+				// Check if destConvType or *destConvType is assignable to the target interface type
+				valAssignable := reflect.New(destConvType).Elem().Type().AssignableTo(dest.Type())
+				ptrAssignable := reflect.New(destConvType).Type().AssignableTo(dest.Type())
+
+				if valAssignable || ptrAssignable {
+					convertedVal, convErr := converterFunc(ultimateSrcConcreteVal)
+					if convErr == nil && convertedVal.IsValid() {
+						// Now check if the *result* of the conversion is assignable
+						if convertedVal.Type().AssignableTo(dest.Type()) {
+							typeForHolder = convertedVal.Type()
+							valueToCopyIntoHolder = convertedVal // This is the value we'll deep copy if it's complex
+							c.logger.Debug("   Interface: Using converter %s -> %s. Holder will be based on %s.", ultimateSrcConcreteVal.Type(), destConvType, typeForHolder)
+							convertedSuccessfully = true
+							break
+						} else if convertedVal.CanAddr() && convertedVal.Addr().Type().AssignableTo(dest.Type()) {
+							// The converter returned T, but interface needs *T
+							// We will make a holder of *T, and copy T into its element.
+							typeForHolder = convertedVal.Type() // Holder will be *T, based on element T
+							valueToCopyIntoHolder = convertedVal
+							originalSrcKindBeforeUltimateDeref = reflect.Ptr // Treat as if original was pointer for holder creation
+							c.logger.Debug("   Interface: Using converter %s -> %s. Holder will be *%s (by taking Addr of converted).", ultimateSrcConcreteVal.Type(), destConvType, typeForHolder)
+							convertedSuccessfully = true
+							break
+						}
+					}
+				}
+			}
+		}
+		if convertedSuccessfully {
+			c.logger.Debug("   Interface: After checking converters, effective type for holder is %s, value to copy is %s", typeForHolder, valueToCopyIntoHolder.Type())
 		}
 
-		// Create holder based on whether the original source was a pointer or value,
-		// using the determined finalTargetElemType.
 		var holder reflect.Value
-		if isSrcConcretePtr || originalSrcKindBeforeDeref == reflect.Ptr {
-			holder = reflect.New(finalTargetElemType) // Create *T (where T is finalTargetElemType)
-			c.logger.Debug("   Interface: Original src was Ptr-like. Creating Ptr holder *%s.", finalTargetElemType)
+		shouldHolderBePointer := originalSrcKindBeforeUltimateDeref == reflect.Ptr
 
-			// Cycle track original source pointer to the new pointer holder
-			if c.enableCycleDetect && actualSrcForCycleCheck.IsValid() && actualSrcForCycleCheck.Kind() == reflect.Ptr && !actualSrcForCycleCheck.IsNil() {
-				ctx.detector.Track(actualSrcForCycleCheck.Pointer(), actualSrcForCycleCheck.Type().Elem(), holder)
+		if typeForHolder.Kind() == reflect.Ptr { // If converter returned a pointer type
+			shouldHolderBePointer = true
+			// Holder needs to be of type *T, and we'll copy element of valueToCopyIntoHolder into holder's element.
+			// Example: converter returns *SimpleDest. typeForHolder is *SimpleDest.
+			// holder = reflect.New(*SimpleDest.Elem()) which is reflect.New(SimpleDest) -> *SimpleDest
+			holder = reflect.New(typeForHolder.Elem()) // holder is *T
+			if valueToCopyIntoHolder.Kind() == reflect.Ptr && !valueToCopyIntoHolder.IsNil() {
+				if errRec := c.copyRecursive(holder.Elem(), valueToCopyIntoHolder.Elem(), ctx); errRec != nil {
+					return fmt.Errorf("deep copying to Ptr holder.Elem (typeForHolder was Ptr) for interface: %w", errRec)
+				}
+			} else if valueToCopyIntoHolder.Kind() != reflect.Ptr { // Converter returned *T, but valueToCopy is T. This shouldn't happen with good converter.
+				err = fmt.Errorf("type mismatch: converter indicated pointer type %s but provided value %s", typeForHolder, valueToCopyIntoHolder.Type())
+				if c.handlePotentialError(err, ctx) {
+					return nil
+				}
+				return err
+			} else { // valueToCopyIntoHolder is nil pointer
+				// holder remains a pointer to a zero value; assign Zero to make it nil pointer if interface allows
+				if dest.Type().Kind() == reflect.Interface { // Ensure we are setting an interface
+					holder = reflect.Zero(typeForHolder) // e.g. (*SimpleDest)(nil)
+				}
 			}
-			// Copy into the element of the new pointer holder
-			if errRec := c.copyRecursive(holder.Elem(), convertedSrcVal, ctx); errRec != nil {
-				return fmt.Errorf("deep copying Ptr's content for interface (holder.Elem type %s from concreteSrcVal type %s): %w", holder.Elem().Type(), convertedSrcVal.Type(), errRec)
+			c.logger.Debug("   Interface: Creating Ptr holder %s (typeForHolder was Ptr).", typeForHolder)
+		} else if shouldHolderBePointer { // Original was pointer, or converter implies pointer result for interface
+			holder = reflect.New(typeForHolder) // Holder is *T
+			c.logger.Debug("   Interface: Creating Ptr holder *%s.", typeForHolder)
+			if errRec := c.copyRecursive(holder.Elem(), valueToCopyIntoHolder, ctx); errRec != nil {
+				return fmt.Errorf("deep copying to Ptr holder.Elem for interface: %w", errRec)
 			}
-		} else {
-			holder = reflect.New(finalTargetElemType).Elem() // Create T (where T is finalTargetElemType)
-			c.logger.Debug("   Interface: Original src was Value-like. Creating Value holder %s.", finalTargetElemType)
-			// Copy directly into the new value holder
-			if errRec := c.copyRecursive(holder, convertedSrcVal, ctx); errRec != nil {
-				return fmt.Errorf("deep copying Value for interface (holder type %s from concreteSrcVal type %s): %w", holder.Type(), convertedSrcVal.Type(), errRec)
+		} else { // Value type for holder
+			holder = reflect.New(typeForHolder).Elem() // Holder is T
+			c.logger.Debug("   Interface: Creating Value holder %s.", typeForHolder)
+			if errRec := c.copyRecursive(holder, valueToCopyIntoHolder, ctx); errRec != nil {
+				return fmt.Errorf("deep copying to Value holder for interface: %w", errRec)
+			}
+		}
+
+		if c.enableCycleDetect && actualSrcForCycleCheck.Kind() == reflect.Ptr && !actualSrcForCycleCheck.IsNil() {
+			trackableDest := holder
+			if holder.IsValid() && holder.Kind() != reflect.Ptr && holder.CanAddr() {
+				trackableDest = holder.Addr()
+			}
+			if trackableDest.IsValid() && (trackableDest.Kind() == reflect.Ptr || trackableDest.Kind() == reflect.Interface) {
+				ctx.detector.Track(actualSrcForCycleCheck.Pointer(), actualSrcForCycleCheck.Type().Elem(), trackableDest)
 			}
 		}
 		valueToSetInInterface = holder
 	}
-	// *** End FIX ***
 
-	// Final checks and set (same as before)
 	if !valueToSetInInterface.IsValid() {
 		dest.Set(reflect.Zero(dest.Type()))
+		c.logger.Debug("   Setting dest interface %s to typed nil because valueToSetInInterface is invalid.", dest.Type())
 		return nil
 	}
-	if c.skipZeroValue && valueToSetInInterface.IsZero() {
+
+	if c.skipZeroValue && valueToSetInInterface.IsValid() && valueToSetInInterface.IsZero() && valueToSetInInterface.Kind() != reflect.Interface {
+		c.logger.Debug("   Skipping set of zero value (type %s) into interface (skipZeroValue=true)", valueToSetInInterface.Type())
 		if c.overwrite {
 			dest.Set(reflect.Zero(dest.Type()))
 		}
 		return nil
 	}
 	if c.skipEmptyValue && isEmptyValue(valueToSetInInterface) {
+		c.logger.Debug("   Skipping set of empty value (type %s) into interface (skipEmptyValue=true)", valueToSetInInterface.Type())
 		if c.overwrite {
 			dest.Set(reflect.Zero(dest.Type()))
 		}
 		return nil
 	}
+
 	if !valueToSetInInterface.Type().AssignableTo(dest.Type()) {
+		// If it's not assignable, but the value inside is (e.g. interface holds *T, dest is interface{})
+		// This should ideally be caught by type converter logic making typeForHolder correct.
+		// For now, if direct assignment fails, this is an error.
 		return fmt.Errorf("internal error: final value type %s not assignable to dest interface %s", valueToSetInInterface.Type(), dest.Type())
 	}
 
