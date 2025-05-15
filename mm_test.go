@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/olekukonko/ll"
+	"github.com/olekukonko/ll/lh"
+	"github.com/olekukonko/ll/lx"
 	"log" // Added for debug/warning output capture if needed
 	"math"
 	"reflect"
@@ -1143,11 +1146,16 @@ func TestUnmappedFieldsWrongType(t *testing.T) {
 	src := SourceWithExtras{ID: 1, Name: "N", Email: "E", Address: "A"}
 	var dest DestWithWrongUnmapped // ExtraData is []string, should be map
 
-	logOutput := &bytes.Buffer{}
-	log.SetOutput(logOutput)
-	defer log.SetOutput(log.Writer()) // Restore default logger
+	// --- Setup logger with MemoryHandler to capture logs ---
+	memHandler := lh.NewMemoryHandler()
+	// Create a new logger instance that uses the MemoryHandler
+	// Ensure it's enabled and set to a level that captures warnings.
+	testLogger := ll.New("testcapture", ll.WithHandler(memHandler)).Enable().Level(lx.LevelWarn)
+	// --- End logger setup ---
 
-	c := NewCopier().WithDebug(true)
+	// Create a Copier instance and configure it to use our testLogger
+	c := NewCopier().WithDebug(false).WithLogger(testLogger)
+
 	err := c.Copy(&dest, src)
 	if err != nil {
 		// Expecting NO error here, just a warning and skipping the unmapped part
@@ -1158,9 +1166,22 @@ func TestUnmappedFieldsWrongType(t *testing.T) {
 	exp := DestWithWrongUnmapped{ID: 1, DestName: "N", ExtraData: nil} // Expect ExtraData to be untouched (or nil)
 	assertDeepEqual(t, dest, exp, "Wrong unmapped type copy mismatch")
 
-	// Check for warning log
-	if !strings.Contains(logOutput.String(), "dest unmapped field 'ExtraData' has type []string") {
-		t.Errorf("Expected warning log for wrong unmapped field type, got: %s", logOutput.String())
+	// Check for warning log in the MemoryHandler
+	entries := memHandler.Entries()
+	foundLog := false
+	expectedLogSubstring := "dest unmapped field 'ExtraData' (type []string) is not map[string]interface{}"
+
+	var allMessages []string
+	for _, entry := range entries {
+		allMessages = append(allMessages, entry.Message) // Assuming lx.Entry has a Message field
+		if entry.Level == lx.LevelWarn && strings.Contains(entry.Message, expectedLogSubstring) {
+			foundLog = true
+			break
+		}
+	}
+
+	if !foundLog {
+		t.Errorf("Expected warning log containing '%s', got messages: %v", expectedLogSubstring, allMessages)
 	}
 }
 

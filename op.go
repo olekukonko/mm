@@ -354,6 +354,12 @@ func (c *Copier) WithDebug(enable bool) *Copier {
 	WithDebug(enable)(c)
 	return c
 }
+
+func (c *Copier) WithLogger(logger *ll.Logger) *Copier {
+	WithLogger(logger)(c)
+	return c
+}
+
 func (c *Copier) WithSkipSensitive(skip bool) *Copier {
 	WithSkipSensitive(skip)(c)
 	return c
