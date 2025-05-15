@@ -136,11 +136,21 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	}
 
 	// --- Cycle Detection ---
-	cycleCheckSrc := originalSrcForInterfaceChecks
-	if c.enableCycleDetect &&
-		(cycleCheckSrc.Kind() == reflect.Ptr || cycleCheckSrc.Kind() == reflect.Map || cycleCheckSrc.Kind() == reflect.Slice) &&
-		!cycleCheckSrc.IsNil() {
+	// Defer cycle detection if `dest` is a pointer type that needs special handling,
+	// as the special handler might allocate and set `dest`, and cycle detection before that
+	// might use a pre-allocation `dest` value incorrectly.
+	isDestSpecialPointerType := false
+	if dest.Kind() == reflect.Ptr {
+		destElemType := dest.Type().Elem()
+		if destElemType == reflect.TypeOf(bytes.Buffer{}) || destElemType == reflect.TypeOf(strings.Builder{}) {
+			isDestSpecialPointerType = true
+		}
+	}
 
+	if !isDestSpecialPointerType && c.enableCycleDetect &&
+		(originalSrcForInterfaceChecks.Kind() == reflect.Ptr || originalSrcForInterfaceChecks.Kind() == reflect.Map || originalSrcForInterfaceChecks.Kind() == reflect.Slice) &&
+		!originalSrcForInterfaceChecks.IsNil() {
+		cycleCheckSrc := originalSrcForInterfaceChecks
 		var srcPtrForCycle uintptr
 		var srcTypeForCycleKey reflect.Type
 
@@ -335,8 +345,9 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 	}
 
-	// --- Track Pointers for Cycle Detection ---
-	if c.enableCycleDetect &&
+	// --- Track Pointers for Cycle Detection (if not done before for special types) ---
+	if (isDestSpecialPointerType || true) && // Condition to ensure this runs after special pointer handlers might have set dest
+		c.enableCycleDetect &&
 		(originalSrcForInterfaceChecks.Kind() == reflect.Ptr || originalSrcForInterfaceChecks.Kind() == reflect.Map || originalSrcForInterfaceChecks.Kind() == reflect.Slice) &&
 		!originalSrcForInterfaceChecks.IsNil() {
 
@@ -352,9 +363,15 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 
 		destToActuallyTrack := dest
-		if dest.Kind() == reflect.Ptr {
-			destToActuallyTrack = dest
-		} else if dest.CanAddr() && dest.Kind() != reflect.Interface {
+		if dest.Kind() == reflect.Ptr { // If dest is *T, track T -> *T
+			// Ensure dest is not nil before trying to track it, esp if it was allocated by a special handler
+			if !dest.IsNil() {
+				destToActuallyTrack = dest
+			} else {
+				// If dest is still nil (e.g. special handler decided not to allocate), don't track
+				srcPtrForCycle = 0 // effectively skip tracking
+			}
+		} else if dest.CanAddr() && dest.Kind() != reflect.Interface { // If dest is T, track T -> &T
 			destToActuallyTrack = dest.Addr()
 		}
 
@@ -434,7 +451,7 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	}
 
 	if !srcConcrete.IsValid() {
-		c.logger.Debug("Source concrete became invalid after dereferencing %s.", effectiveSrc.Type())
+		c.logger.Debug("Source concrete became invalid after dereferencing %s.", originalSrcForInterfaceChecks.Type())
 		if c.skipNilSrc {
 			return nil
 		}
@@ -449,9 +466,9 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	}
 
 	if destConcrete.IsValid() && destConcrete.Kind() == reflect.Interface {
-		c.logger.Debug("Destination concrete is interface (%s), calling copyInterface with effectiveSrc (%s)",
-			destConcrete.Type(), effectiveSrc.Type())
-		return c.copyInterface(destConcrete, effectiveSrc, ctx)
+		c.logger.Debug("Destination concrete is interface (%s), calling copyInterface with originalSrcForInterfaceChecks (%s)",
+			destConcrete.Type(), originalSrcForInterfaceChecks.Type())
+		return c.copyInterface(destConcrete, originalSrcForInterfaceChecks, ctx)
 	}
 
 	// --- Source Sensitivity (on srcConcrete) ---
@@ -482,7 +499,7 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				}
 				return errSensitive
 			}
-			c.logger.Debug("  Sensitive source concrete type %s has a handler or will be handled by processItem. Proceeding.", srcConcrete.Type())
+			c.logger.Debug("  Sensitive source concrete type %s has a handler (MarshalCopier or Copiable on concrete) or will be handled by processItem. Proceeding.", srcConcrete.Type())
 		}
 	}
 
@@ -494,8 +511,228 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	srcConcreteType := srcConcrete.Type()
 	destConcreteType := destConcrete.Type()
 
+	// SPECIAL TYPE HANDLING (MOVED BEFORE MAIN DISPATCH)
+	// *bytes.Buffer (Pointer to Pointer copy)
+	if dest.Type() == reflect.TypeOf(&bytes.Buffer{}) &&
+		originalSrcForInterfaceChecks.IsValid() && originalSrcForInterfaceChecks.Type() == reflect.TypeOf(&bytes.Buffer{}) {
+		c.logger.Debug("Special Handling for *bytes.Buffer -> *bytes.Buffer")
+		if originalSrcForInterfaceChecks.IsNil() {
+			if c.skipNilSrc {
+				c.logger.Debug("  Src *bytes.Buffer is nil, skipping.")
+				return nil
+			}
+			if c.overwrite && dest.CanSet() && !dest.IsNil() {
+				dest.Set(reflect.Zero(dest.Type()))
+				c.logger.Debug("  Set dest *bytes.Buffer to nil (source was nil, overwrite=true).")
+			}
+			return nil
+		}
+		srcBufferPtr := originalSrcForInterfaceChecks.Interface().(*bytes.Buffer)
+		if !c.overwrite && dest.IsValid() && !dest.IsNil() {
+			if destBuf, ok := dest.Interface().(*bytes.Buffer); ok && destBuf.Len() > 0 {
+				c.logger.Debug("  Skipping *bytes.Buffer (Ptr): Overwrite=false and Dest non-empty.")
+				return nil
+			}
+		}
+		if dest.CanSet() {
+			newBuf := bytes.NewBuffer(srcBufferPtr.Bytes())
+			dest.Set(reflect.ValueOf(newBuf))
+			runtime.KeepAlive(newBuf)
+			runtime.KeepAlive(dest)
+			c.logger.Debug("  Set dest *bytes.Buffer to new buffer with content: '%s'", newBuf.String())
+			return nil
+		}
+		err = fmt.Errorf("cannot set dest pointer for *bytes.Buffer %s", dest.Type())
+		if c.handlePotentialError(err, ctx) {
+			return nil
+		}
+		return err
+	}
+
+	// *strings.Builder (Pointer to Pointer copy)
+	if dest.Type() == reflect.TypeOf(&strings.Builder{}) &&
+		originalSrcForInterfaceChecks.IsValid() && originalSrcForInterfaceChecks.Type() == reflect.TypeOf(&strings.Builder{}) {
+		c.logger.Debug("Special Handling for *strings.Builder -> *strings.Builder")
+		if originalSrcForInterfaceChecks.IsNil() {
+			if c.skipNilSrc {
+				c.logger.Debug("  Src *strings.Builder is nil, skipping.")
+				return nil
+			}
+			if c.overwrite && dest.CanSet() && !dest.IsNil() {
+				dest.Set(reflect.Zero(dest.Type()))
+				c.logger.Debug("  Set dest *strings.Builder to nil (source was nil, overwrite=true).")
+			}
+			return nil
+		}
+		srcBuilderPtr := originalSrcForInterfaceChecks.Interface().(*strings.Builder)
+		if !c.overwrite && dest.IsValid() && !dest.IsNil() {
+			if destBuild, ok := dest.Interface().(*strings.Builder); ok && destBuild.Len() > 0 {
+				c.logger.Debug("  Skipping *strings.Builder (Ptr): Overwrite=false and Dest non-empty.")
+				return nil
+			}
+		}
+		if dest.CanSet() {
+			var newBuilderS strings.Builder
+			newBuilderS.WriteString(srcBuilderPtr.String())
+			dest.Set(reflect.ValueOf(&newBuilderS))
+			runtime.KeepAlive(&newBuilderS)
+			runtime.KeepAlive(dest)
+			c.logger.Debug("  Set dest *strings.Builder to new builder with content: '%s'", newBuilderS.String())
+			return nil
+		}
+		err = fmt.Errorf("cannot set dest pointer for *strings.Builder %s", dest.Type())
+		if c.handlePotentialError(err, ctx) {
+			return nil
+		}
+		return err
+	}
+
+	// Bytes Buffer (Value) - srcConcrete is bytes.Buffer, destConcrete is bytes.Buffer
+	if srcConcrete.IsValid() && destConcrete.IsValid() &&
+		srcConcreteType == reflect.TypeOf(bytes.Buffer{}) && destConcreteType == srcConcreteType {
+		c.logger.Debug("Handling bytes.Buffer (Value) copy: %s -> %s", srcConcreteType, destConcreteType)
+
+		var srcBufferContent []byte
+		if srcConcrete.CanInterface() {
+			srcBufVal := srcConcrete.Interface().(bytes.Buffer)
+			srcBufferContent = make([]byte, srcBufVal.Len())
+			copy(srcBufferContent, srcBufVal.Bytes())
+		} else if srcConcrete.CanAddr() && c.useUnsafe {
+			srcBufPtr := (*bytes.Buffer)(unsafe.Pointer(srcConcrete.UnsafeAddr()))
+			srcBufferContent = make([]byte, srcBufPtr.Len())
+			copy(srcBufferContent, srcBufPtr.Bytes())
+			runtime.KeepAlive(srcConcrete)
+		} else {
+			c.logger.Warn("  Cannot reliably get source bytes.Buffer content for value copy. Assuming empty.")
+			srcBufferContent = []byte{}
+		}
+		c.logger.Debug("  Src Buffer Content (for Value copy): %d bytes", len(srcBufferContent))
+
+		destNonEmpty := false
+		if destConcrete.IsValid() {
+			var destLen int
+			if destConcrete.CanAddr() {
+				// Since Len() has a pointer receiver, get the address first
+				ptrToDestConcrete := destConcrete.Addr()
+				if ptrToDestConcrete.CanInterface() { // Check if the pointer can be interfaced
+					if bufPtr, ok := ptrToDestConcrete.Interface().(*bytes.Buffer); ok {
+						destLen = bufPtr.Len()
+					}
+				}
+			} else {
+				c.logger.Debug("   Dest bytes.Buffer (Value) is not addressable, cannot reliably get Len for non-overwrite check.")
+			}
+			if destLen > 0 {
+				destNonEmpty = true
+			}
+		}
+
+		if !c.overwrite && destNonEmpty {
+			c.logger.Debug("  Skipping bytes.Buffer (Value): Overwrite=false and Dest non-empty.")
+			return nil
+		}
+
+		if destConcrete.CanSet() {
+			var newDestBuf bytes.Buffer
+			if srcBufferContent != nil {
+				newDestBuf.Write(srcBufferContent)
+			}
+			destConcrete.Set(reflect.ValueOf(newDestBuf))
+			c.logger.Debug("  Set dest bytes.Buffer (Value) with new buffer, content length: %d", newDestBuf.Len())
+			return nil
+		} else if destConcrete.CanAddr() && c.useUnsafe {
+			// This path modifies destConcrete in place.
+			destBufPtr := (*bytes.Buffer)(unsafe.Pointer(destConcrete.UnsafeAddr()))
+			destBufPtr.Reset()
+			if srcBufferContent != nil {
+				destBufPtr.Write(srcBufferContent)
+			}
+			runtime.KeepAlive(destConcrete)
+			c.logger.Debug("  Modified in-place (unsafe) dest bytes.Buffer (Value). Content length: %d", destBufPtr.Len())
+			return nil
+		} else {
+			if len(srcBufferContent) > 0 {
+				err = fmt.Errorf("cannot deep copy non-empty bytes.Buffer value: dest type %s is not modifiable", destConcreteType)
+				if c.handlePotentialError(err, ctx) {
+					return nil
+				}
+				return err
+			}
+			return nil
+		}
+	}
+
+	// Strings Builder (Value)
+	if srcConcrete.IsValid() && destConcrete.IsValid() &&
+		srcConcreteType == reflect.TypeOf(strings.Builder{}) && destConcreteType == srcConcreteType {
+		c.logger.Debug("Handling strings.Builder (Value) copy: %s -> %s", srcConcreteType, destConcreteType)
+		var srcContent string
+		// strings.Builder.String() has a VALUE receiver.
+		if srcConcrete.CanInterface() {
+			builder := srcConcrete.Interface().(strings.Builder) // Get the value
+			srcContent = builder.String()                        // Call String() on the value
+		} else if srcConcrete.CanAddr() && c.useUnsafe {
+			// This case is tricky for value receivers if not CanInterface.
+			// For now, assume CanInterface for common cases.
+			c.logger.Warn("  Source strings.Builder (Value) is not directly interfaceable. Getting String() content via unsafe address is complex. Assuming empty.")
+		} else {
+			c.logger.Warn("  Cannot reliably get source strings.Builder content for value copy. Assuming empty.")
+		}
+		c.logger.Debug("  Src Builder Content (for Value copy): %d chars", len(srcContent))
+
+		destNonEmpty := false
+		if destConcrete.IsValid() {
+			var destLen int
+			// strings.Builder.Len() has a POINTER receiver.
+			if destConcrete.CanAddr() {
+				ptrToDestConcrete := destConcrete.Addr()
+				if ptrToDestConcrete.CanInterface() {
+					if sbPtr, ok := ptrToDestConcrete.Interface().(*strings.Builder); ok {
+						destLen = sbPtr.Len()
+					}
+				}
+			} else {
+				c.logger.Debug("   Dest strings.Builder (Value) is not addressable, cannot reliably get Len for non-overwrite check.")
+			}
+			if destLen > 0 {
+				destNonEmpty = true
+			}
+		}
+
+		if !c.overwrite && destNonEmpty {
+			c.logger.Debug("  Skipping strings.Builder (Value): Overwrite=false and Dest non-empty.")
+			return nil
+		}
+
+		if destConcrete.CanSet() {
+			var newDestBuilder strings.Builder
+			newDestBuilder.WriteString(srcContent)
+			destConcrete.Set(reflect.ValueOf(newDestBuilder))
+			c.logger.Debug("  Set dest strings.Builder (Value) with new builder, content length: %d", newDestBuilder.Len())
+			return nil
+		} else if destConcrete.CanAddr() && c.useUnsafe {
+			destBuilderPtr := (*strings.Builder)(unsafe.Pointer(destConcrete.UnsafeAddr()))
+			destBuilderPtr.Reset()
+			destBuilderPtr.WriteString(srcContent)
+			runtime.KeepAlive(destConcrete)
+			c.logger.Debug("  Modified in-place (unsafe) dest strings.Builder (Value). Content length: %d", destBuilderPtr.Len())
+			return nil
+		} else {
+			if len(srcContent) > 0 {
+				err = fmt.Errorf("cannot deep copy non-empty strings.Builder value: dest type %s is not modifiable", destConcreteType)
+				if c.handlePotentialError(err, ctx) {
+					return nil
+				}
+				return err
+			}
+			return nil
+		}
+	}
+
 	dispatchPerformed := false
 	if destConcrete.Kind() == reflect.Struct && srcConcrete.Kind() == reflect.Struct {
+		// This is the fallback for general structs.
+		// We've already handled special struct types (Buffer, Builder) above.
 		c.logger.Debug("Dispatching Struct -> Struct directly.")
 		ctx.depth++
 		err = c.copyStructDriven(destConcrete, srcConcrete, ctx)
@@ -520,7 +757,7 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		ctx.depth--
 		dispatchPerformed = true
 	} else if dest.Kind() == reflect.Ptr {
-		c.logger.Debug("Dispatching -> Ptr directly.")
+		c.logger.Debug("Dispatching -> Ptr directly (dest: %s, srcConcrete: %s).", dest.Type(), srcConcrete.Type())
 		ctx.depth++
 		err = c.copyPtr(dest, srcConcrete, ctx)
 		ctx.depth--
@@ -583,219 +820,6 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 		if handledBySpecialTypeOrConversion || err != nil {
 			c.logger.Debug("Handled []byte. Handled=%v, Err: %v", handledBySpecialTypeOrConversion, err)
-			if err != nil && c.handlePotentialError(err, ctx) {
-				return nil
-			}
-			return err
-		}
-	}
-
-	// Bytes Buffer (Value)
-	if srcConcreteType == reflect.TypeOf(bytes.Buffer{}) && destConcreteType == srcConcreteType {
-		c.logger.Debug("Handling bytes.Buffer (Value) copy check.")
-		var srcBufferContent []byte
-		if srcConcrete.CanAddr() {
-			srcBufPtr := (*bytes.Buffer)(unsafe.Pointer(srcConcrete.UnsafeAddr()))
-			srcBufferContent = make([]byte, srcBufPtr.Len())
-			copy(srcBufferContent, srcBufPtr.Bytes())
-			runtime.KeepAlive(srcConcrete)
-		} else if srcConcrete.CanInterface() {
-			srcBufVal := srcConcrete.Interface().(bytes.Buffer)
-			srcBufferContent = make([]byte, srcBufVal.Len())
-			copy(srcBufferContent, srcBufVal.Bytes())
-		} else {
-			c.logger.Warn("  Cannot reliably get source bytes.Buffer content. Assuming empty.")
-		}
-		c.logger.Debug("  Src Buffer Content (for Value copy): '%s'", string(srcBufferContent))
-
-		destNonEmpty := false
-		if destConcrete.IsValid() {
-			var destLen int
-			if destConcrete.CanAddr() {
-				destBufPtr := (*bytes.Buffer)(unsafe.Pointer(destConcrete.UnsafeAddr()))
-				destLen = destBufPtr.Len()
-				runtime.KeepAlive(destConcrete)
-			} else if destConcrete.CanInterface() {
-				destBufVal := destConcrete.Interface().(bytes.Buffer)
-				destLen = destBufVal.Len()
-			}
-			if destLen > 0 {
-				destNonEmpty = true
-			}
-		}
-
-		if !c.overwrite && destNonEmpty {
-			c.logger.Debug("  Skipping bytes.Buffer (Value): Overwrite=false and Dest non-empty.")
-			handledBySpecialTypeOrConversion = true
-		} else {
-			modifiedInPlace := false
-			if destConcrete.CanAddr() {
-				destBufPtr := (*bytes.Buffer)(unsafe.Pointer(destConcrete.UnsafeAddr()))
-				destBufPtr.Reset()
-				if srcBufferContent != nil {
-					destBufPtr.Write(srcBufferContent)
-				}
-				modifiedInPlace = true
-				runtime.KeepAlive(destConcrete)
-				c.logger.Debug("  Modified in-place dest bytes.Buffer (Value). Content: '%s'", destBufPtr.String())
-			}
-
-			if !modifiedInPlace && destConcrete.CanSet() {
-				var newDestBuf bytes.Buffer
-				if srcBufferContent != nil {
-					newDestBuf.Write(srcBufferContent)
-				}
-				destConcrete.Set(reflect.ValueOf(newDestBuf))
-				c.logger.Debug("  Set dest bytes.Buffer (Value) with new buffer content: '%s'", newDestBuf.String())
-			} else if !modifiedInPlace {
-				if len(srcBufferContent) > 0 {
-					err = fmt.Errorf("cannot deep copy non-empty bytes.Buffer value: destination type %s is not modifiable", destConcreteType)
-				}
-			}
-			handledBySpecialTypeOrConversion = true
-		}
-		if handledBySpecialTypeOrConversion || err != nil {
-			c.logger.Debug("Handled bytes.Buffer (Value). Handled=%v, Err: %v", handledBySpecialTypeOrConversion, err)
-			if err != nil && c.handlePotentialError(err, ctx) {
-				return nil
-			}
-			return err
-		}
-	}
-
-	// Bytes Buffer (Pointer)
-	if originalSrcForInterfaceChecks.Type() == reflect.TypeOf(&bytes.Buffer{}) && !originalSrcForInterfaceChecks.IsNil() &&
-		dest.Type() == reflect.TypeOf(&bytes.Buffer{}) {
-		srcBufferPtr := originalSrcForInterfaceChecks.Interface().(*bytes.Buffer)
-		c.logger.Debug("Handling *bytes.Buffer (Ptr) copy. Src Ptr Content: '%s'", srcBufferPtr.String())
-		destIsEmpty := true
-		if dest.IsValid() && !dest.IsNil() {
-			if bufPtr, ok := dest.Interface().(*bytes.Buffer); ok {
-				if bufPtr.Len() > 0 {
-					destIsEmpty = false
-				}
-			}
-		}
-		if !c.overwrite && !destIsEmpty {
-			c.logger.Debug("  Skipping *bytes.Buffer (Ptr): Overwrite=false and Dest non-empty.")
-			handledBySpecialTypeOrConversion = true
-		} else {
-			if dest.CanSet() {
-				c.logger.Debug("  Creating and setting new *bytes.Buffer for dest (deep copy).")
-				newBuf := bytes.NewBuffer(srcBufferPtr.Bytes())
-				dest.Set(reflect.ValueOf(newBuf))
-				handledBySpecialTypeOrConversion = true
-				c.logger.Debug("  Dest *Buffer Content after Set(New): '%s'", newBuf.String())
-			} else {
-				err = fmt.Errorf("cannot set dest pointer for *bytes.Buffer %s", dest.Type())
-			}
-		}
-		if handledBySpecialTypeOrConversion || err != nil {
-			c.logger.Debug("Handled *bytes.Buffer (Ptr). Handled=%v, Err: %v", handledBySpecialTypeOrConversion, err)
-			if err != nil && c.handlePotentialError(err, ctx) {
-				return nil
-			}
-			return err
-		}
-	}
-
-	// Strings Builder (Value)
-	if srcConcreteType == reflect.TypeOf(strings.Builder{}) && destConcreteType == srcConcreteType {
-		c.logger.Debug("Handling strings.Builder (Value) copy check.")
-		var srcContent string
-		if srcConcrete.CanAddr() {
-			srcBuilderPtr := (*strings.Builder)(unsafe.Pointer(srcConcrete.UnsafeAddr()))
-			srcContent = srcBuilderPtr.String()
-			runtime.KeepAlive(srcConcrete)
-		} else if srcConcrete.CanInterface() {
-			srcBuilderVal := srcConcrete.Interface().(strings.Builder)
-			srcContent = srcBuilderVal.String()
-		} else {
-			c.logger.Warn("  Cannot reliably get source strings.Builder content. Assuming empty.")
-		}
-		c.logger.Debug("  Src Builder Content (for Value copy): '%s'", srcContent)
-
-		destNonEmpty := false
-		if destConcrete.IsValid() {
-			var destLen int
-			if destConcrete.CanAddr() {
-				destBuilderPtr := (*strings.Builder)(unsafe.Pointer(destConcrete.UnsafeAddr()))
-				destLen = destBuilderPtr.Len()
-				runtime.KeepAlive(destConcrete)
-			} else if destConcrete.CanInterface() {
-				destBuilderVal := destConcrete.Interface().(strings.Builder)
-				destLen = destBuilderVal.Len()
-			}
-			if destLen > 0 {
-				destNonEmpty = true
-			}
-		}
-
-		if !c.overwrite && destNonEmpty {
-			c.logger.Debug("  Skipping strings.Builder (Value): Overwrite=false and Dest non-empty.")
-			handledBySpecialTypeOrConversion = true
-		} else {
-			modifiedInPlace := false
-			if destConcrete.CanAddr() {
-				destBuilderPtr := (*strings.Builder)(unsafe.Pointer(destConcrete.UnsafeAddr()))
-				destBuilderPtr.Reset()
-				destBuilderPtr.WriteString(srcContent)
-				modifiedInPlace = true
-				runtime.KeepAlive(destConcrete)
-				c.logger.Debug("  Modified in-place dest strings.Builder (Value). Content: '%s'", destBuilderPtr.String())
-			}
-
-			if !modifiedInPlace && destConcrete.CanSet() {
-				var newDestBuilder strings.Builder
-				newDestBuilder.WriteString(srcContent)
-				destConcrete.Set(reflect.ValueOf(newDestBuilder))
-				c.logger.Debug("  Set dest strings.Builder (Value) with new builder content: '%s'", newDestBuilder.String())
-			} else if !modifiedInPlace {
-				if len(srcContent) > 0 {
-					err = fmt.Errorf("cannot deep copy non-empty strings.Builder value: destination type %s is not modifiable", destConcreteType)
-				}
-			}
-			handledBySpecialTypeOrConversion = true
-		}
-		if handledBySpecialTypeOrConversion || err != nil {
-			c.logger.Debug("Handled strings.Builder (Value). Handled=%v, Err: %v", handledBySpecialTypeOrConversion, err)
-			if err != nil && c.handlePotentialError(err, ctx) {
-				return nil
-			}
-			return err
-		}
-	}
-
-	// Strings Builder (Pointer)
-	if originalSrcForInterfaceChecks.Type() == reflect.TypeOf(&strings.Builder{}) && !originalSrcForInterfaceChecks.IsNil() &&
-		dest.Type() == reflect.TypeOf(&strings.Builder{}) {
-		srcBuilderPtr := originalSrcForInterfaceChecks.Interface().(*strings.Builder)
-		c.logger.Debug("Handling *strings.Builder (Ptr) copy. Src Ptr Content: '%s'", srcBuilderPtr.String())
-		destIsEmpty := true
-		if dest.IsValid() && !dest.IsNil() {
-			if bldPtr, ok := dest.Interface().(*strings.Builder); ok {
-				if bldPtr.Len() > 0 {
-					destIsEmpty = false
-				}
-			}
-		}
-		if !c.overwrite && !destIsEmpty {
-			c.logger.Debug("  Skipping *strings.Builder (Ptr): Overwrite=false and Dest non-empty.")
-			handledBySpecialTypeOrConversion = true
-		} else {
-			if dest.CanSet() {
-				c.logger.Debug("  Creating and setting new *strings.Builder for dest (deep copy).")
-				var newBuilderS strings.Builder
-				newBuilderS.WriteString(srcBuilderPtr.String())
-				dest.Set(reflect.ValueOf(&newBuilderS))
-				handledBySpecialTypeOrConversion = true
-				c.logger.Debug("  Dest *Builder Content after Set(New): '%s'", newBuilderS.String())
-			} else {
-				err = fmt.Errorf("cannot set dest pointer for *strings.Builder %s", dest.Type())
-			}
-		}
-		if handledBySpecialTypeOrConversion || err != nil {
-			c.logger.Debug("Handled *strings.Builder (Ptr). Handled=%v, Err: %v", handledBySpecialTypeOrConversion, err)
 			if err != nil && c.handlePotentialError(err, ctx) {
 				return nil
 			}

@@ -3,6 +3,7 @@ package mm
 import (
 	"errors"
 	"github.com/olekukonko/ll"
+	"github.com/olekukonko/ll/lx"
 	"reflect"
 )
 
@@ -26,7 +27,7 @@ var (
 // Default Copier and Package-Level Functions
 var defaultCopier = NewCopier()
 
-var logger = ll.New("mm")
+var logger = ll.New("mm").Level(lx.LevelDebug)
 
 // Copiable defines an interface for types that handle their own field-level copying logic.
 // The Copy method is called for individual fields of a struct when the field's type implements this interface.

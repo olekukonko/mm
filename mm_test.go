@@ -828,7 +828,7 @@ func TestSliceCopy(t *testing.T) {
 		Ptrs:    []*SimpleSrc{srcPtr1, srcPtr2, srcPtr1}, // Reuse pointer
 	}
 	var dest SliceDest
-	c := NewCopier().WithCycleDetection(true).WithDebug(false) // Cycle detection matters for Ptrs slice
+	c := NewCopier().WithCycleDetection(true).WithDebug(true) // Cycle detection matters for Ptrs slice
 	err := c.Copy(&dest, src)
 	if err != nil {
 		t.Fatalf("Copy failed for slices: %v", err)
@@ -959,7 +959,7 @@ func TestMapCopy(t *testing.T) {
 
 func TestInterfaceCopy(t *testing.T) {
 	srcSimpleVal := SimpleSrc{Name: "Concrete", Age: 55}
-	c := NewCopier().WithDebug(false).WithTypeConverter(
+	c := NewCopier().WithDebug(true).WithTypeConverter(
 		reflect.TypeOf(SimpleSrc{}), reflect.TypeOf(SimpleDest{}),
 		func(src reflect.Value) (reflect.Value, error) {
 			s := src.Interface().(SimpleSrc)
