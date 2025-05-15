@@ -136,9 +136,6 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	}
 
 	// --- Cycle Detection ---
-	// Defer cycle detection if `dest` is a pointer type that needs special handling,
-	// as the special handler might allocate and set `dest`, and cycle detection before that
-	// might use a pre-allocation `dest` value incorrectly.
 	isDestSpecialPointerType := false
 	if dest.Kind() == reflect.Ptr {
 		destElemType := dest.Type().Elem()
@@ -345,9 +342,10 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 	}
 
-	// --- Track Pointers for Cycle Detection (if not done before for special types) ---
-	if (isDestSpecialPointerType || true) && // Condition to ensure this runs after special pointer handlers might have set dest
-		c.enableCycleDetect &&
+	// --- Track Pointers for Cycle Detection (General Case) ---
+	// This tracking needs to happen after potential allocation/setting by special handlers (like copyPtr)
+	// but before further recursion on elements/fields.
+	if c.enableCycleDetect &&
 		(originalSrcForInterfaceChecks.Kind() == reflect.Ptr || originalSrcForInterfaceChecks.Kind() == reflect.Map || originalSrcForInterfaceChecks.Kind() == reflect.Slice) &&
 		!originalSrcForInterfaceChecks.IsNil() {
 
@@ -362,21 +360,27 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			srcTypeForCycleKey = originalSrcForInterfaceChecks.Type()
 		}
 
-		destToActuallyTrack := dest
-		if dest.Kind() == reflect.Ptr { // If dest is *T, track T -> *T
-			// Ensure dest is not nil before trying to track it, esp if it was allocated by a special handler
-			if !dest.IsNil() {
-				destToActuallyTrack = dest
-			} else {
-				// If dest is still nil (e.g. special handler decided not to allocate), don't track
-				srcPtrForCycle = 0 // effectively skip tracking
-			}
-		} else if dest.CanAddr() && dest.Kind() != reflect.Interface { // If dest is T, track T -> &T
+		destToActuallyTrack := dest // `dest` here is the argument to copyRecursive.
+		// If `dest` is a pointer (e.g. holder for *T, or actual *T from Deep()), track it.
+		// If `dest` is a value (e.g. struct field, slice element that's a struct), track its address.
+		if dest.Kind() != reflect.Ptr && dest.Kind() != reflect.Interface && dest.CanAddr() {
 			destToActuallyTrack = dest.Addr()
 		}
+		// If destToActuallyTrack is still not a pointer (e.g. unaddressable value type, or interface not holding pointer),
+		// tracking might not be effective for pointer-equality based cycle detection.
 
-		if srcPtrForCycle != 0 && destToActuallyTrack.IsValid() {
+		if srcPtrForCycle != 0 && destToActuallyTrack.IsValid() &&
+			(destToActuallyTrack.Kind() == reflect.Ptr || destToActuallyTrack.Kind() == reflect.Map || destToActuallyTrack.Kind() == reflect.Slice) { // Only track if dest is also a trackable kind
 			if _, visited := ctx.detector.Check(srcPtrForCycle, srcTypeForCycleKey); !visited {
+				// Check if destToActuallyTrack is non-nil before tracking.
+				// This is important if copyPtr initialized a nil 'dest' holder and then set it.
+				// The 'dest' to copyRecursive might still be the reflect.Value of that initially nil ptr.
+				// We must track the value that 'dest' points to *after* it's been (potentially) allocated.
+				// This means this Track call should arguably be *after* copyPtr sets the dest.
+				// This is a key challenge.
+				// For now, we track `dest` as passed. If `dest` is a `reflect.Value` for a pointer,
+				// and `copyPtr` later calls `dest.Set(newPointer)`, the `reflect.Value` in the map
+				// should refer to the updated pointer.
 				var trackedDestTypeStr, trackedDestKindStr, trackedDestPtrStr string
 				if destToActuallyTrack.IsValid() {
 					trackedDestTypeStr = destToActuallyTrack.Type().String()
@@ -388,7 +392,7 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					} else {
 						trackedDestPtrStr = "<no_ptr_or_addr>"
 					}
-				} else {
+				} else { // Should not happen if destToActuallyTrack.IsValid() check above is working
 					trackedDestTypeStr = "<invalid_track_dest>"
 					trackedDestKindStr = "<invalid_track_dest_kind>"
 					trackedDestPtrStr = "<invalid_track_dest_ptr>"
@@ -396,7 +400,6 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				c.logger.Debug("  Cycle TRACK: Storing srcPtr %p (keyType %s) -> destToTrack %s (%s) ptr/addr %s",
 					unsafe.Pointer(srcPtrForCycle), srcTypeForCycleKey,
 					trackedDestTypeStr, trackedDestKindStr, trackedDestPtrStr)
-
 				ctx.detector.Track(srcPtrForCycle, srcTypeForCycleKey, destToActuallyTrack)
 			}
 		}
@@ -512,6 +515,9 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	destConcreteType := destConcrete.Type()
 
 	// SPECIAL TYPE HANDLING (MOVED BEFORE MAIN DISPATCH)
+	// These handlers check `dest` (original arg) and `originalSrcForInterfaceChecks` for pointer types,
+	// and `destConcrete` / `srcConcrete` for value types.
+
 	// *bytes.Buffer (Pointer to Pointer copy)
 	if dest.Type() == reflect.TypeOf(&bytes.Buffer{}) &&
 		originalSrcForInterfaceChecks.IsValid() && originalSrcForInterfaceChecks.Type() == reflect.TypeOf(&bytes.Buffer{}) {
@@ -612,9 +618,8 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		if destConcrete.IsValid() {
 			var destLen int
 			if destConcrete.CanAddr() {
-				// Since Len() has a pointer receiver, get the address first
 				ptrToDestConcrete := destConcrete.Addr()
-				if ptrToDestConcrete.CanInterface() { // Check if the pointer can be interfaced
+				if ptrToDestConcrete.CanInterface() {
 					if bufPtr, ok := ptrToDestConcrete.Interface().(*bytes.Buffer); ok {
 						destLen = bufPtr.Len()
 					}
@@ -641,7 +646,6 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			c.logger.Debug("  Set dest bytes.Buffer (Value) with new buffer, content length: %d", newDestBuf.Len())
 			return nil
 		} else if destConcrete.CanAddr() && c.useUnsafe {
-			// This path modifies destConcrete in place.
 			destBufPtr := (*bytes.Buffer)(unsafe.Pointer(destConcrete.UnsafeAddr()))
 			destBufPtr.Reset()
 			if srcBufferContent != nil {
@@ -667,13 +671,10 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		srcConcreteType == reflect.TypeOf(strings.Builder{}) && destConcreteType == srcConcreteType {
 		c.logger.Debug("Handling strings.Builder (Value) copy: %s -> %s", srcConcreteType, destConcreteType)
 		var srcContent string
-		// strings.Builder.String() has a VALUE receiver.
 		if srcConcrete.CanInterface() {
 			builder := srcConcrete.Interface().(strings.Builder) // Get the value
 			srcContent = builder.String()                        // Call String() on the value
 		} else if srcConcrete.CanAddr() && c.useUnsafe {
-			// This case is tricky for value receivers if not CanInterface.
-			// For now, assume CanInterface for common cases.
 			c.logger.Warn("  Source strings.Builder (Value) is not directly interfaceable. Getting String() content via unsafe address is complex. Assuming empty.")
 		} else {
 			c.logger.Warn("  Cannot reliably get source strings.Builder content for value copy. Assuming empty.")
@@ -683,7 +684,6 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		destNonEmpty := false
 		if destConcrete.IsValid() {
 			var destLen int
-			// strings.Builder.Len() has a POINTER receiver.
 			if destConcrete.CanAddr() {
 				ptrToDestConcrete := destConcrete.Addr()
 				if ptrToDestConcrete.CanInterface() {
@@ -731,8 +731,6 @@ func (c *Copier) copyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 
 	dispatchPerformed := false
 	if destConcrete.Kind() == reflect.Struct && srcConcrete.Kind() == reflect.Struct {
-		// This is the fallback for general structs.
-		// We've already handled special struct types (Buffer, Builder) above.
 		c.logger.Debug("Dispatching Struct -> Struct directly.")
 		ctx.depth++
 		err = c.copyStructDriven(destConcrete, srcConcrete, ctx)

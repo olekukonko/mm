@@ -828,7 +828,7 @@ func TestSliceCopy(t *testing.T) {
 		Ptrs:    []*SimpleSrc{srcPtr1, srcPtr2, srcPtr1}, // Reuse pointer
 	}
 	var dest SliceDest
-	c := NewCopier().WithCycleDetection(true).WithDebug(true) // Cycle detection matters for Ptrs slice
+	c := NewCopier().WithCycleDetection(true).WithDebug(false) // Cycle detection matters for Ptrs slice
 	err := c.Copy(&dest, src)
 	if err != nil {
 		t.Fatalf("Copy failed for slices: %v", err)
@@ -1147,7 +1147,7 @@ func TestUnmappedFieldsWrongType(t *testing.T) {
 	log.SetOutput(logOutput)
 	defer log.SetOutput(log.Writer()) // Restore default logger
 
-	c := NewCopier().WithDebug(false)
+	c := NewCopier().WithDebug(true)
 	err := c.Copy(&dest, src)
 	if err != nil {
 		// Expecting NO error here, just a warning and skipping the unmapped part
