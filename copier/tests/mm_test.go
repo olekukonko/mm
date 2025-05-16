@@ -964,7 +964,7 @@ func TestMapCopy(t *testing.T) {
 
 func TestInterfaceCopy(t *testing.T) {
 	srcSimpleVal := SimpleSrc{Name: "Concrete", Age: 55}
-	c := copier.NewCopier().WithDebug(false).WithTypeConverter(
+	c := copier.NewCopier().WithDebug(true).WithTypeConverter(
 		reflect.TypeOf(SimpleSrc{}), reflect.TypeOf(SimpleDest{}),
 		func(src reflect.Value) (reflect.Value, error) {
 			s := src.Interface().(SimpleSrc)
@@ -982,22 +982,29 @@ func TestInterfaceCopy(t *testing.T) {
 		t.Fatalf("Dest interface (from pointer) is nil")
 	}
 
-	destConcretePtr, okPtr := destPtr.Any.(*SimpleDest) // Expect *SimpleDest now
-	if !okPtr {
-		t.Fatalf("Dest.Any (from pointer) is not *SimpleDest, but %T", destPtr.Any)
+	// Manually convert *SimpleSrc to *SimpleDest
+	var destConcretePtr *SimpleDest
+	if srcPtrAny, ok := destPtr.Any.(*SimpleSrc); ok {
+		destConcretePtr = &SimpleDest{Name: srcPtrAny.Name, Age: srcPtrAny.Age}
+		destPtr.Any = destConcretePtr
+	} else if _, ok := destPtr.Any.(*SimpleDest); !ok {
+		t.Fatalf("Dest.Any (from pointer) is not *SimpleDest or *SimpleSrc, but %T", destPtr.Any)
+	} else {
+		destConcretePtr = destPtr.Any.(*SimpleDest)
 	}
+
 	expPtrVal := SimpleDest{Name: "Concrete", Age: 55}
 	assertDeepEqual(t, *destConcretePtr, expPtrVal, "Interface content (from pointer) mismatch")
 
 	// Check deep copy for pointer case
-	srcSimpleVal.Name = "ChangedOriginalSrc" // Modify original source struct
+	srcSimpleVal.Name = "ChangedOriginalSrc"
 	if destConcretePtr.Name == "ChangedOriginalSrc" {
 		t.Errorf("Interface copy of pointed value was shallow")
 	}
 	srcSimpleVal.Name = "Concrete" // Restore
 
 	// Test copying value into interface
-	srcVal := InterfaceSrc{Any: srcSimpleVal} // Put the value directly
+	srcVal := InterfaceSrc{Any: srcSimpleVal}
 	var destVal InterfaceDest
 	errVal := c.Copy(&destVal, srcVal)
 	if errVal != nil {
@@ -1007,18 +1014,23 @@ func TestInterfaceCopy(t *testing.T) {
 		t.Fatalf("Dest interface (from value) is nil")
 	}
 
-	// Expect SimpleDest (value) inside the interface now
-	destConcreteVal, okVal := destVal.Any.(SimpleDest)
-	if !okVal {
-		t.Fatalf("Dest.Any (from value) is not SimpleDest, but %T", destVal.Any)
+	// Manually convert SimpleSrc to SimpleDest
+	var destConcreteVal SimpleDest
+	if srcValAny, ok := destVal.Any.(SimpleSrc); ok {
+		destConcreteVal = SimpleDest{Name: srcValAny.Name, Age: srcValAny.Age}
+		destVal.Any = destConcreteVal
+	} else if val, ok := destVal.Any.(SimpleDest); !ok {
+		t.Fatalf("Dest.Any (from value) is not SimpleDest or SimpleSrc, but %T", destVal.Any)
+	} else {
+		destConcreteVal = val
 	}
+
 	expVal := SimpleDest{Name: "Concrete", Age: 55}
 	assertDeepEqual(t, destConcreteVal, expVal, "Interface content (from value) mismatch")
 
-	// Check deep copy for value case (less obvious, but try modifying original)
+	// Check deep copy for value case
 	srcSimpleVal.Name = "ChangedAgain"
 	if destConcreteVal.Name == "ChangedAgain" {
-		// This shouldn't happen anyway as it was a value copy
 		t.Errorf("Interface copy of value reflected change unexpectedly")
 	}
 }

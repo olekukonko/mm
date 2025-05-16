@@ -822,7 +822,7 @@ func TestChanSensitive(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := copier.NewCopier(tt.opts...).WithDebug(true)
+			c := copier.NewCopier(tt.opts...).WithDebug(false)
 
 			// Initialize destination slice as empty to avoid nil
 			var result []Hello = []Hello{}
