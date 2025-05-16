@@ -1,9 +1,8 @@
-package mm
+package copier
 
 import (
 	"errors"
-	"github.com/olekukonko/ll"
-	"github.com/olekukonko/ll/lx"
+	"github.com/olekukonko/mm/cycle"
 	"reflect"
 )
 
@@ -23,11 +22,6 @@ var (
 	ErrReadWriterCopy      = errors.New("failed to copy io.ReadWriter data")
 	ErrSensitiveTypeCopied = errors.New("sensitive type copied without custom logic")
 )
-
-// Default Copier and Package-Level Functions
-var defaultCopier = NewCopier()
-
-var logger = ll.New("mm").Level(lx.LevelDebug)
 
 // Copiable defines an interface for types that handle their own field-level copying logic.
 // The Copy method is called for individual fields of a struct when the field's type implements this interface.
@@ -92,8 +86,8 @@ type CopyContext struct {
 
 type SysContext struct {
 	depth    int
-	Detector *cycleDetector
-	Visited  map[VisitKey]reflect.Value
+	Detector *cycle.Detector
+	Visited  map[cycle.VisitKey]reflect.Value
 	Errors   []error
 }
 type TypeInfo struct {

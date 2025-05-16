@@ -1,5 +1,4 @@
-// ch.go
-package mm
+package copier
 
 import (
 	"fmt"

@@ -1,5 +1,5 @@
 // fn.go
-package mm
+package mf
 
 import (
 	"bytes"
@@ -8,10 +8,10 @@ import (
 	"strings"
 )
 
-// parseTagOptions correctly parses struct tag options.
+// ParseTagOptions correctly parses struct tag options.
 // Handles name as the first part unless it's a known flag.
 // Subsequent parts are treated as flags (e.g., "omitempty", "sensitive").
-func parseTagOptions(tag string) map[string]string {
+func ParseTagOptions(tag string) map[string]string {
 	opts := make(map[string]string)
 	parts := strings.Split(tag, ",")
 	knownFlags := map[string]bool{ // Define known flags here
@@ -52,7 +52,7 @@ func parseTagOptions(tag string) map[string]string {
 	return opts
 }
 
-func isMemCopySuitable(typ reflect.Type) bool {
+func IsMemCopySuitable(typ reflect.Type) bool {
 	switch typ.Kind() {
 	case reflect.Bool,
 		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -61,22 +61,22 @@ func isMemCopySuitable(typ reflect.Type) bool {
 		reflect.Complex64, reflect.Complex128:
 		return true
 	case reflect.Array:
-		return isMemCopySuitable(typ.Elem())
+		return IsMemCopySuitable(typ.Elem())
 	case reflect.Struct:
-		return !checkContainsPointers(typ)
+		return !HasPointers(typ)
 	default:
 		return false
 	}
 }
-func checkContainsPointers(typ reflect.Type) bool {
+func HasPointers(typ reflect.Type) bool {
 	switch typ.Kind() {
 	case reflect.Ptr, reflect.UnsafePointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface, reflect.String:
 		return true
 	case reflect.Array:
-		return checkContainsPointers(typ.Elem())
+		return HasPointers(typ.Elem())
 	case reflect.Struct:
 		for i := 0; i < typ.NumField(); i++ {
-			if checkContainsPointers(typ.Field(i).Type) {
+			if HasPointers(typ.Field(i).Type) {
 				return true
 			}
 		}
@@ -86,14 +86,14 @@ func checkContainsPointers(typ reflect.Type) bool {
 	}
 }
 
-// isEmptyValue checks if a reflect.Value is considered empty.
+// IsEmptyValue checks if a reflect.Value is considered empty.
 // This definition differs slightly from IsZero() for certain types.
 // Interfaces and pointers are empty if nil.
 // Slices, maps, strings, arrays are empty if their length is 0.
 // For structs like bytes.Buffer, strings.Builder, it checks Len() if possible.
 // Other structs check sql.NullXXX pattern or fall back to IsZero().
 // Basic types (bool, numbers) are *never* considered empty by this definition, only zero.
-func isEmptyValue(v reflect.Value) bool {
+func IsEmptyValue(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
 	}
@@ -136,21 +136,7 @@ func isEmptyValue(v reflect.Value) bool {
 	}
 }
 
-// srcValInterface is a helper for logging, attempts to get the interface value.
-func srcValInterface(val reflect.Value) interface{} {
-	if !val.IsValid() {
-		return "<invalid_val>"
-	}
-	if val.CanInterface() {
-		return val.Interface()
-	}
-	// For unexported fields, val.Interface() panics.
-	// Try to show type and that it's unexported/uninterfaceable.
-	// Using Addr() might also panic if not addressable.
-	return fmt.Sprintf("<uninterfaceable %s>", val.Type())
-}
-
-func isNilable(v reflect.Value) bool {
+func IsNilable(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true // Invalid value can be considered nil-like for skipNilSrc
 	}
@@ -161,65 +147,8 @@ func isNilable(v reflect.Value) bool {
 	return false
 }
 
-// getSensitivity tries to get the Sensitivity interface implementation from a value.
-func getSensitivity(v reflect.Value) (Sensitivity, bool) {
-	if !v.IsValid() {
-		return nil, false
-	}
-
-	// Check direct value (for value receivers or if v is already an interface holding Sensitivity)
-	if v.CanInterface() {
-		if s, ok := v.Interface().(Sensitivity); ok {
-			return s, true
-		}
-	}
-
-	// Check pointer to value (for pointer receivers)
-	if v.CanAddr() {
-		addrVal := v.Addr()
-		if addrVal.CanInterface() {
-			if s, ok := addrVal.Interface().(Sensitivity); ok {
-				return s, true
-			}
-		}
-	}
-
-	// Type-based check (if T or *T implements Sensitivity)
-	// This is useful if the value 'v' itself isn't interfaceable directly
-	// but its type definition implements the interface.
-	// We create a zero value of T or *T to call the method.
-	valueType := v.Type()
-	ptrType := reflect.PtrTo(valueType)
-
-	// Check T
-	if valueType.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
-		// Create a zero value of T to call Sensitive()
-		// This requires T to be constructible this way.
-		// reflect.New(valueType).Elem() gives T
-		zeroT := reflect.New(valueType).Elem()
-		if zeroT.CanInterface() {
-			if s, ok := zeroT.Interface().(Sensitivity); ok {
-				return s, true
-			}
-		}
-	}
-	// Check *T
-	if ptrType.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
-		// Create a zero value of *T to call Sensitive()
-		// reflect.New(valueType) gives *T
-		zeroPtrT := reflect.New(valueType)
-		if zeroPtrT.CanInterface() {
-			if s, ok := zeroPtrT.Interface().(Sensitivity); ok {
-				return s, true
-			}
-		}
-	}
-
-	return nil, false
-}
-
-// isEmptyValueForOmit checks if a value is empty according to Go's `omitempty` logic.
-func isEmptyValueForOmit(v reflect.Value) bool {
+// IsEmptyValueForOmit checks if a value is empty according to Go's `omitempty` logic.
+func IsEmptyValueForOmit(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
 	}
@@ -262,8 +191,8 @@ func isEmptyValueForOmit(v reflect.Value) bool {
 	}
 }
 
-// getNilLikeValue returns a typed nil or an invalid Value depending on the original value's type.
-func getNilLikeValue(originalVal reflect.Value) reflect.Value {
+// GetNilLikeValue returns a typed nil or an invalid Value depending on the original value's type.
+func GetNilLikeValue(originalVal reflect.Value) reflect.Value {
 	if !originalVal.IsValid() {
 		return reflect.Value{} // Return invalid Value
 	}
@@ -280,8 +209,8 @@ func getNilLikeValue(originalVal reflect.Value) reflect.Value {
 	return reflect.Value{} // Represent "absence" rather than typed zero for non-nilable types.
 }
 
-// isBasicTypeZero checks IsZero only for basic scalar types (bool, numbers, string).
-func isBasicTypeZero(v reflect.Value) bool {
+// IsBasicTypeZero checks IsZero only for basic scalar types (bool, numbers, string).
+func IsBasicTypeZero(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true // Invalid value is considered zero-like for overwrite checks
 	}
@@ -297,8 +226,8 @@ func isBasicTypeZero(v reflect.Value) bool {
 	return false // Composite types (structs, slices, maps etc.) are not "basic types" here
 }
 
-// srcKeyInterface robustly gets interface from map key for logging.
-func srcKeyInterface(key reflect.Value) interface{} {
+// InterfaceKeySrc robustly gets interface from map key for logging.
+func InterfaceKeySrc(key reflect.Value) interface{} {
 	if !key.IsValid() {
 		return "<invalid_key>"
 	}
@@ -309,8 +238,8 @@ func srcKeyInterface(key reflect.Value) interface{} {
 	return fmt.Sprintf("<uninterfaceable_key_type_%s>", key.Type())
 }
 
-// srcKeyValToString converts a map key reflect.Value to a string for logging/lookup.
-func srcKeyValToString(keyVal reflect.Value) string {
+// InterfaceToString converts a map key reflect.Value to a string for logging/lookup.
+func InterfaceToString(keyVal reflect.Value) string {
 	if !keyVal.IsValid() {
 		return "<invalid_key_value>"
 	}

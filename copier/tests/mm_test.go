@@ -10,6 +10,8 @@ import (
 	"github.com/olekukonko/ll/lh"
 	"github.com/olekukonko/ll/lx"
 	"github.com/olekukonko/mm"
+	"github.com/olekukonko/mm/copier"
+	"github.com/olekukonko/mm/cycle"
 	"log" // Added for debug/warning output capture if needed
 	"math"
 	"reflect"
@@ -205,7 +207,7 @@ func mapsClone(m map[string]interface{}) map[string]interface{} {
 }
 
 // MustCopyWith helper for testing
-func MustCopyWith[T any](c *mm.Copier, src interface{}) T {
+func MustCopyWith[T any](c *copier.Copier, src interface{}) T {
 	tempPanicCopier := *c // Make a copy to modify locally
 	tempPanicCopier.WithPanicOnError(true)
 	tempPanicCopier.WithCollectErrors(true)
@@ -231,7 +233,7 @@ func TestSimpleCopy(t *testing.T) {
 	}
 
 	// Test Copy (modifies existing)
-	c := mm.NewCopier()
+	c := copier.NewCopier()
 	err := c.Copy(&dest, src)
 	if err != nil {
 		t.Fatalf("Copy failed: %v", err)
@@ -246,7 +248,7 @@ func TestSimpleCopyLame(t *testing.T) {
 	src := LameSource{Username: "John Doe", Country: "USA"}
 
 	// Configure copier to use "mm" as primary, then try "json", then "db"
-	c := mm.NewCopier().WithTag("mm").WithTagResolution(true).WithFallbackTagKeys("json", "db").WithDebug(false)
+	c := copier.NewCopier().WithTag("mm").WithTagResolution(true).WithFallbackTagKeys("json", "db").WithDebug(false)
 
 	destNew, errNew := mm.CopyWith[LameDestination](c, src)
 	if errNew != nil {
@@ -274,7 +276,7 @@ func TestSimpleCopyLame(t *testing.T) {
 func TestNestedStruct(t *testing.T) {
 	src := NestedSrc{ID: 1, Child: SimpleSrc{Name: "Bob", Age: 25}}
 	var dest NestedDest
-	c := mm.NewCopier()
+	c := copier.NewCopier()
 	err := c.Copy(&dest, src)
 	if err != nil {
 		t.Fatalf("Copy failed: %v", err)
@@ -292,7 +294,7 @@ func TestNestedStruct(t *testing.T) {
 func TestFieldMappingAndTags(t *testing.T) {
 	srcWithValue := TagSource{FullName: "Charlie", Years: 40, ID: "ignore123", NoTag: "copied", City: "Testville", unexported: "secret"}
 	var dest1 TagDest
-	c := mm.NewCopier().WithDebug(false)
+	c := copier.NewCopier().WithDebug(false)
 	err := c.Copy(&dest1, srcWithValue)
 	if err != nil {
 		t.Fatalf("Copy failed: %v", err)
@@ -348,7 +350,7 @@ func TestSkipFields(t *testing.T) {
 	src := SimpleSrc{Name: "SourceValue", Age: 99}
 	dest := SimpleDest{Name: "DestOriginal", Age: 0}
 
-	c := mm.NewCopier().WithSkip("Name").WithDebug(false) // Changed debug to false for cleaner output unless needed
+	c := copier.NewCopier().WithSkip("Name").WithDebug(false) // Changed debug to false for cleaner output unless needed
 	err := c.Copy(&dest, src)
 	if err != nil {
 		t.Fatalf("Copy failed: %v", err)
@@ -361,7 +363,7 @@ func TestSkipFields(t *testing.T) {
 func TestTypeConversion(t *testing.T) {
 	src := DifferentTypesSrc{Timestamp: "2023-01-01T00:00:00Z", Count: 42, Value: 3.14}
 	var dest DifferentTypesDest
-	c := mm.NewCopier().
+	c := copier.NewCopier().
 		WithTypeConverter(reflect.TypeOf(""), reflect.TypeOf(time.Time{}),
 			func(src reflect.Value) (reflect.Value, error) {
 				t, err := time.Parse(time.RFC3339, src.String())
@@ -401,7 +403,7 @@ func TestUnexportedFields(t *testing.T) {
 	var dest UnexportedDest
 
 	// Default: unsafe=true, copyUnexported=false
-	cDefault := mm.NewCopier()
+	cDefault := copier.NewCopier()
 	dest = UnexportedDest{} // Reset
 	err := cDefault.Copy(&dest, src)
 	if err != nil {
@@ -411,7 +413,7 @@ func TestUnexportedFields(t *testing.T) {
 	assertDeepEqual(t, dest, expDefault, "Default (unexported=false) failed")
 
 	// Explicitly enable unexported copy (requires unsafe)
-	cWithUnsafe := mm.NewCopier().WithUnsafe(true).WithUnexported(true)
+	cWithUnsafe := copier.NewCopier().WithUnsafe(true).WithUnexported(true)
 	dest = UnexportedDest{} // Reset
 	err = cWithUnsafe.Copy(&dest, src)
 	if err != nil {
@@ -426,7 +428,7 @@ func TestUnexportedFields(t *testing.T) {
 	log.SetOutput(logOutput)
 	defer log.SetOutput(log.Writer()) // Restore default logger
 
-	cNoUnsafeButFlag := mm.NewCopier().WithUnsafe(false).WithUnexported(true)
+	cNoUnsafeButFlag := copier.NewCopier().WithUnsafe(false).WithUnexported(true)
 	dest = UnexportedDest{} // Reset
 	err = cNoUnsafeButFlag.Copy(&dest, src)
 	if err != nil {
@@ -445,7 +447,7 @@ func TestNilSourceHandling(t *testing.T) {
 	dest := SimpleDest{Name: "Keep", Age: 1}
 
 	// With SkipNil(true)
-	cSkip := mm.NewCopier().WithSkipNil(true)
+	cSkip := copier.NewCopier().WithSkipNil(true)
 	destSkip := dest // Copy initial state
 	err := cSkip.Copy(&destSkip, src)
 	if err != nil {
@@ -455,7 +457,7 @@ func TestNilSourceHandling(t *testing.T) {
 
 	// With SkipNil(false) and Overwrite(true)
 	destOverwrite := SimpleDest{Name: "OverwriteMe", Age: 2}
-	cOverwrite := mm.NewCopier().WithSkipNil(false).WithOverwrite(true)
+	cOverwrite := copier.NewCopier().WithSkipNil(false).WithOverwrite(true)
 	err = cOverwrite.Copy(&destOverwrite, src)
 	if err != nil {
 		t.Fatalf("Copy SkipNil(false)/Overwrite(true) failed: %v", err)
@@ -466,7 +468,7 @@ func TestNilSourceHandling(t *testing.T) {
 	// With SkipNil(false) and Overwrite(false)
 	destNoOverwrite := SimpleDest{Name: "KeepAgain", Age: 3}
 	initialNoOverwrite := destNoOverwrite // Copy initial state
-	cNoOverwrite := mm.NewCopier().WithSkipNil(false).WithOverwrite(false)
+	cNoOverwrite := copier.NewCopier().WithSkipNil(false).WithOverwrite(false)
 	err = cNoOverwrite.Copy(&destNoOverwrite, src)
 	if err != nil {
 		t.Fatalf("Copy SkipNil(false)/Overwrite(false) failed: %v", err)
@@ -481,7 +483,7 @@ func TestNilSourceHandling(t *testing.T) {
 	assertDeepEqual(t, destGenNilSkip, SimpleDest{}, "Generic CopyWith(skipNil=true) returned non-zero")
 
 	destGenNilNoSkip, errGenNilNoSkip := mm.CopyWith[SimpleDest](cOverwrite, nil) // Use nil interface{}
-	if !errors.Is(errGenNilNoSkip, mm.ErrSourceIsNil) {
+	if !errors.Is(errGenNilNoSkip, copier.ErrSourceIsNil) {
 		t.Fatalf("Generic CopyWith(skipNil=false) expected ErrSourceIsNil, got %v", errGenNilNoSkip)
 	}
 	assertDeepEqual(t, destGenNilNoSkip, SimpleDest{}, "Generic CopyWith(skipNil=false) from nil returned non-zero")
@@ -507,7 +509,7 @@ func TestNilPointerFieldHandling(t *testing.T) {
 
 	// With SkipNil(true) - should skip the nil Ptr field, keep original dest ptr
 	destSkip := DestWithPtr{Name: "DestOrig", Ptr: origDestPtrVal}
-	cSkip := mm.NewCopier().WithSkipNil(true)
+	cSkip := copier.NewCopier().WithSkipNil(true)
 	err := cSkip.Copy(&destSkip, src)
 	if err != nil {
 		t.Fatalf("Copy SkipNil(true) for field failed: %v", err)
@@ -520,7 +522,7 @@ func TestNilPointerFieldHandling(t *testing.T) {
 
 	// With SkipNil(false) and Overwrite(true) - should copy Name, set Ptr field to nil
 	destOverwrite := DestWithPtr{Name: "DestOrig", Ptr: origDestPtrVal}
-	cOverwrite := mm.NewCopier().WithSkipNil(false).WithOverwrite(true)
+	cOverwrite := copier.NewCopier().WithSkipNil(false).WithOverwrite(true)
 	err = cOverwrite.Copy(&destOverwrite, src)
 	if err != nil {
 		t.Fatalf("Copy SkipNil(false)/Overwrite(true) for field failed: %v", err)
@@ -531,7 +533,7 @@ func TestNilPointerFieldHandling(t *testing.T) {
 	// With SkipNil(false) and Overwrite(false) - should keep original Name, keep original Ptr
 	destNoOverwrite := DestWithPtr{Name: "DestOrigName", Ptr: origDestPtrVal}
 	initialNoOverwrite := destNoOverwrite // Copy initial state
-	cNoOverwrite := mm.NewCopier().WithSkipNil(false).WithOverwrite(false)
+	cNoOverwrite := copier.NewCopier().WithSkipNil(false).WithOverwrite(false)
 	err = cNoOverwrite.Copy(&destNoOverwrite, src)
 	if err != nil {
 		t.Fatalf("Copy SkipNil(false)/Overwrite(false) for field failed: %v", err)
@@ -570,13 +572,13 @@ func TestGenericCopy(t *testing.T) {
 
 	// Copy from general nil interface{} MUST return ErrSourceIsNil
 	destGeneralNil, errGeneralNil := mm.Copy[SimpleDest](nil)
-	if !errors.Is(errGeneralNil, mm.ErrSourceIsNil) {
+	if !errors.Is(errGeneralNil, copier.ErrSourceIsNil) {
 		t.Fatalf("Package Copy from general nil source expected ErrSourceIsNil, got %v", errGeneralNil)
 	}
 	assertDeepEqual(t, destGeneralNil, SimpleDest{}, "Package Copy from general nil source returned non-zero dest")
 
 	// Test CopyWith options
-	customCopierSkipNil := mm.NewCopier().WithSkipNil(true)
+	customCopierSkipNil := copier.NewCopier().WithSkipNil(true)
 	destWithCustomSkip, errWithCustomSkip := mm.CopyWith[SimpleDest](customCopierSkipNil, typedNilSrc)
 	if errWithCustomSkip != nil {
 		t.Fatalf("CopyWith (skipNil=true) from typed nil pointer expected nil error, got %v", errWithCustomSkip)
@@ -597,12 +599,12 @@ func TestGenericCopy(t *testing.T) {
 		t.Fatalf("MustCopy did not panic for nil source as expected")
 	}
 	// Check panic message
-	if errMsg, ok := recovered.(string); !ok || !strings.Contains(errMsg, mm.ErrSourceIsNil.Error()) {
-		t.Errorf("MustCopy panic message unexpected: %v, expected to contain '%s'", recovered, mm.ErrSourceIsNil.Error())
+	if errMsg, ok := recovered.(string); !ok || !strings.Contains(errMsg, copier.ErrSourceIsNil.Error()) {
+		t.Errorf("MustCopy panic message unexpected: %v, expected to contain '%s'", recovered, copier.ErrSourceIsNil.Error())
 	}
 
 	// Test MustCopy panic with custom copier (if CopyWith would error)
-	customPanicCopier := mm.NewCopier().WithSkipNil(false) // Ensure nil causes error
+	customPanicCopier := copier.NewCopier().WithSkipNil(false) // Ensure nil causes error
 	recoveredPanicCustom := func() (r interface{}) {
 		defer func() { r = recover() }()
 		_ = MustCopyWith[SimpleDest](customPanicCopier, nil)
@@ -611,8 +613,8 @@ func TestGenericCopy(t *testing.T) {
 	if recoveredPanicCustom == nil {
 		t.Fatalf("MustCopyWith did not panic for nil source as expected")
 	}
-	if errMsg, ok := recoveredPanicCustom.(string); !ok || !strings.Contains(errMsg, mm.ErrSourceIsNil.Error()) {
-		t.Errorf("MustCopyWith panic message unexpected: %v, expected to contain '%s'", recoveredPanicCustom, mm.ErrSourceIsNil.Error())
+	if errMsg, ok := recoveredPanicCustom.(string); !ok || !strings.Contains(errMsg, copier.ErrSourceIsNil.Error()) {
+		t.Errorf("MustCopyWith panic message unexpected: %v, expected to contain '%s'", recoveredPanicCustom, copier.ErrSourceIsNil.Error())
 	}
 }
 
@@ -623,7 +625,7 @@ func TestCycleDetection(t *testing.T) {
 	node2.Self = node1
 	node1.Data = node2 // Interface cycle
 
-	c := mm.NewCopier().WithCycleDetection(true).WithDebug(false) // Debug off for cleaner trace
+	c := copier.NewCopier().WithCycleDetection(true).WithDebug(false) // Debug off for cleaner trace
 	var dest1 Cyclic
 	err := c.Copy(&dest1, node1)
 	if err != nil {
@@ -701,7 +703,7 @@ func TestSkipZeroValue(t *testing.T) {
 	num := 5
 	src := SkipZeroSrc{Name: "KeepMe", Age: 0, Num: nil, Flag: false}         // Age, Num, Flag are zero values
 	dest := SkipZeroDest{Name: "OverwriteMe", Age: 99, Num: &num, Flag: true} // Pre-populate dest
-	c := mm.NewCopier().WithSkipZero(true).WithDebug(false)
+	c := copier.NewCopier().WithSkipZero(true).WithDebug(false)
 	err := c.Copy(&dest, src)
 	if err != nil {
 		t.Fatalf("Copy failed: %v", err)
@@ -767,7 +769,7 @@ func TestSkipEmptyValue(t *testing.T) {
 		},
 	}
 
-	c := mm.NewCopier().WithSkipEmpty(true).WithDebug(false)
+	c := copier.NewCopier().WithSkipEmpty(true).WithDebug(false)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -831,7 +833,7 @@ func TestSliceCopy(t *testing.T) {
 		Ptrs:    []*SimpleSrc{srcPtr1, srcPtr2, srcPtr1}, // Reuse pointer
 	}
 	var dest SliceDest
-	c := mm.NewCopier().WithCycleDetection(true).WithDebug(false) // Cycle detection matters for Ptrs slice
+	c := copier.NewCopier().WithCycleDetection(true).WithDebug(false) // Cycle detection matters for Ptrs slice
 	err := c.Copy(&dest, src)
 	if err != nil {
 		t.Fatalf("Copy failed for slices: %v", err)
@@ -918,7 +920,7 @@ func TestMapCopy(t *testing.T) {
 		IntStr: map[int]SimpleSrc{10: srcVal1, 20: srcVal2},
 	}
 	var dest MapDest
-	c := mm.NewCopier().WithDebug(false)
+	c := copier.NewCopier().WithDebug(false)
 	err := c.Copy(&dest, src)
 	if err != nil {
 		t.Fatalf("Copy failed for maps: %v", err)
@@ -962,7 +964,7 @@ func TestMapCopy(t *testing.T) {
 
 func TestInterfaceCopy(t *testing.T) {
 	srcSimpleVal := SimpleSrc{Name: "Concrete", Age: 55}
-	c := mm.NewCopier().WithDebug(false).WithTypeConverter(
+	c := copier.NewCopier().WithDebug(false).WithTypeConverter(
 		reflect.TypeOf(SimpleSrc{}), reflect.TypeOf(SimpleDest{}),
 		func(src reflect.Value) (reflect.Value, error) {
 			s := src.Interface().(SimpleSrc)
@@ -1028,7 +1030,7 @@ func TestUnmappedFieldsStructToStruct(t *testing.T) {
 	dest.ExtraData = map[string]interface{}{"Existing": true, "Email": "old@example.com"}
 
 	//  Test with Overwrite = true (Default)
-	cOverwrite := mm.NewCopier().WithDebug(false)
+	cOverwrite := copier.NewCopier().WithDebug(false)
 	destOverwrite := dest // Copy initial state
 	errOverwrite := cOverwrite.Copy(&destOverwrite, src)
 	if errOverwrite != nil {
@@ -1049,7 +1051,7 @@ func TestUnmappedFieldsStructToStruct(t *testing.T) {
 	assertDeepEqual(t, destOverwrite.ExtraData, expUnmappedOverwrite, "Overwrite: Unmapped data mismatch")
 
 	//  Test with Overwrite = false (Merge)
-	cMerge := mm.NewCopier().WithOverwrite(false).WithDebug(false)
+	cMerge := copier.NewCopier().WithOverwrite(false).WithDebug(false)
 	destMerge := dest // Reset to initial state
 	errMerge := cMerge.Copy(&destMerge, src)
 	if errMerge != nil {
@@ -1084,7 +1086,7 @@ func TestUnmappedFieldsMapToStruct(t *testing.T) {
 	dest.ExtraData = map[string]interface{}{"KeepMe": 123, "Email": "original@dest.com"}
 
 	//  Test with Overwrite = true (Default)
-	cOverwrite := mm.NewCopier().WithDebug(false)
+	cOverwrite := copier.NewCopier().WithDebug(false)
 	destOverwrite := dest // Copy initial state
 	errOverwrite := cOverwrite.Copy(&destOverwrite, srcMap)
 	if errOverwrite != nil {
@@ -1119,7 +1121,7 @@ func TestUnmappedFieldsMapToStruct(t *testing.T) {
 	}
 
 	//  Test with Overwrite = false (Merge)
-	cMerge := mm.NewCopier().WithOverwrite(false).WithDebug(false)
+	cMerge := copier.NewCopier().WithOverwrite(false).WithDebug(false)
 	destMerge := dest // Reset to initial state
 	errMerge := cMerge.Copy(&destMerge, srcMap)
 	if errMerge != nil {
@@ -1154,7 +1156,7 @@ func TestUnmappedFieldsWrongType(t *testing.T) {
 	// --- End logger setup ---
 
 	// Create a Copier instance and configure it to use our testLogger
-	c := mm.NewCopier().WithDebug(false).WithLogger(testLogger)
+	c := copier.NewCopier().WithDebug(false).WithLogger(testLogger)
 
 	err := c.Copy(&dest, src)
 	if err != nil {
@@ -1191,7 +1193,7 @@ func TestStructToMap(t *testing.T) {
 	dest["existing"] = true // Pre-populate
 
 	//  Test with Overwrite = true
-	cOverwrite := mm.NewCopier().WithDebug(false)
+	cOverwrite := copier.NewCopier().WithDebug(false)
 	destOverwrite := mapsClone(dest) // Clone initial map
 	errOverwrite := cOverwrite.Copy(&destOverwrite, src)
 	if errOverwrite != nil {
@@ -1223,7 +1225,7 @@ func TestStructToMap(t *testing.T) {
 	}
 
 	//  Test with Overwrite = false
-	cMerge := mm.NewCopier().WithOverwrite(false).WithDebug(false)
+	cMerge := copier.NewCopier().WithOverwrite(false).WithDebug(false)
 	destMerge := mapsClone(dest) // Clone initial map
 	errMerge := cMerge.Copy(&destMerge, src)
 	if errMerge != nil {
@@ -1244,7 +1246,7 @@ func TestStructToMap(t *testing.T) {
 	destOmit := make(map[string]interface{})
 
 	// Use a copier specifically configured to skip nil source values for this test's expectation
-	cOmitSpecific := mm.NewCopier().WithSkipNil(true).WithDebug(cOverwrite.DebugMode())
+	cOmitSpecific := copier.NewCopier().WithSkipNil(true).WithDebug(cOverwrite.DebugMode())
 	errOmit := cOmitSpecific.Copy(&destOmit, srcOmit)
 	if errOmit != nil {
 		t.Fatalf("Copy struct->map (omit age) failed: %v", errOmit)
@@ -1263,7 +1265,7 @@ func TestMergeTo(t *testing.T) {
 	src := SimpleSrc{Name: "New Name", Age: 50} // Name non-empty, Age non-zero
 	dest := SimpleDest{Name: "Keep Me", Age: 0} // Name non-empty, Age zero
 
-	c := mm.NewCopier().WithDebug(false) // Merge uses default copier settings except overwrite=false
+	c := copier.NewCopier().WithDebug(false) // Merge uses default copier settings except overwrite=false
 	err := c.Merge(&dest, src)
 	if err != nil {
 		t.Fatalf("Merge failed: %v", err)
@@ -1278,7 +1280,7 @@ func TestMergeTo(t *testing.T) {
 func TestMustCopyTo(t *testing.T) {
 	src := SimpleSrc{Name: "PanicTest", Age: 1}
 	var dest SimpleDest
-	c := mm.NewCopier()
+	c := copier.NewCopier()
 
 	recoveredSuccess := func() (r interface{}) {
 		defer func() { r = recover() }()
@@ -1302,8 +1304,8 @@ func TestMustCopyTo(t *testing.T) {
 	if recoveredPanic == nil {
 		t.Fatalf("MustCopy did not panic for invalid destination")
 	}
-	if errMsg, ok := recoveredPanic.(string); !ok || !strings.Contains(errMsg, mm.ErrDestNotPointer.Error()) {
-		t.Errorf("MustCopy panic message unexpected: %v, expected to contain '%s'", recoveredPanic, mm.ErrDestNotPointer.Error())
+	if errMsg, ok := recoveredPanic.(string); !ok || !strings.Contains(errMsg, copier.ErrDestNotPointer.Error()) {
+		t.Errorf("MustCopy panic message unexpected: %v, expected to contain '%s'", recoveredPanic, copier.ErrDestNotPointer.Error())
 	}
 
 	var nilDestPtr *SimpleDest = nil
@@ -1315,8 +1317,8 @@ func TestMustCopyTo(t *testing.T) {
 	if recoveredNilPanic == nil {
 		t.Fatalf("MustCopy did not panic for nil destination pointer")
 	}
-	if errMsg, ok := recoveredNilPanic.(string); !ok || !strings.Contains(errMsg, mm.ErrDestNotPointer.Error()) {
-		t.Errorf("MustCopy (nil ptr) panic message unexpected: %v, expected to contain '%s'", recoveredNilPanic, mm.ErrDestNotPointer.Error())
+	if errMsg, ok := recoveredNilPanic.(string); !ok || !strings.Contains(errMsg, copier.ErrDestNotPointer.Error()) {
+		t.Errorf("MustCopy (nil ptr) panic message unexpected: %v, expected to contain '%s'", recoveredNilPanic, copier.ErrDestNotPointer.Error())
 	}
 }
 
@@ -1324,7 +1326,7 @@ func TestMustCopyTo(t *testing.T) {
 func TestDeepCopyReadWriter(t *testing.T) {
 	// Test *bytes.Buffer
 	srcBufPtr := bytes.NewBufferString("buffer test data")
-	c := mm.NewCopier().WithDebug(false)
+	c := copier.NewCopier().WithDebug(false)
 
 	resBufPtr, errBufPtr := c.Deep(srcBufPtr)
 	if errBufPtr != nil {
@@ -1371,13 +1373,13 @@ func TestDeepCopyReadWriter(t *testing.T) {
 // Test for Stringer -> string/interface{} and error cases
 func TestCopyRecursiveStringer(t *testing.T) {
 	src := MyStringer{s: "test"}
-	copier := mm.NewCopier()
+	cc := copier.NewCopier()
 
 	// Test Stringer -> string
 	var destStrTarget string
 	destTargetVal := reflect.ValueOf(&destStrTarget).Elem()
-	ctx := &mm.SysContext{Visited: make(map[mm.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: mm.NewCycleDetector()}
-	errTarget := copier.CopyRecursive(destTargetVal, reflect.ValueOf(src), ctx)
+	ctx := &copier.SysContext{Visited: make(map[cycle.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: cycle.New(cycle.WithLogger(cc.Logger()))}
+	errTarget := cc.CopyRecursive(destTargetVal, reflect.ValueOf(src), ctx)
 	if errTarget != nil {
 		t.Fatalf("Copy Stringer->string failed: %v", errTarget)
 	}
@@ -1388,8 +1390,8 @@ func TestCopyRecursiveStringer(t *testing.T) {
 	// Test Stringer -> interface{}
 	var destIface interface{}
 	destIfaceVal := reflect.ValueOf(&destIface).Elem()
-	ctx = &mm.SysContext{Visited: make(map[mm.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: mm.NewCycleDetector()}
-	errIface := copier.CopyRecursive(destIfaceVal, reflect.ValueOf(src), ctx)
+	ctx = &copier.SysContext{Visited: make(map[cycle.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: cycle.New(cycle.WithLogger(cc.Logger()))}
+	errIface := cc.CopyRecursive(destIfaceVal, reflect.ValueOf(src), ctx)
 	if errIface != nil {
 		t.Fatalf("Copy Stringer->interface{} failed: %v", errIface)
 	}
@@ -1401,13 +1403,13 @@ func TestCopyRecursiveStringer(t *testing.T) {
 	// Test Stringer -> int (should fail)
 	var destInt int
 	destIntVal := reflect.ValueOf(&destInt).Elem()
-	ctx = &mm.SysContext{Visited: make(map[mm.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: mm.NewCycleDetector()}
-	errInt := copier.CopyRecursive(destIntVal, reflect.ValueOf(src), ctx)
+	ctx = &copier.SysContext{Visited: make(map[cycle.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: cycle.New(cycle.WithLogger(cc.Logger()))}
+	errInt := cc.CopyRecursive(destIntVal, reflect.ValueOf(src), ctx)
 	if errInt == nil {
 		t.Fatalf("Copy Stringer->int expected error, got nil")
 	}
 	// Expect conversion failure because stringer output ("test") cannot convert to int
-	if !errors.Is(errInt, mm.ErrNoConverter) && !errors.Is(errInt, mm.ErrTypeMismatch) { // Allow either error
+	if !errors.Is(errInt, copier.ErrNoConverter) && !errors.Is(errInt, copier.ErrTypeMismatch) { // Allow either error
 		t.Errorf("Copy Stringer->int expected ErrNoConverter or ErrTypeMismatch, got %T: %v", errInt, errInt)
 	}
 }

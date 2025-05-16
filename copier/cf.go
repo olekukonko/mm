@@ -1,9 +1,10 @@
 // mf.go
-package mm
+package copier
 
 import (
 	"errors"
 	"fmt"
+	"github.com/olekukonko/mm/mf"
 	"reflect"
 	"unsafe"
 )
@@ -28,13 +29,13 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 			fields:       make(map[string]FieldInfo),
 			size:         typ.Size(),
 			alignment:    uintptr(typ.Align()),
-			containsPtrs: checkContainsPointers(typ),
+			containsPtrs: mf.HasPointers(typ),
 			isStruct:     false,
 			isSlice:      typ.Kind() == reflect.Slice,
 			isMap:        typ.Kind() == reflect.Map,
 			isPtr:        typ.Kind() == reflect.Ptr,
 			isInterface:  typ.Kind() == reflect.Interface,
-			canMemCopy:   isMemCopySuitable(concreteType),
+			canMemCopy:   mf.IsMemCopySuitable(concreteType),
 		}
 	}
 
@@ -47,14 +48,14 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 		fields:       make(map[string]FieldInfo),
 		size:         typ.Size(),
 		alignment:    uintptr(typ.Align()),
-		containsPtrs: checkContainsPointers(typ),
+		containsPtrs: mf.HasPointers(typ),
 		isStruct:     true,
-		isSlice:      typ.Kind() == reflect.Slice, // Use original type for these flags
+		isSlice:      typ.Kind() == reflect.Slice,
 		isMap:        typ.Kind() == reflect.Map,
 		isPtr:        typ.Kind() == reflect.Ptr,
 		isInterface:  typ.Kind() == reflect.Interface,
 	}
-	processedEffectiveNames := make(map[string]string)
+	processedEffectiveNames := make(map[string]string) // To detect duplicate effective names
 
 	for i := 0; i < concreteType.NumField(); i++ {
 		f := concreteType.Field(i)
@@ -65,66 +66,73 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 			continue
 		}
 
-		effectiveName := f.Name
+		effectiveName := f.Name // Default to Go field name
 		var chosenTagOptions map[string]string
-		var isIgnoredByTag bool
+		var isIgnoredByTag bool = false
+		var nameSetByTag bool = false
 
-		// --- Tag Parsing Logic (using corrected parseTagOptions) ---
+		// Try primary tag first
 		primaryTagValue := f.Tag.Get(c.tagName)
 		if primaryTagValue != "" {
-			parsedOpts := parseTagOptions(primaryTagValue) // Corrected parsing
+			parsedOpts := mf.ParseTagOptions(primaryTagValue)
 			if name, ok := parsedOpts["name"]; ok {
 				effectiveName = name
-				chosenTagOptions = parsedOpts
-				c.logger.Debugf("getTypeInfo:     Primary tag ('%s') provided name: '%s', options: %v", c.tagName, effectiveName, chosenTagOptions)
-			} else if _, ignorePresent := parsedOpts["-"]; ignorePresent {
-				isIgnoredByTag = true
-				chosenTagOptions = parsedOpts
-				c.logger.Debugf("getTypeInfo:     Primary tag ('%s') IGNORED field '%s'.", c.tagName, f.Name)
-			} else { // Primary tag exists but only contains flags (like "omitempty", "sensitive")
-				chosenTagOptions = parsedOpts
-				c.logger.Debugf("getTypeInfo:     Primary tag ('%s') provided only flags: %v for field '%s'. Effective name remains '%s'.", c.tagName, chosenTagOptions, f.Name, effectiveName)
+				nameSetByTag = true
+				c.logger.Debugf("getTypeInfo:     Primary tag ('%s') set name to: '%s' for field '%s'.", c.tagName, effectiveName, f.Name)
 			}
-		} else {
-			c.logger.Debugf("getTypeInfo:     Primary tag ('%s') not found or empty for field %s.", c.tagName, f.Name)
+			if _, ignorePresent := parsedOpts["-"]; ignorePresent {
+				isIgnoredByTag = true
+				c.logger.Debugf("getTypeInfo:     Primary tag ('%s') IGNORED field '%s'.", c.tagName, f.Name)
+			}
+			chosenTagOptions = parsedOpts // Use options from primary tag if it exists
 		}
 
-		shouldTryFallbacksForName := !isIgnoredByTag && c.tagResolution &&
-			(chosenTagOptions == nil || (chosenTagOptions != nil && effectiveName == f.Name && chosenTagOptions["name"] == ""))
-
-		if shouldTryFallbacksForName {
-			c.logger.Debugf("getTypeInfo:     Tag resolution ON for field %s. Trying fallbacks for name/ignore: %v", f.Name, c.fallbackTagKeys)
+		// Try fallback tags if enabled, primary tag didn't ignore, and primary tag didn't set a name explicitly
+		if c.tagResolution && !isIgnoredByTag && !nameSetByTag {
+			c.logger.Debugf("getTypeInfo:     Tag resolution ON for field %s. Primary didn't set name/ignore. Trying fallbacks: %v", f.Name, c.fallbackTagKeys)
 			for _, fallbackKey := range c.fallbackTagKeys {
 				fallbackTagValue := f.Tag.Get(fallbackKey)
 				if fallbackTagValue != "" {
-					parsedFallbackOpts := parseTagOptions(fallbackTagValue)
+					parsedFallbackOpts := mf.ParseTagOptions(fallbackTagValue)
 					if name, ok := parsedFallbackOpts["name"]; ok {
 						effectiveName = name
-						chosenTagOptions = parsedFallbackOpts
-						isIgnoredByTag = false
-						c.logger.Debugf("getTypeInfo:       Fallback tag '%s' provided name: '%s'. Options from this tag: %v.", fallbackKey, effectiveName, chosenTagOptions)
-						break
-					} else if _, ignorePresent := parsedFallbackOpts["-"]; ignorePresent {
+						nameSetByTag = true          // Fallback set the name
+						if chosenTagOptions == nil { // Prefer options from the tag that set the name
+							chosenTagOptions = parsedFallbackOpts
+						}
+						c.logger.Debugf("getTypeInfo:       Fallback tag '%s' set name to: '%s' for field '%s'.", fallbackKey, effectiveName, f.Name)
+						break // Found name from fallback, stop searching fallbacks for name
+					}
+					if _, ignorePresent := parsedFallbackOpts["-"]; ignorePresent {
 						isIgnoredByTag = true
-						chosenTagOptions = parsedFallbackOpts
+						if chosenTagOptions == nil { // Prefer options from the tag that set ignore
+							chosenTagOptions = parsedFallbackOpts
+						}
 						c.logger.Debugf("getTypeInfo:       Fallback tag '%s' IGNORED field '%s'.", fallbackKey, f.Name)
-						break
-					} else if len(parsedFallbackOpts) > 0 && chosenTagOptions == nil {
+						break // Found ignore from fallback, stop searching fallbacks
+					}
+					// If fallback only provided other options and primary had no options, consider these.
+					if chosenTagOptions == nil && len(parsedFallbackOpts) > 0 {
 						chosenTagOptions = parsedFallbackOpts
-						c.logger.Debugf("getTypeInfo:       Fallback tag '%s' provided only flags: %v for field '%s'. Effective name remains '%s'.", fallbackKey, chosenTagOptions, f.Name, effectiveName)
-						// Note: We don't break here, primary tag options might still be preferred if they existed without a name.
+						c.logger.Debugf("getTypeInfo:       Fallback tag '%s' provided options for field '%s' (no name/ignore from this tag).", fallbackKey, f.Name)
 					}
 				}
 			}
 		}
-		// --- End Tag Parsing Logic ---
 
-		if chosenTagOptions == nil {
+		if chosenTagOptions == nil { // Ensure chosenTagOptions is not nil
 			chosenTagOptions = make(map[string]string)
 		}
 
-		// *** Check for sensitive flag using correct parsing ***
-		_, isSensitive := chosenTagOptions["sensitive"] // Check for presence of the key
+		// Final check for ignore, potentially from chosenTagOptions if not set by specific break earlier
+		if !isIgnoredByTag {
+			if _, ignorePresent := chosenTagOptions["-"]; ignorePresent {
+				isIgnoredByTag = true
+			}
+		}
+
+		_, isSensitive := chosenTagOptions["sensitive"]
+		_, isUnmapped := chosenTagOptions["unmapped"]
 
 		fInfo := FieldInfo{
 			name:        effectiveName,
@@ -133,20 +141,19 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 			offset:      f.Offset,
 			typ:         f.Type,
 			tagOpts:     chosenTagOptions,
-			sensitive:   isSensitive, // Use the correctly parsed flag
+			sensitive:   isSensitive,
 		}
 
-		_, isUnmapped := chosenTagOptions["unmapped"]
 		if isUnmapped {
 			if info.unmappedField != nil && info.unmappedField.structField.Name != f.Name {
 				c.logger.Warnf("[mm warning] Multiple unmapped fields ('%s', '%s') in %s, ignoring current field '%s'",
 					info.unmappedField.structField.Name, f.Name, concreteType.Name(), f.Name)
 			} else {
 				info.unmappedField = &fInfo
-				c.logger.Debugf("getTypeInfo:     Field '%s' (Go name) is designated as UNMAPPED field. Effective name: '%s'.", f.Name, effectiveName)
+				c.logger.Debugf("getTypeInfo:     Field '%s' (Go name) designated as UNMAPPED. Effective name: '%s'.", f.Name, effectiveName)
 			}
 		} else if isIgnoredByTag {
-			c.logger.Debugf("getTypeInfo:     Field '%s' (Go name) is IGNORED due to tag '-' (effective name was to be '%s').", f.Name, effectiveName)
+			c.logger.Debugf("getTypeInfo:     Field '%s' (Go name) IGNORED (tag '-'). Effective name was '%s'.", f.Name, effectiveName)
 		} else {
 			if existingGoName, duplicate := processedEffectiveNames[effectiveName]; duplicate {
 				c.logger.Warnf("[mm warning] Duplicate effective field name '%s' in type %s. Field '%s' conflicts with already processed field '%s'. Skipping field '%s'.",
@@ -158,7 +165,7 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 			}
 		}
 	}
-	info.canMemCopy = isMemCopySuitable(concreteType)
+	info.canMemCopy = mf.IsMemCopySuitable(concreteType)
 	c.typeInfoCache.Store(concreteType, info)
 	c.logger.Debugf("getTypeInfo: Finished analyzing type %s (concrete: %s). Fields: %d, Unmapped: %v",
 		typ, concreteType, len(info.fields), info.unmappedField != nil)
@@ -178,23 +185,6 @@ func (c *Copier) handlePotentialError(err error, ctx *SysContext) bool {
 		return true
 	}
 	return false
-}
-
-func (c *Copier) finalizeResult(returnedErr error, ctx *SysContext) error {
-	if c.collectErrors && len(ctx.Errors) > 0 {
-		finalErr := errors.Join(ctx.Errors...)
-		if c.panicOnError {
-			panic(fmt.Sprintf("mm copy failed with %d error(s): %v", len(ctx.Errors), finalErr))
-		}
-		return finalErr
-	}
-	if returnedErr != nil {
-		if c.panicOnError {
-			panic(fmt.Sprintf("mm copy failed: %v", returnedErr))
-		}
-		return returnedErr
-	}
-	return nil
 }
 
 func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.Value, bool, error) {
@@ -233,7 +223,7 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 				if converted.Type().ConvertibleTo(destType) {
 					c.logger.Debugf("%s    tryConvert: Custom converter for %s -> %s returned %s, converting to %s.", tryConvertDepthPrefix, srcType, destType, converted.Type(), destType)
 					finalConverted := converted.Convert(destType)
-					if !finalConverted.Type().AssignableTo(destType) {
+					if !finalConverted.Type().AssignableTo(destType) { // Should not happen if ConvertibleTo is true
 						c.logger.Debugf("%s      tryConvert: Post-Go-conversion type %s is STILL not assignable to %s.", tryConvertDepthPrefix, finalConverted.Type(), destType)
 						return reflect.Value{}, false, fmt.Errorf("type converter %s -> %s returned %s, and after Go conversion to %s, it's still not assignable to %s", srcType, destType, converted.Type(), finalConverted.Type(), destType)
 					}
@@ -253,7 +243,6 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 		return src.Convert(destType), true, nil
 	}
 
-	// T -> *U
 	if destType.Kind() == reflect.Ptr {
 		destElemType := destType.Elem()
 		if convMap, ok := c.typeConverters[srcType]; ok {
@@ -271,7 +260,7 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 				}
 			}
 		}
-		if srcType.Kind() != reflect.Ptr {
+		if srcType.Kind() != reflect.Ptr { // Avoid T -> *T by direct assignment if src is not ptr already.
 			if srcType.AssignableTo(destElemType) {
 				c.logger.Debugf("%s  tryConvert: Assigning %s to *%s (elem assignable)", tryConvertDepthPrefix, srcType, destElemType)
 				newPtr := reflect.New(destElemType)
@@ -287,11 +276,10 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 		}
 	}
 
-	// *T -> U
 	if srcType.Kind() == reflect.Ptr && !src.IsNil() {
 		srcElem := src.Elem()
 		srcElemType := srcElem.Type()
-		if destType.Kind() != reflect.Ptr {
+		if destType.Kind() != reflect.Ptr { // Avoid *T -> *U by deref if dest is also ptr (handled by main assign/convert)
 			if convMap, ok := c.typeConverters[srcElemType]; ok {
 				if _, specificConvExists := convMap[destType]; specificConvExists {
 					c.logger.Debugf("%s  tryConvert: Found custom converter for srcElem %s -> dest %s. Attempting *T -> U.", tryConvertDepthPrefix, srcElemType, destType)
@@ -309,7 +297,6 @@ func (c *Copier) tryConvert(src reflect.Value, destType reflect.Type) (reflect.V
 		}
 	}
 
-	// interface -> T
 	if srcType.Kind() == reflect.Interface && !src.IsNil() {
 		srcElem := src.Elem()
 		if srcElem.IsValid() {
@@ -354,21 +341,20 @@ func (c *Copier) getSettableFieldValue(structVal reflect.Value, fi *FieldInfo) (
 		return f, true, nil
 	}
 
-	if fi.structField.PkgPath != "" { // Unexported field
+	if fi.structField.PkgPath != "" {
 		if c.useUnsafe && c.copyUnexported {
 			if !concreteStructVal.CanAddr() {
 				return reflect.Value{}, false, fmt.Errorf("struct %s (field '%s') not addressable for unsafe set", concreteStructVal.Type(), fi.name)
 			}
 			fieldPtr := unsafe.Pointer(concreteStructVal.UnsafeAddr() + fi.offset)
 			fUnsafe := reflect.NewAt(fi.typ, fieldPtr).Elem()
-			if fUnsafe.IsValid() { // Assume settable if obtained via NewAt
+			if fUnsafe.IsValid() {
 				return fUnsafe, true, nil
 			}
 			return reflect.Value{}, false, fmt.Errorf("unsafe access to field '%s' of %s yielded invalid value", fi.name, concreteStructVal.Type())
 		}
 		return reflect.Value{}, false, ErrUnexportedField
 	}
-	// Exported but not settable
 	return reflect.Value{}, false, fmt.Errorf("exported field '%s' not settable (likely from unaddressable struct)", fi.name)
 }
 
@@ -394,15 +380,17 @@ func (c *Copier) readSourceFieldValue(srcStruct reflect.Value, fi *FieldInfo) (r
 
 	if f.CanInterface() {
 		return f, true
-	} // Standard way for exported fields
+	}
 
-	if fi.structField.PkgPath != "" { // Unexported
+	if fi.structField.PkgPath != "" {
 		if c.useUnsafe && c.copyUnexported {
 			if !concreteSrcStruct.CanAddr() {
 				c.logger.Debugf("   readSourceFieldValue: Struct %s (field '%s') not addressable for unsafe read.", concreteSrcStruct.Type(), fi.name)
 				return reflect.Value{}, false
 			}
 			fieldPtr := unsafe.Pointer(concreteSrcStruct.UnsafeAddr() + fi.offset)
+			// Create a new Value that refers to the memory at fieldPtr with type fi.typ. Then get its Elem().
+			// This reflect.Value, fUnsafe, should be readable.
 			fUnsafe := reflect.NewAt(fi.typ, fieldPtr).Elem()
 			if fUnsafe.IsValid() {
 				return fUnsafe, true
@@ -413,8 +401,6 @@ func (c *Copier) readSourceFieldValue(srcStruct reflect.Value, fi *FieldInfo) (r
 		c.logger.Debugf("   readSourceFieldValue: Field '%s' of %s unexported and unsafe/copyUnexported not enabled.", fi.name, concreteSrcStruct.Type())
 		return reflect.Value{}, false
 	}
-
-	// Exported but cannot interface (rare)
 	c.logger.Debugf("   readSourceFieldValue: Exported field '%s' of %s cannot be read via CanInterface().", fi.name, concreteSrcStruct.Type())
 	return reflect.Value{}, false
 }
@@ -427,53 +413,105 @@ func (c *Copier) checkIsSensitive(val reflect.Value) bool {
 	t := val.Type()
 	checkVal := val
 
+	// Handle pointers and interfaces: check the element type or concrete type for Sensitivity
 	if t.Kind() == reflect.Ptr || t.Kind() == reflect.Interface {
 		if val.IsNil() {
-			// Check type definition for sensitivity
-			tToCheck := t
+			// For nil Ptr/Interface, check if the defined type T (in *T or interface{T}) implements Sensitivity.
+			// This requires creating a zero value of T or *T to call the Sensitive() method.
+			var typeForZeroValueCheck reflect.Type
 			if t.Kind() == reflect.Ptr {
-				tToCheck = t.Elem()
+				typeForZeroValueCheck = t.Elem()
+			} else { // Interface
+				// For an interface type itself to implement Sensitivity is rare.
+				// Usually, it's the concrete type held by the interface.
+				// If it's nil, we can only check the interface type definition.
+				// A common case: iface.Type().Implements(...)
+				// This path is tricky for nil interfaces if Sensitivity is on the concrete type.
+				// For now, if nil, we can only check the static type T in interface{T} or *T.
+				// If val is a nil interface, val.Elem() is invalid. We need to rely on t.
+				// If t is interface{}, it cannot implement Sensitivity.
+				// If t is specific interface type e.g. MyInterface, check if MyInterface implements.
+				if t.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
+					// Must create a value of this interface type to call. How?
+					// This is hard. Let's assume Sensitivity is typically on concrete types or pointers to them.
+					// So if val is nil, and t is an interface type, we can't easily check.
+					// Best effort: if interface *itself* is Sensitivity (e.g. type MyIface interface { Sensitive(); ... })
+					// This requires a concrete type implementing MyIface to exist to call Sensitive().
+					// This indicates a design limitation or a very specific use case.
+					// For now, let's assume if a nil interface is passed, its type-defined sensitivity (if any) is what matters.
+					// However, calling Sensitive() on a nil interface value is not possible directly.
+					// We'd need a non-nil instance of a type that *is* that interface.
+					// This implies that for a nil interface, we probably can't determine sensitivity this way
+					// unless the interface type *itself* provides a way (which is not standard).
+					// Let's focus on the element type for pointers.
+					return false // Cannot reliably check sensitivity of a nil interface's potential concrete type.
+				}
 			}
-			if tToCheck == nil || tToCheck.Kind() == reflect.Invalid {
+
+			if typeForZeroValueCheck == nil || typeForZeroValueCheck.Kind() == reflect.Invalid {
 				return false
 			}
 
-			if tToCheck.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
-				zeroVal := reflect.New(tToCheck).Elem() // Get zero value of element T
-				if zeroVal.CanInterface() {
-					if s, ok := zeroVal.Interface().(Sensitivity); ok {
-						return s.Sensitive()
-					}
-				} else if zeroVal.CanAddr() && reflect.PtrTo(tToCheck).Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
-					// Check if *T implements it for pointer receiver on T
-					zeroPtr := zeroVal.Addr()
-					if zeroPtr.CanInterface() {
-						if s, ok := zeroPtr.Interface().(Sensitivity); ok {
-							return s.Sensitive()
-						}
-					}
+			// Check T
+			if typeForZeroValueCheck.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
+				zeroT := reflect.New(typeForZeroValueCheck).Elem()
+				if s, ok := zeroT.Interface().(Sensitivity); ok {
+					return s.Sensitive()
 				}
 			}
-			return false // Cannot determine from nil if type doesn't implement
+			// Check *T
+			ptrToType := reflect.PtrTo(typeForZeroValueCheck)
+			if ptrToType.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
+				zeroPtrT := reflect.New(typeForZeroValueCheck) // This is *T
+				if s, ok := zeroPtrT.Interface().(Sensitivity); ok {
+					return s.Sensitive()
+				}
+			}
+			return false
 		}
 		// Non-nil Ptr/Interface, check concrete value
 		checkVal = val.Elem()
-		if !checkVal.IsValid() {
+		if !checkVal.IsValid() { // e.g., interface holding nil pointer
 			return false
-		} // e.g., nil pointer inside interface
-		t = checkVal.Type()
+		}
+		t = checkVal.Type() // Update t to the concrete type
 	}
 
-	// Check concrete value instance or its pointer receiver
-	if checkVal.CanInterface() {
-		if s, ok := checkVal.Interface().(Sensitivity); ok {
-			return s.Sensitive()
+	// Now checkVal is a concrete value (or was originally)
+	// Check if value T implements Sensitivity
+	if t.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
+		// Need an instance of T to call Sensitive()
+		// If checkVal is already T and interfaceable
+		if checkVal.CanInterface() {
+			if s, ok := checkVal.Interface().(Sensitivity); ok {
+				return s.Sensitive()
+			}
+		} else if checkVal.CanAddr() { // Try with pointer receiver on T
+			// If T has pointer receiver, checkVal.Addr() which is *T might implement.
+			// This case is covered by the *T check below if checkVal itself doesn't work.
 		}
 	}
-	if checkVal.CanAddr() {
-		addrVal := checkVal.Addr()
-		if addrVal.CanInterface() {
-			if s, ok := addrVal.Interface().(Sensitivity); ok {
+
+	// Check if *T implements Sensitivity (for pointer receivers on T)
+	ptrType := reflect.PtrTo(t)
+	if ptrType.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
+		var instanceForPtrMethodCall reflect.Value
+		if checkVal.CanAddr() {
+			instanceForPtrMethodCall = checkVal.Addr() // Use existing *T
+		} else {
+			// If checkVal is not addressable (e.g. map element), create a new *T.
+			// This only works if Sensitive() doesn't depend on the specific state of checkVal.
+			// It's a type-level check using an instance.
+			// This path has limitations if Sensitive() is stateful.
+			// For most struct tag based sensitivity, this is fine.
+			tempNew := reflect.New(t) // Creates *T
+			// We can't set tempNew.Elem() from checkVal if checkVal is not addressable and settable into tempNew.Elem().
+			// We just need *any* instance of *T to call the method.
+			instanceForPtrMethodCall = tempNew
+		}
+
+		if instanceForPtrMethodCall.IsValid() && instanceForPtrMethodCall.CanInterface() {
+			if s, ok := instanceForPtrMethodCall.Interface().(Sensitivity); ok {
 				return s.Sensitive()
 			}
 		}

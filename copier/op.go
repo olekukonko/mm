@@ -1,5 +1,5 @@
 // op.go
-package mm
+package copier
 
 import (
 	"github.com/olekukonko/ll"

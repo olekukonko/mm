@@ -1,8 +1,9 @@
 // ph.go
-package mm
+package copier
 
 import (
 	"fmt"
+	"github.com/olekukonko/mm/mf"
 	"log" // Keep for specific debug warning if needed by tests
 	"reflect"
 )
@@ -71,7 +72,7 @@ func (c *Copier) processItem(
 		c.logger.Debugf("  Skipping '%s' (zero value).", itemName)
 		return processItemResult{shouldSet: false}
 	}
-	if c.skipEmptyValue && isEmptyValue(src) { // isEmptyValue handles invalid src
+	if c.skipEmptyValue && mf.IsEmptyValue(src) { // IsEmptyValue handles invalid src
 		c.logger.Debugf("  Skipping '%s' (empty value).", itemName)
 		return processItemResult{shouldSet: false}
 	}
@@ -83,7 +84,7 @@ func (c *Copier) processItem(
 				return processItemResult{shouldSet: false}
 			}
 		}
-	} else { // !isValidSrc (already handled by isEmptyValue if skipEmptyValue is true)
+	} else { // !isValidSrc (already handled by IsEmptyValue if skipEmptyValue is true)
 		if c.skipNilSrc { // Explicit skipNilSrc check for invalid src if skipEmptyValue is false
 			c.logger.Debugf("  Skipping '%s' (invalid src value, skipNilSrc=true).", itemName)
 			return processItemResult{shouldSet: false}

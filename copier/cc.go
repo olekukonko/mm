@@ -1,10 +1,11 @@
 // cc.go
-package mm
+package copier
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/olekukonko/mm/mf"
 	"log" // Keep standard log for specific warnings/infos like deprecation
 	"reflect"
 	"runtime"
@@ -841,7 +842,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		if isStringerOrError {
 			shouldSetStringer := c.overwrite ||
 				(destConcrete.Kind() == reflect.String && destConcrete.String() == "") ||
-				(destConcrete.Kind() == reflect.Interface && (destConcrete.IsNil() || (destConcrete.Elem().IsValid() && isEmptyValue(destConcrete.Elem()))))
+				(destConcrete.Kind() == reflect.Interface && (destConcrete.IsNil() || (destConcrete.Elem().IsValid() && mf.IsEmptyValue(destConcrete.Elem()))))
 			if shouldSetStringer && destConcrete.CanSet() {
 				if destConcrete.Kind() == reflect.String {
 					destConcrete.SetString(stringerVal)
@@ -878,11 +879,11 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				c.logger.Debugf("Skipping assign of converted value (zero).")
 				return nil
 			}
-			if c.skipEmptyValue && isEmptyValue(converted) {
+			if c.skipEmptyValue && mf.IsEmptyValue(converted) {
 				c.logger.Debugf("Skipping assign of converted value (empty).")
 				return nil
 			}
-			shouldSetConverted := c.overwrite || (destConcrete.IsValid() && (isBasicTypeZero(destConcrete) || isEmptyValue(destConcrete))) || !destConcrete.IsValid()
+			shouldSetConverted := c.overwrite || (destConcrete.IsValid() && (mf.IsBasicTypeZero(destConcrete) || mf.IsEmptyValue(destConcrete))) || !destConcrete.IsValid()
 			if shouldSetConverted {
 				if destConcrete.CanSet() {
 					destConcrete.Set(converted)
@@ -919,11 +920,11 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			c.logger.Debugf("Skipping assign of %s (zero).", srcConcreteType)
 			return nil
 		}
-		if c.skipEmptyValue && isEmptyValue(srcConcrete) {
+		if c.skipEmptyValue && mf.IsEmptyValue(srcConcrete) {
 			c.logger.Debugf("Skipping assign of %s (empty).", srcConcreteType)
 			return nil
 		}
-		shouldSetSimpleKind := c.overwrite || (destConcrete.IsValid() && (isBasicTypeZero(destConcrete) || isEmptyValue(destConcrete))) || !destConcrete.IsValid()
+		shouldSetSimpleKind := c.overwrite || (destConcrete.IsValid() && (mf.IsBasicTypeZero(destConcrete) || mf.IsEmptyValue(destConcrete))) || !destConcrete.IsValid()
 		if shouldSetSimpleKind {
 			if destConcrete.CanSet() {
 				destConcrete.Set(srcConcrete)
