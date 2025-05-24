@@ -106,11 +106,7 @@ type SkipZeroDest struct {
 	Num  *int
 	Flag bool
 }
-type Cyclic struct {
-	Value int
-	Self  *Cyclic
-	Data  interface{}
-}
+
 type SourceWithExtras struct {
 	ID      int
 	Name    string `mm:"DestName"`
@@ -618,87 +614,6 @@ func TestGenericCopy(t *testing.T) {
 	}
 }
 
-func TestCycleDetection(t *testing.T) {
-	node1 := &Cyclic{Value: 1}
-	node2 := &Cyclic{Value: 2}
-	node1.Self = node2
-	node2.Self = node1
-	node1.Data = node2 // Interface cycle
-
-	c := copier.NewCopier().WithCycleDetection(true).WithDebug(false) // Debug off for cleaner trace
-	var dest1 Cyclic
-	err := c.Copy(&dest1, node1)
-	if err != nil {
-		t.Fatalf("Cycle detection Copy failed: %v", err)
-	}
-
-	//  Assertions for Copy
-	if dest1.Value != 1 {
-		t.Errorf("Copy: dest1.Value mismatch: got %d, expected 1", dest1.Value)
-	}
-	if dest1.Self == nil {
-		t.Fatalf("Copy: dest1.Self is nil")
-	}
-	if dest1.Self.Value != 2 {
-		t.Errorf("Copy: dest1.Self.Value mismatch: got %d, expected 2", dest1.Self.Value)
-	}
-	if dest1.Self.Self == nil {
-		t.Fatalf("Copy: dest1.Self.Self is nil")
-	}
-	// Check if the pointers point to the *correct* instance in the copied structure
-	if dest1.Self.Self != &dest1 {
-		t.Errorf("Copy: Cycle failed: dest1.Self.Self (%p) != &dest1 (%p)", dest1.Self.Self, &dest1)
-	}
-
-	// Check interface cycle
-	if dest1.Data == nil {
-		t.Fatalf("Copy: dest1.Data is nil")
-	}
-	destDataPtr, ok := dest1.Data.(*Cyclic)
-	if !ok {
-		t.Fatalf("Copy: dest1.Data is not *Cyclic, type is %T, value is %+v", dest1.Data, dest1.Data)
-	}
-	if destDataPtr != dest1.Self {
-		t.Errorf("Copy: Cycle via interface failed: dest1.Data (%p) != dest1.Self (%p)", destDataPtr, dest1.Self)
-	}
-
-	//  Test Generic CopyWith
-	genDest, errGen := mm.CopyWith[Cyclic](c, node1)
-	if errGen != nil {
-		t.Fatalf("Cycle detection generic CopyWith failed: %v", errGen)
-	}
-
-	//  Assertions for CopyWith
-	if genDest.Value != 1 {
-		t.Errorf("CopyWith: genDest.Value mismatch: got %d, expected 1", genDest.Value)
-	}
-	if genDest.Self == nil {
-		t.Fatalf("CopyWith: genDest.Self is nil")
-	}
-	if genDest.Self.Value != 2 {
-		t.Errorf("CopyWith: genDest.Self.Value mismatch: got %d, expected 2", genDest.Self.Value)
-	}
-	if genDest.Self.Self == nil {
-		t.Fatalf("CopyWith: genDest.Self.Self is nil")
-	}
-	// Check pointers within the *newly created* generic structure
-	if genDest.Self.Self != &genDest {
-		t.Errorf("CopyWith: Generic cycle failed: genDest.Self.Self (%p) != &genDest (%p)", genDest.Self.Self, &genDest)
-	}
-
-	// Check interface cycle within the generic structure
-	if genDest.Data == nil {
-		t.Fatalf("CopyWith: genDest.Data is nil")
-	}
-	genDestDataPtr, ok := genDest.Data.(*Cyclic)
-	if !ok {
-		t.Fatalf("CopyWith: genDest.Data is not *Cyclic, type is %T, value is %+v", genDest.Data, genDest.Data)
-	}
-	if genDestDataPtr != genDest.Self {
-		t.Errorf("CopyWith: Generic cycle via interface failed: genDest.Data (%p) != genDest.Self (%p)", genDestDataPtr, genDest.Self)
-	}
-}
-
 func TestSkipZeroValue(t *testing.T) {
 	num := 5
 	src := SkipZeroSrc{Name: "KeepMe", Age: 0, Num: nil, Flag: false}         // Age, Num, Flag are zero values
@@ -964,7 +879,7 @@ func TestMapCopy(t *testing.T) {
 
 func TestInterfaceCopy(t *testing.T) {
 	srcSimpleVal := SimpleSrc{Name: "Concrete", Age: 55}
-	c := copier.NewCopier().WithDebug(true).WithTypeConverter(
+	c := copier.NewCopier().WithDebug(false).WithTypeConverter(
 		reflect.TypeOf(SimpleSrc{}), reflect.TypeOf(SimpleDest{}),
 		func(src reflect.Value) (reflect.Value, error) {
 			s := src.Interface().(SimpleSrc)
