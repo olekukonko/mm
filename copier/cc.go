@@ -1,4 +1,3 @@
-// cc.go
 package copier
 
 import (
@@ -177,96 +176,90 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					edvTypeStr, edvKindStr,
 					dest.Type(), dest.Kind())
 
-				settableDest := dest
-				if !dest.CanSet() {
-					if c.useUnsafe && dest.CanAddr() && (!isUnexportedStructField(dest) || c.copyUnexported) {
-						c.logger.Debugf("  Cycle REASSIGN: Current dest %s not settable, attempting unsafe access.", dest.Type())
-						if dest.IsValid() {
-							tempDest := reflect.NewAt(dest.Type(), unsafe.Pointer(dest.UnsafeAddr())).Elem()
-							if tempDest.CanSet() {
-								settableDest = tempDest
-								c.logger.Debugf("  Cycle REASSIGN: Unsafe access to dest %s successful.", settableDest.Type())
-							} else {
-								c.logger.Debugf("  Cycle REASSIGN: Unsafe access to dest %s failed to make it settable.", dest.Type())
-							}
-						} else {
-							c.logger.Debugf("  Cycle REASSIGN: Cannot attempt unsafe access on invalid dest.")
-						}
-					}
-				}
+				// `dest` is the current argument to CopyRecursive.
+				// `existingDestVal` is the value previously tracked for `srcPtrForCycle`.
 
-				if !settableDest.CanSet() {
-					errCycle := fmt.Errorf("cycle detected, current dest %s (%s) not settable for reassignment: %w",
-						dest.Type(), dest.Kind(), ErrCycleDetected)
-					if c.handlePotentialError(errCycle, ctx) {
-						return nil
-					}
-					return errCycle
-				}
-
-				assigned := false
-				if existingDestVal.IsValid() {
-					if existingDestVal.Type().AssignableTo(settableDest.Type()) {
-						settableDest.Set(existingDestVal)
-						assigned = true
-						c.logger.Debugf("  Cycle REASSIGN (Direct Assign): Dest %s (%s) set with existing %s (%s).", settableDest.Type(), settableDest.Kind(), existingDestVal.Type(), existingDestVal.Kind())
-					} else if settableDest.Kind() == reflect.Ptr {
-						if existingDestVal.Kind() != reflect.Ptr && existingDestVal.CanAddr() && settableDest.Type().Elem() == existingDestVal.Type() {
-							settableDest.Set(existingDestVal.Addr())
-							assigned = true
-							c.logger.Debugf("  Cycle REASSIGN (Value->Ptr): Dest Ptr %s set with Addr() of existing Value %s.", settableDest.Type(), existingDestVal.Type())
-						} else if existingDestVal.Kind() == reflect.Interface && !existingDestVal.IsNil() {
-							elemInInterface := existingDestVal.Elem()
-							if elemInInterface.IsValid() {
-								if elemInInterface.Type().AssignableTo(settableDest.Type()) {
-									settableDest.Set(elemInInterface)
-									assigned = true
-								} else if elemInInterface.CanAddr() && settableDest.Type().Elem() == elemInInterface.Type() {
-									settableDest.Set(elemInInterface.Addr())
-									assigned = true
+				// Case 1: Current `dest` is a pointer itself (e.g. *Cyclic field, or top-level CopyWith[*Cyclic])
+				// and `existingDestVal` IS that same pointer. This means we are trying to populate the object
+				// this pointer refers to, and a cycle points back to this pointer. We must proceed to populate.
+				if dest.Kind() == reflect.Ptr && existingDestVal.Kind() == reflect.Ptr && dest.Pointer() == existingDestVal.Pointer() {
+					c.logger.Debugf("  Cycle REASSIGN (Self-Ptr): `dest` (%p) is `existingDestVal`. Population of pointed-to struct must proceed.", unsafe.Pointer(dest.Pointer()))
+					// No assignment needed here, `assigned` remains false, `isSelfRefFallThrough` logic will handle fall-through.
+				} else if dest.Kind() != reflect.Ptr && dest.Kind() != reflect.Interface && // `dest` is a value type (e.g. struct)
+					existingDestVal.Kind() == reflect.Ptr && !existingDestVal.IsNil() && dest.Type() == existingDestVal.Type().Elem() && // `existingDestVal` is a pointer to `dest`'s type
+					dest.CanAddr() && existingDestVal.Pointer() == dest.UnsafeAddr() { // and `existingDestVal` points to `dest`
+					c.logger.Debugf("  Cycle REASSIGN (Ptr->Self-Value): `existingDestVal` (%p) points to `dest` itself (%s @ %p). Population must proceed.",
+						unsafe.Pointer(existingDestVal.Pointer()), dest.Type(), unsafe.Pointer(dest.UnsafeAddr()))
+					// No assignment, `assigned` remains false.
+				} else {
+					// Standard reassignment logic if not a self-reference needing population.
+					settableDest := dest
+					if !dest.CanSet() {
+						if c.useUnsafe && dest.CanAddr() && (!isUnexportedStructField(dest) || c.copyUnexported) {
+							if dest.IsValid() {
+								tempDest := reflect.NewAt(dest.Type(), unsafe.Pointer(dest.UnsafeAddr())).Elem()
+								if tempDest.CanSet() {
+									settableDest = tempDest
 								}
 							}
-							if assigned {
-								c.logger.Debugf("  Cycle REASSIGN (Interface Elem->Ptr): Dest Ptr %s set with Elem/Addr of existing Interface %s.", settableDest.Type(), existingDestVal.Type())
-							}
 						}
-					} else if settableDest.Kind() != reflect.Ptr && settableDest.Kind() != reflect.Interface {
-						if existingDestVal.Kind() == reflect.Ptr && !existingDestVal.IsNil() && settableDest.Type() == existingDestVal.Type().Elem() {
-							settableDest.Set(existingDestVal.Elem())
-							assigned = true
-							c.logger.Debugf("  Cycle REASSIGN (Ptr->Value): Dest %s set with Elem() of existing Ptr %s.", settableDest.Type(), existingDestVal.Type())
-						} else if existingDestVal.Kind() == reflect.Interface && !existingDestVal.IsNil() {
-							elemInInterface := existingDestVal.Elem()
-							if elemInInterface.IsValid() && elemInInterface.Type().AssignableTo(settableDest.Type()) {
-								settableDest.Set(elemInInterface)
-								assigned = true
-								c.logger.Debugf("  Cycle REASSIGN (Interface Elem->Value): Dest %s set with Elem of existing Interface %s.", settableDest.Type(), existingDestVal.Type())
-							}
+					}
+
+					if !settableDest.CanSet() {
+						errCycle := fmt.Errorf("cycle detected, current dest %s (%s) not settable for reassignment (standard path): %w",
+							dest.Type(), dest.Kind(), ErrCycleDetected)
+						if c.handlePotentialError(errCycle, ctx) {
+							return nil
 						}
-					} else if settableDest.Kind() == reflect.Interface {
+						return errCycle
+					}
+
+					if existingDestVal.IsValid() {
 						if existingDestVal.Type().AssignableTo(settableDest.Type()) {
 							settableDest.Set(existingDestVal)
-							assigned = true
-							c.logger.Debugf("  Cycle REASSIGN (ToInterface): Dest Interface %s set with existing %s.", settableDest.Type(), existingDestVal.Type())
+							c.logger.Debugf("  Cycle REASSIGN (Direct Assign): Dest %s (%s) set with existing %s (%s).", settableDest.Type(), settableDest.Kind(), existingDestVal.Type(), existingDestVal.Kind())
+							return nil // Successfully reassigned
+						} else if settableDest.Kind() == reflect.Ptr {
+							if existingDestVal.Kind() != reflect.Ptr && existingDestVal.CanAddr() && settableDest.Type().Elem() == existingDestVal.Type() {
+								settableDest.Set(existingDestVal.Addr())
+								c.logger.Debugf("  Cycle REASSIGN (Value->Ptr): Dest Ptr %s set with Addr() of existing Value %s.", settableDest.Type(), existingDestVal.Type())
+								return nil
+							} else if existingDestVal.Kind() == reflect.Interface && !existingDestVal.IsNil() {
+								elemInInterface := existingDestVal.Elem()
+								if elemInInterface.IsValid() {
+									if elemInInterface.Type().AssignableTo(settableDest.Type()) {
+										settableDest.Set(elemInInterface)
+										return nil
+									} else if elemInInterface.CanAddr() && settableDest.Type().Elem() == elemInInterface.Type() {
+										settableDest.Set(elemInInterface.Addr())
+										return nil
+									}
+								}
+							}
+						} else if settableDest.Kind() != reflect.Ptr && settableDest.Kind() != reflect.Interface { // Value type
+							if existingDestVal.Kind() == reflect.Ptr && !existingDestVal.IsNil() && settableDest.Type() == existingDestVal.Type().Elem() {
+								settableDest.Set(existingDestVal.Elem()) // Not a self-ref, so assign
+								c.logger.Debugf("  Cycle REASSIGN (Ptr->Value, different instance): Dest %s set with Elem() of existing Ptr %s.", settableDest.Type(), existingDestVal.Type())
+								return nil
+							}
+							// Other cases for value type...
+						} else if settableDest.Kind() == reflect.Interface {
+							if existingDestVal.Type().AssignableTo(settableDest.Type()) {
+								settableDest.Set(existingDestVal)
+								return nil
+							}
 						}
 					}
-				} else {
-					c.logger.Debugf("  Cycle REASSIGN: existingDestVal from Detector is invalid. Cannot assign.")
-				}
-
-				if assigned {
-					if c.logger != nil {
-						c.logger.Debugf("  Cycle REASSIGN successful.")
-					}
-					return nil
-				} else {
-					errCycle := fmt.Errorf("cycle detected, existing dest %s (%s) not assignable/settable to current dest %s (%s) after checks: %w",
+					// If no assignment happened, and it wasn't a self-ref fall-through handled above, then it's an error.
+					errCycle := fmt.Errorf("cycle detected, existing dest %s (%s) not assignable/settable to current dest %s (%s) after all checks: %w",
 						edvTypeStr, edvKindStr, settableDest.Type(), settableDest.Kind(), ErrCycleDetected)
 					if c.handlePotentialError(errCycle, ctx) {
 						return nil
 					}
 					return errCycle
 				}
+				// If we reached here, it means it was one of the self-reference fall-through cases.
+				c.logger.Debugf("  Cycle REASSIGN: Fall-through for self-reference, proceeding with population.")
 			}
 		}
 	}
@@ -314,8 +307,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 
 				destToTrackForMarshal := dest
 				if dest.Kind() == reflect.Ptr {
-					destToTrackForMarshal = dest
-				} else if dest.CanAddr() && dest.Kind() != reflect.Interface {
+				} else if dest.Kind() != reflect.Interface && dest.CanAddr() {
 					destToTrackForMarshal = dest.Addr()
 				}
 
@@ -343,8 +335,6 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	}
 
 	// --- Track Pointers for Cycle Detection (General Case) ---
-	// This tracking needs to happen after potential allocation/setting by special handlers (like copyPtr)
-	// but before further recursion on elements/fields.
 	if c.enableCycleDetect &&
 		(originalSrcForInterfaceChecks.Kind() == reflect.Ptr || originalSrcForInterfaceChecks.Kind() == reflect.Map || originalSrcForInterfaceChecks.Kind() == reflect.Slice) &&
 		!originalSrcForInterfaceChecks.IsNil() {
@@ -360,27 +350,13 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			srcTypeForCycleKey = originalSrcForInterfaceChecks.Type()
 		}
 
-		destToActuallyTrack := dest // `dest` here is the argument to CopyRecursive.
-		// If `dest` is a pointer (e.g. holder for *T, or actual *T from Deep()), track it.
-		// If `dest` is a value (e.g. struct field, slice element that's a struct), track its address.
+		destToActuallyTrack := dest
 		if dest.Kind() != reflect.Ptr && dest.Kind() != reflect.Interface && dest.CanAddr() {
 			destToActuallyTrack = dest.Addr()
 		}
-		// If destToActuallyTrack is still not a pointer (e.g. unaddressable value type, or interface not holding pointer),
-		// tracking might not be effective for pointer-equality based cycle detection.
-
 		if srcPtrForCycle != 0 && destToActuallyTrack.IsValid() &&
-			(destToActuallyTrack.Kind() == reflect.Ptr || destToActuallyTrack.Kind() == reflect.Map || destToActuallyTrack.Kind() == reflect.Slice) { // Only track if dest is also a trackable kind
+			(destToActuallyTrack.Kind() == reflect.Ptr || destToActuallyTrack.Kind() == reflect.Map || destToActuallyTrack.Kind() == reflect.Slice) {
 			if _, visited := ctx.Detector.Check(srcPtrForCycle, srcTypeForCycleKey); !visited {
-				// Check if destToActuallyTrack is non-nil before tracking.
-				// This is important if copyPtr initialized a nil 'dest' holder and then set it.
-				// The 'dest' to CopyRecursive might still be the reflect.Value of that initially nil ptr.
-				// We must track the value that 'dest' points to *after* it's been (potentially) allocated.
-				// This means this Track call should arguably be *after* copyPtr sets the dest.
-				// This is a key challenge.
-				// For now, we track `dest` as passed. If `dest` is a `reflect.Value` for a pointer,
-				// and `copyPtr` later calls `dest.Set(newPointer)`, the `reflect.Value` in the map
-				// should refer to the updated pointer.
 				var trackedDestTypeStr, trackedDestKindStr, trackedDestPtrStr string
 				if destToActuallyTrack.IsValid() {
 					trackedDestTypeStr = destToActuallyTrack.Type().String()
@@ -392,7 +368,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					} else {
 						trackedDestPtrStr = "<no_ptr_or_addr>"
 					}
-				} else { // Should not happen if destToActuallyTrack.IsValid() check above is working
+				} else {
 					trackedDestTypeStr = "<invalid_track_dest>"
 					trackedDestKindStr = "<invalid_track_dest_kind>"
 					trackedDestPtrStr = "<invalid_track_dest_ptr>"
@@ -439,10 +415,12 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				return nil
 			}
 			if c.overwrite {
-				if destConcrete.IsValid() && destConcrete.CanSet() {
-					destConcrete.Set(reflect.Zero(destConcrete.Type()))
-				} else if dest.CanSet() {
-					dest.Set(reflect.Zero(dest.Type()))
+				targetForZero := destConcrete
+				if !targetForZero.IsValid() || !targetForZero.CanSet() {
+					targetForZero = dest
+				}
+				if targetForZero.IsValid() && targetForZero.CanSet() {
+					targetForZero.Set(reflect.Zero(targetForZero.Type()))
 				}
 			}
 			return nil
@@ -459,10 +437,12 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			return nil
 		}
 		if c.overwrite {
-			if destConcrete.IsValid() && destConcrete.CanSet() {
-				destConcrete.Set(reflect.Zero(destConcrete.Type()))
-			} else if dest.CanSet() {
-				dest.Set(reflect.Zero(dest.Type()))
+			targetForZero := destConcrete
+			if !targetForZero.IsValid() || !targetForZero.CanSet() {
+				targetForZero = dest
+			}
+			if targetForZero.IsValid() && targetForZero.CanSet() {
+				targetForZero.Set(reflect.Zero(targetForZero.Type()))
 			}
 		}
 		return nil
@@ -474,7 +454,6 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		return c.copyInterface(destConcrete, originalSrcForInterfaceChecks, ctx)
 	}
 
-	// --- Source Sensitivity (on srcConcrete) ---
 	if srcConcrete.IsValid() {
 		isActuallySensitive := c.checkIsSensitive(srcConcrete)
 		if isActuallySensitive {
@@ -507,36 +486,27 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	}
 
 	if !destConcrete.IsValid() {
-		c.logger.Debugf("Destination concrete is invalid before kind dispatch. Cannot copy.")
+		c.logger.Debugf("Destination concrete is invalid before kind dispatch. Cannot copy (original dest type %s).", dest.Type())
 		return nil
 	}
 
 	srcConcreteType := srcConcrete.Type()
 	destConcreteType := destConcrete.Type()
 
-	// SPECIAL TYPE HANDLING (MOVED BEFORE MAIN DISPATCH)
-	// These handlers check `dest` (original arg) and `originalSrcForInterfaceChecks` for pointer types,
-	// and `destConcrete` / `srcConcrete` for value types.
-
-	// *bytes.Buffer (Pointer to Pointer copy)
 	if dest.Type() == reflect.TypeOf(&bytes.Buffer{}) &&
 		originalSrcForInterfaceChecks.IsValid() && originalSrcForInterfaceChecks.Type() == reflect.TypeOf(&bytes.Buffer{}) {
-		c.logger.Debugf("Special Handling for *bytes.Buffer -> *bytes.Buffer")
 		if originalSrcForInterfaceChecks.IsNil() {
 			if c.skipNilSrc {
-				c.logger.Debugf("  Src *bytes.Buffer is nil, skipping.")
 				return nil
 			}
 			if c.overwrite && dest.CanSet() && !dest.IsNil() {
 				dest.Set(reflect.Zero(dest.Type()))
-				c.logger.Debugf("  Set dest *bytes.Buffer to nil (source was nil, overwrite=true).")
 			}
 			return nil
 		}
 		srcBufferPtr := originalSrcForInterfaceChecks.Interface().(*bytes.Buffer)
 		if !c.overwrite && dest.IsValid() && !dest.IsNil() {
 			if destBuf, ok := dest.Interface().(*bytes.Buffer); ok && destBuf.Len() > 0 {
-				c.logger.Debugf("  Skipping *bytes.Buffer (Ptr): Overwrite=false and Dest non-empty.")
 				return nil
 			}
 		}
@@ -545,7 +515,6 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			dest.Set(reflect.ValueOf(newBuf))
 			runtime.KeepAlive(newBuf)
 			runtime.KeepAlive(dest)
-			c.logger.Debugf("  Set dest *bytes.Buffer to new buffer with content: '%s'", newBuf.String())
 			return nil
 		}
 		err = fmt.Errorf("cannot set dest pointer for *bytes.Buffer %s", dest.Type())
@@ -555,25 +524,20 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		return err
 	}
 
-	// *strings.Builder (Pointer to Pointer copy)
 	if dest.Type() == reflect.TypeOf(&strings.Builder{}) &&
 		originalSrcForInterfaceChecks.IsValid() && originalSrcForInterfaceChecks.Type() == reflect.TypeOf(&strings.Builder{}) {
-		c.logger.Debugf("Special Handling for *strings.Builder -> *strings.Builder")
 		if originalSrcForInterfaceChecks.IsNil() {
 			if c.skipNilSrc {
-				c.logger.Debugf("  Src *strings.Builder is nil, skipping.")
 				return nil
 			}
 			if c.overwrite && dest.CanSet() && !dest.IsNil() {
 				dest.Set(reflect.Zero(dest.Type()))
-				c.logger.Debugf("  Set dest *strings.Builder to nil (source was nil, overwrite=true).")
 			}
 			return nil
 		}
 		srcBuilderPtr := originalSrcForInterfaceChecks.Interface().(*strings.Builder)
 		if !c.overwrite && dest.IsValid() && !dest.IsNil() {
 			if destBuild, ok := dest.Interface().(*strings.Builder); ok && destBuild.Len() > 0 {
-				c.logger.Debugf("  Skipping *strings.Builder (Ptr): Overwrite=false and Dest non-empty.")
 				return nil
 			}
 		}
@@ -583,7 +547,6 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			dest.Set(reflect.ValueOf(&newBuilderS))
 			runtime.KeepAlive(&newBuilderS)
 			runtime.KeepAlive(dest)
-			c.logger.Debugf("  Set dest *strings.Builder to new builder with content: '%s'", newBuilderS.String())
 			return nil
 		}
 		err = fmt.Errorf("cannot set dest pointer for *strings.Builder %s", dest.Type())
@@ -593,11 +556,8 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		return err
 	}
 
-	// Bytes Buffer (Value) - srcConcrete is bytes.Buffer, destConcrete is bytes.Buffer
 	if srcConcrete.IsValid() && destConcrete.IsValid() &&
 		srcConcreteType == reflect.TypeOf(bytes.Buffer{}) && destConcreteType == srcConcreteType {
-		c.logger.Debugf("Handling bytes.Buffer (Value) copy: %s -> %s", srcConcreteType, destConcreteType)
-
 		var srcBufferContent []byte
 		if srcConcrete.CanInterface() {
 			srcBufVal := srcConcrete.Interface().(bytes.Buffer)
@@ -608,42 +568,28 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			srcBufferContent = make([]byte, srcBufPtr.Len())
 			copy(srcBufferContent, srcBufPtr.Bytes())
 			runtime.KeepAlive(srcConcrete)
-		} else {
-			c.logger.Warnf("  Cannot reliably get source bytes.Buffer content for value copy. Assuming empty.")
-			srcBufferContent = []byte{}
 		}
-		c.logger.Debugf("  Src Buffer Content (for Value copy): %d bytes", len(srcBufferContent))
-
 		destNonEmpty := false
 		if destConcrete.IsValid() {
 			var destLen int
 			if destConcrete.CanAddr() {
-				ptrToDestConcrete := destConcrete.Addr()
-				if ptrToDestConcrete.CanInterface() {
-					if bufPtr, ok := ptrToDestConcrete.Interface().(*bytes.Buffer); ok {
-						destLen = bufPtr.Len()
-					}
+				if bufPtr, ok := destConcrete.Addr().Interface().(*bytes.Buffer); ok {
+					destLen = bufPtr.Len()
 				}
-			} else {
-				c.logger.Debugf("   Dest bytes.Buffer (Value) is not addressable, cannot reliably get Len for non-overwrite check.")
 			}
 			if destLen > 0 {
 				destNonEmpty = true
 			}
 		}
-
 		if !c.overwrite && destNonEmpty {
-			c.logger.Debugf("  Skipping bytes.Buffer (Value): Overwrite=false and Dest non-empty.")
 			return nil
 		}
-
 		if destConcrete.CanSet() {
 			var newDestBuf bytes.Buffer
 			if srcBufferContent != nil {
 				newDestBuf.Write(srcBufferContent)
 			}
 			destConcrete.Set(reflect.ValueOf(newDestBuf))
-			c.logger.Debugf("  Set dest bytes.Buffer (Value) with new buffer, content length: %d", newDestBuf.Len())
 			return nil
 		} else if destConcrete.CanAddr() && c.useUnsafe {
 			destBufPtr := (*bytes.Buffer)(unsafe.Pointer(destConcrete.UnsafeAddr()))
@@ -652,11 +598,10 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				destBufPtr.Write(srcBufferContent)
 			}
 			runtime.KeepAlive(destConcrete)
-			c.logger.Debugf("  Modified in-place (unsafe) dest bytes.Buffer (Value). Content length: %d", destBufPtr.Len())
 			return nil
 		} else {
 			if len(srcBufferContent) > 0 {
-				err = fmt.Errorf("cannot deep copy non-empty bytes.Buffer value: dest type %s is not modifiable", destConcreteType)
+				err = fmt.Errorf("cannot deep copy non-empty bytes.Buffer value: dest type %s not modifiable", destConcreteType)
 				if c.handlePotentialError(err, ctx) {
 					return nil
 				}
@@ -665,61 +610,42 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			return nil
 		}
 	}
-
-	// Strings Builder (Value)
 	if srcConcrete.IsValid() && destConcrete.IsValid() &&
 		srcConcreteType == reflect.TypeOf(strings.Builder{}) && destConcreteType == srcConcreteType {
-		c.logger.Debugf("Handling strings.Builder (Value) copy: %s -> %s", srcConcreteType, destConcreteType)
 		var srcContent string
 		if srcConcrete.CanInterface() {
-			builder := srcConcrete.Interface().(strings.Builder) // Get the value
-			srcContent = builder.String()                        // Call String() on the value
-		} else if srcConcrete.CanAddr() && c.useUnsafe {
-			c.logger.Warnf("  Source strings.Builder (Value) is not directly interfaceable. Getting String() content via unsafe address is complex. Assuming empty.")
-		} else {
-			c.logger.Warnf("  Cannot reliably get source strings.Builder content for value copy. Assuming empty.")
+			builder := srcConcrete.Interface().(strings.Builder)
+			srcContent = builder.String()
 		}
-		c.logger.Debugf("  Src Builder Content (for Value copy): %d chars", len(srcContent))
-
 		destNonEmpty := false
 		if destConcrete.IsValid() {
 			var destLen int
 			if destConcrete.CanAddr() {
-				ptrToDestConcrete := destConcrete.Addr()
-				if ptrToDestConcrete.CanInterface() {
-					if sbPtr, ok := ptrToDestConcrete.Interface().(*strings.Builder); ok {
-						destLen = sbPtr.Len()
-					}
+				if sbPtr, ok := destConcrete.Addr().Interface().(*strings.Builder); ok {
+					destLen = sbPtr.Len()
 				}
-			} else {
-				c.logger.Debugf("   Dest strings.Builder (Value) is not addressable, cannot reliably get Len for non-overwrite check.")
 			}
 			if destLen > 0 {
 				destNonEmpty = true
 			}
 		}
-
 		if !c.overwrite && destNonEmpty {
-			c.logger.Debugf("  Skipping strings.Builder (Value): Overwrite=false and Dest non-empty.")
 			return nil
 		}
-
 		if destConcrete.CanSet() {
 			var newDestBuilder strings.Builder
 			newDestBuilder.WriteString(srcContent)
 			destConcrete.Set(reflect.ValueOf(newDestBuilder))
-			c.logger.Debugf("  Set dest strings.Builder (Value) with new builder, content length: %d", newDestBuilder.Len())
 			return nil
 		} else if destConcrete.CanAddr() && c.useUnsafe {
 			destBuilderPtr := (*strings.Builder)(unsafe.Pointer(destConcrete.UnsafeAddr()))
 			destBuilderPtr.Reset()
 			destBuilderPtr.WriteString(srcContent)
 			runtime.KeepAlive(destConcrete)
-			c.logger.Debugf("  Modified in-place (unsafe) dest strings.Builder (Value). Content length: %d", destBuilderPtr.Len())
 			return nil
 		} else {
 			if len(srcContent) > 0 {
-				err = fmt.Errorf("cannot deep copy non-empty strings.Builder value: dest type %s is not modifiable", destConcreteType)
+				err = fmt.Errorf("cannot deep copy non-empty strings.Builder value: dest type %s not modifiable", destConcreteType)
 				if c.handlePotentialError(err, ctx) {
 					return nil
 				}
@@ -731,31 +657,26 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 
 	dispatchPerformed := false
 	if destConcrete.Kind() == reflect.Struct && srcConcrete.Kind() == reflect.Struct {
-		c.logger.Debugf("Dispatching Struct -> Struct directly.")
 		ctx.depth++
 		err = c.copyStructDriven(destConcrete, srcConcrete, ctx)
 		ctx.depth--
 		dispatchPerformed = true
 	} else if destConcrete.Kind() == reflect.Map && srcConcrete.Kind() == reflect.Map {
-		c.logger.Debugf("Dispatching Map -> Map directly.")
 		ctx.depth++
 		err = c.copyMap(destConcrete, srcConcrete, ctx)
 		ctx.depth--
 		dispatchPerformed = true
 	} else if destConcrete.Kind() == reflect.Slice && (srcConcrete.Kind() == reflect.Slice || srcConcrete.Kind() == reflect.Array) {
-		c.logger.Debugf("Dispatching Slice/Array -> Slice directly.")
 		ctx.depth++
 		err = c.copySlice(destConcrete, srcConcrete, ctx)
 		ctx.depth--
 		dispatchPerformed = true
 	} else if destConcrete.Kind() == reflect.Array && (srcConcrete.Kind() == reflect.Slice || srcConcrete.Kind() == reflect.Array) {
-		c.logger.Debugf("Dispatching Slice/Array -> Array directly.")
 		ctx.depth++
 		err = c.copyArray(destConcrete, srcConcrete, ctx)
 		ctx.depth--
 		dispatchPerformed = true
 	} else if dest.Kind() == reflect.Ptr {
-		c.logger.Debugf("Dispatching -> Ptr directly (dest: %s, srcConcrete: %s).", dest.Type(), srcConcrete.Type())
 		ctx.depth++
 		err = c.copyPtr(dest, srcConcrete, ctx)
 		ctx.depth--
@@ -769,13 +690,9 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		return err
 	}
 
-	c.logger.Debugf("Kind dispatch did not handle %s (%s) -> %s (%s). Trying conversion/assignment.", srcConcreteType, srcConcrete.Kind(), destConcreteType, destConcrete.Kind())
 	handledBySpecialTypeOrConversion := false
-
-	// Time
 	if srcConcreteType == reflect.TypeOf(time.Time{}) && destConcreteType == srcConcreteType {
 		if !c.overwrite && destConcrete.IsValid() && !destConcrete.Interface().(time.Time).IsZero() {
-			c.logger.Debugf("  Skipping time.Time: Overwrite=false and Dest non-zero.")
 			handledBySpecialTypeOrConversion = true
 		} else if destConcrete.CanSet() {
 			destConcrete.Set(srcConcrete)
@@ -789,7 +706,6 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			err = fmt.Errorf("cannot set time.Time %s", destConcreteType)
 		}
 		if handledBySpecialTypeOrConversion || err != nil {
-			c.logger.Debugf("Handled time.Time. Handled=%v, Err: %v", handledBySpecialTypeOrConversion, err)
 			if err != nil && c.handlePotentialError(err, ctx) {
 				return nil
 			}
@@ -797,10 +713,8 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 	}
 
-	// Bytes
 	if srcConcreteType == reflect.TypeOf([]byte{}) && destConcreteType == srcConcreteType {
 		if !c.overwrite && destConcrete.IsValid() && !destConcrete.IsNil() && destConcrete.Len() > 0 {
-			c.logger.Debugf("  Skipping []byte: Overwrite=false and Dest non-empty.")
 			handledBySpecialTypeOrConversion = true
 		} else {
 			var srcBytes []byte
@@ -817,7 +731,6 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			}
 		}
 		if handledBySpecialTypeOrConversion || err != nil {
-			c.logger.Debugf("Handled []byte. Handled=%v, Err: %v", handledBySpecialTypeOrConversion, err)
 			if err != nil && c.handlePotentialError(err, ctx) {
 				return nil
 			}
@@ -825,7 +738,6 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 	}
 
-	// Stringer/Error to String or Interface{}
 	if (destConcrete.Kind() == reflect.String || (destConcrete.Kind() == reflect.Interface && destConcreteType.NumMethod() == 0 && destConcreteType.Name() == "")) &&
 		srcConcrete.CanInterface() {
 		stringerVal := ""
@@ -833,11 +745,9 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		if stringer, ok := srcConcrete.Interface().(fmt.Stringer); ok {
 			stringerVal = stringer.String()
 			isStringerOrError = true
-			c.logger.Debugf("  Source %s is fmt.Stringer.", srcConcreteType)
 		} else if errInterface, ok := srcConcrete.Interface().(error); ok {
 			stringerVal = errInterface.Error()
 			isStringerOrError = true
-			c.logger.Debugf("  Source %s is error.", srcConcreteType)
 		}
 		if isStringerOrError {
 			shouldSetStringer := c.overwrite ||
@@ -851,21 +761,13 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					destConcrete.Set(reflect.ValueOf(stringerVal))
 					handledBySpecialTypeOrConversion = true
 				}
-			} else {
-				if !destConcrete.CanSet() {
-					c.logger.Debugf("  Skipping Stringer/Error from %s to non-settable %s.", srcConcreteType, destConcreteType)
-				} else {
-					c.logger.Debugf("  Skipping Stringer/Error from %s to non-empty %s (overwrite=false).", srcConcreteType, destConcreteType)
-				}
 			}
 		}
 		if handledBySpecialTypeOrConversion {
-			c.logger.Debugf("Handled Stringer/Error to String/Interface{}. Set: %v", handledBySpecialTypeOrConversion)
 			return nil
 		}
 	}
 
-	// Attempt explicit type conversion then Go's ConvertibleTo
 	if srcConcreteType != destConcreteType && !srcConcreteType.AssignableTo(destConcreteType) {
 		converted, conversionSuccessful, errConvert := c.tryConvert(srcConcrete, destConcreteType)
 		if errConvert != nil && !errors.Is(errConvert, ErrNoConverter) {
@@ -876,25 +778,21 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 		if conversionSuccessful {
 			if c.skipZeroValue && converted.IsValid() && converted.IsZero() {
-				c.logger.Debugf("Skipping assign of converted value (zero).")
 				return nil
 			}
 			if c.skipEmptyValue && mf.IsEmptyValue(converted) {
-				c.logger.Debugf("Skipping assign of converted value (empty).")
 				return nil
 			}
 			shouldSetConverted := c.overwrite || (destConcrete.IsValid() && (mf.IsBasicTypeZero(destConcrete) || mf.IsEmptyValue(destConcrete))) || !destConcrete.IsValid()
 			if shouldSetConverted {
 				if destConcrete.CanSet() {
 					destConcrete.Set(converted)
-					c.logger.Debugf("Successfully set converted %s -> %s.", srcConcreteType, destConcreteType)
 					return nil
 				}
 				if c.useUnsafe && destConcrete.CanAddr() && (c.copyUnexported || !isUnexportedStructField(destConcrete)) {
 					ptr := unsafe.Pointer(destConcrete.UnsafeAddr())
 					reflect.NewAt(destConcreteType, ptr).Elem().Set(converted)
 					runtime.KeepAlive(destConcrete)
-					c.logger.Debugf("Unsafe set converted %s -> %s.", srcConcreteType, destConcreteType)
 					return nil
 				} else {
 					err = fmt.Errorf("converted %s -> %s, but dest not settable", srcConcreteType, destConcreteType)
@@ -904,12 +802,10 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				}
 				return err
 			}
-			c.logger.Debugf("Converted %s -> %s, but dest not overwritten (merge).", srcConcreteType, destConcreteType)
 			return nil
 		}
 	}
 
-	// Direct assignment for simple kinds if types are assignable
 	isSimpleKindForDirectAssign := true
 	switch srcConcrete.Kind() {
 	case reflect.Struct, reflect.Map, reflect.Slice, reflect.Array, reflect.Interface, reflect.Chan, reflect.Func:
@@ -917,11 +813,9 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 	}
 	if isSimpleKindForDirectAssign && srcConcreteType.AssignableTo(destConcreteType) {
 		if c.skipZeroValue && srcConcrete.IsZero() {
-			c.logger.Debugf("Skipping assign of %s (zero).", srcConcreteType)
 			return nil
 		}
 		if c.skipEmptyValue && mf.IsEmptyValue(srcConcrete) {
-			c.logger.Debugf("Skipping assign of %s (empty).", srcConcreteType)
 			return nil
 		}
 		shouldSetSimpleKind := c.overwrite || (destConcrete.IsValid() && (mf.IsBasicTypeZero(destConcrete) || mf.IsEmptyValue(destConcrete))) || !destConcrete.IsValid()
@@ -943,15 +837,11 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			}
 			return err
 		}
-		c.logger.Debugf("Assignable %s -> %s, but dest not overwritten (merge).", srcConcreteType, destConcreteType)
 		return nil
 	}
 
-	// --- Fallback Kind Dispatch ---
-	c.logger.Debugf("Fallback dispatching: DestKind: %s (%s), SrcKind: %s (%s)", destConcrete.Kind(), destConcreteType, srcConcrete.Kind(), srcConcreteType)
 	ctx.depth++
 	defer func() { ctx.depth-- }()
-
 	switch destConcrete.Kind() {
 	case reflect.Struct:
 		if srcConcrete.Kind() == reflect.Map {

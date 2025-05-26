@@ -1,4 +1,3 @@
-// fn.go
 package mf
 
 import (
@@ -8,13 +7,14 @@ import (
 	"strings"
 )
 
-// ParseTagOptions correctly parses struct tag options.
-// Handles name as the first part unless it's a known flag.
-// Subsequent parts are treated as flags (e.g., "omitempty", "sensitive").
+// ParseTagOptions parses struct tag options into a map of option names to values.
+// The first part is treated as the field name unless it’s a known flag (e.g., "omitempty", "sensitive").
+// Subsequent parts are treated as flags. The "-" flag removes any parsed name.
+// Returns a map of options where flags have empty string values.
 func ParseTagOptions(tag string) map[string]string {
 	opts := make(map[string]string)
 	parts := strings.Split(tag, ",")
-	knownFlags := map[string]bool{ // Define known flags here
+	knownFlags := map[string]bool{
 		"omitempty": true,
 		"sensitive": true,
 		"unmapped":  true,
@@ -22,29 +22,23 @@ func ParseTagOptions(tag string) map[string]string {
 	}
 
 	if len(parts) > 0 {
-		// Handle the first part
 		part0 := strings.TrimSpace(parts[0])
 		if part0 != "" {
 			if _, isFlag := knownFlags[part0]; isFlag {
-				// First part is a flag (e.g., `mm:"sensitive,omitempty"`)
-				opts[part0] = "" // Store with empty value to indicate presence of flag
+				opts[part0] = ""
 			} else {
-				// First part is the name (e.g., `mm:"newName,omitempty"`)
 				opts["name"] = part0
 			}
-		} // If empty first part (e.g., `,omitempty`), ignore it
+		}
 
-		// Handle subsequent parts (always flags)
 		for _, opt := range parts[1:] {
 			trimmedOpt := strings.TrimSpace(opt)
 			if trimmedOpt != "" {
-				// Store flag options with an empty string value to indicate presence
 				opts[trimmedOpt] = ""
 			}
 		}
 	}
 
-	// If ignore tag "-" is present, ensure name is removed if it was also parsed.
 	if _, ignorePresent := opts["-"]; ignorePresent {
 		delete(opts, "name")
 	}
@@ -52,6 +46,8 @@ func ParseTagOptions(tag string) map[string]string {
 	return opts
 }
 
+// IsMemCopySuitable checks if a type is suitable for memory copying.
+// Returns true for basic types (bool, numbers), arrays of suitable types, and structs without pointers.
 func IsMemCopySuitable(typ reflect.Type) bool {
 	switch typ.Kind() {
 	case reflect.Bool,
@@ -68,6 +64,9 @@ func IsMemCopySuitable(typ reflect.Type) bool {
 		return false
 	}
 }
+
+// HasPointers checks if a type contains pointers or reference types.
+// Returns true for pointers, maps, slices, channels, functions, interfaces, strings, or arrays/structs containing them.
 func HasPointers(typ reflect.Type) bool {
 	switch typ.Kind() {
 	case reflect.Ptr, reflect.UnsafePointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface, reflect.String:
@@ -86,13 +85,9 @@ func HasPointers(typ reflect.Type) bool {
 	}
 }
 
-// IsEmptyValue checks if a reflect.Value is considered empty.
-// This definition differs slightly from IsZero() for certain types.
-// Interfaces and pointers are empty if nil.
-// Slices, maps, strings, arrays are empty if their length is 0.
-// For structs like bytes.Buffer, strings.Builder, it checks Len() if possible.
-// Other structs check sql.NullXXX pattern or fall back to IsZero().
-// Basic types (bool, numbers) are *never* considered empty by this definition, only zero.
+// IsEmptyValue checks if a value is considered empty, differing from IsZero for some types.
+// Returns true for invalid values, nil pointers/interfaces, empty collections, or structs like bytes.Buffer with zero length.
+// Basic types (bool, numbers) are never empty, only zero. Structs use sql.NullXXX pattern or IsZero as fallback.
 func IsEmptyValue(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
@@ -107,12 +102,11 @@ func IsEmptyValue(v reflect.Value) bool {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
 		reflect.Float32, reflect.Float64,
 		reflect.Complex64, reflect.Complex128:
-		return false // Numeric and bool types are not "empty", only potentially "zero"
+		return false
 	case reflect.Struct:
-		// Handle common types with Len() method that have pointer receivers.
 		if v.CanAddr() {
 			addrVal := v.Addr()
-			if addrVal.CanInterface() { // Check if *T can be interfaced
+			if addrVal.CanInterface() {
 				switch ptr := addrVal.Interface().(type) {
 				case *bytes.Buffer:
 					return ptr.Len() == 0
@@ -121,33 +115,32 @@ func IsEmptyValue(v reflect.Value) bool {
 				}
 			}
 		}
-		// If not addressable or not one of the above, try sql.NullXXX pattern
 		validField := v.FieldByName("Valid")
 		if validField.IsValid() && validField.Kind() == reflect.Bool {
 			return !validField.Bool()
 		}
-		// Fallback for other structs: empty if zero.
-		// This applies if v.CanAddr() was false for Buffer/Builder,
-		// or if it's another struct type.
 		return v.IsZero()
 	default:
-		// For any other kinds not explicitly handled, consider empty if zero.
 		return v.IsZero()
 	}
 }
 
+// IsNilable checks if a value can be nil.
+// Returns true for invalid values, channels, functions, interfaces, maps, pointers, or slices.
 func IsNilable(v reflect.Value) bool {
 	if !v.IsValid() {
-		return true // Invalid value can be considered nil-like for skipNilSrc
+		return true
 	}
 	switch v.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // IsEmptyValueForOmit checks if a value is empty according to Go's `omitempty` logic.
+// Returns true for invalid values, nil pointers/interfaces, empty collections, zero basic types, or structs with sql.NullXXX pattern or IsZero.
 func IsEmptyValueForOmit(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
@@ -165,54 +158,39 @@ func IsEmptyValueForOmit(v reflect.Value) bool {
 		return v.Float() == 0
 	case reflect.Complex64, reflect.Complex128:
 		return v.Complex() == 0
-	case reflect.Interface, reflect.Ptr:
-		return v.IsNil()
-	case reflect.Chan, reflect.Func: // Added Chan, Func
+	case reflect.Interface, reflect.Ptr, reflect.Chan, reflect.Func:
 		return v.IsNil()
 	case reflect.Struct:
-		// Special case for sql.NullXXX or similar patterns
-		// This should be robust enough even if Valid field is unexported,
-		// as FieldByName still returns it, just CanInterface might be false.
-		// IsZero below will handle unexported Valid field correctly if it's zero.
 		validField := v.FieldByName("Valid")
-		if validField.IsValid() && validField.Kind() == reflect.Bool {
-			// We must be able to read the bool
-			if validField.CanInterface() { // Or some other way to get bool if unexported
-				return !validField.Bool()
-			}
-			// If Valid field is unexported and we can't read it, fallback to IsZero() for the struct.
-			// This is safer than assuming.
+		if validField.IsValid() && validField.Kind() == reflect.Bool && validField.CanInterface() {
+			return !validField.Bool()
 		}
-		// Standard omitempty for struct checks IsZero()
 		return v.IsZero()
 	default:
-		// Fallback: Check IsZero for any other kinds
 		return v.IsZero()
 	}
 }
 
-// GetNilLikeValue returns a typed nil or an invalid Value depending on the original value's type.
+// GetNilLikeValue returns a nil-like value for the given type.
+// For nilable types (pointers, interfaces, slices, maps, channels, functions), returns a typed nil.
+// For other types, returns an invalid reflect.Value to indicate absence.
 func GetNilLikeValue(originalVal reflect.Value) reflect.Value {
 	if !originalVal.IsValid() {
-		return reflect.Value{} // Return invalid Value
+		return reflect.Value{}
 	}
 	t := originalVal.Type()
-	k := t.Kind()
-	// For kinds that can be nil, return a typed nil.
-	if k == reflect.Ptr || k == reflect.Interface || k == reflect.Slice || k == reflect.Map || k == reflect.Chan || k == reflect.Func {
+	if t.Kind() == reflect.Ptr || t.Kind() == reflect.Interface || t.Kind() == reflect.Slice ||
+		t.Kind() == reflect.Map || t.Kind() == reflect.Chan || t.Kind() == reflect.Func {
 		return reflect.Zero(t)
 	}
-	// For other types, returning Zero might be confusing (e.g., 0 for int).
-	// Returning an invalid Value is safer to signal "nil" specifically if the intent is to represent absence.
-	// However, for processItem, if Copiable returns nil, we usually want to set the zero value of dest type.
-	// This helper is more about what "nil" means for source-side checks or formatter returns.
-	return reflect.Value{} // Represent "absence" rather than typed zero for non-nilable types.
+	return reflect.Value{}
 }
 
-// IsBasicTypeZero checks IsZero only for basic scalar types (bool, numbers, string).
+// IsBasicTypeZero checks if a basic scalar type (bool, numbers, string) is zero.
+// Returns true for invalid values or zero values of basic types.
 func IsBasicTypeZero(v reflect.Value) bool {
 	if !v.IsValid() {
-		return true // Invalid value is considered zero-like for overwrite checks
+		return true
 	}
 	switch v.Kind() {
 	case reflect.Bool,
@@ -222,11 +200,13 @@ func IsBasicTypeZero(v reflect.Value) bool {
 		reflect.Complex64, reflect.Complex128,
 		reflect.String:
 		return v.IsZero()
+	default:
+		return false
 	}
-	return false // Composite types (structs, slices, maps etc.) are not "basic types" here
 }
 
-// InterfaceKeySrc robustly gets interface from map key for logging.
+// InterfaceKeySrc retrieves a map key's interface value for logging.
+// Returns a string representation for unexported or invalid keys.
 func InterfaceKeySrc(key reflect.Value) interface{} {
 	if !key.IsValid() {
 		return "<invalid_key>"
@@ -234,19 +214,17 @@ func InterfaceKeySrc(key reflect.Value) interface{} {
 	if key.CanInterface() {
 		return key.Interface()
 	}
-	// Fallback for unexported key types (less common for map keys)
 	return fmt.Sprintf("<uninterfaceable_key_type_%s>", key.Type())
 }
 
-// InterfaceToString converts a map key reflect.Value to a string for logging/lookup.
+// InterfaceToString converts a map key's reflect.Value to a string for logging or lookup.
+// Uses fmt.Sprintf for valid interfaces or a fallback for unexported/invalid keys.
 func InterfaceToString(keyVal reflect.Value) string {
 	if !keyVal.IsValid() {
 		return "<invalid_key_value>"
 	}
 	if keyVal.CanInterface() {
-		// Use fmt.Sprintf for types that might have custom String() method
 		return fmt.Sprintf("%v", keyVal.Interface())
 	}
-	// Fallback for uninterfaceable keys
 	return fmt.Sprintf("<uninterfaceable_key_%s>", keyVal.Type())
 }
