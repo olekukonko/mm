@@ -1,4 +1,3 @@
-// fieldx_test.go
 package ex
 
 import (

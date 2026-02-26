@@ -1,17 +1,19 @@
-// mm_test.go
 package tests
 
 import (
 	"encoding/base64"
 	"fmt"
-	"github.com/olekukonko/mm/copier"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/olekukonko/mm/copier"
 )
 
-// Helper function to clone initial destination states reliably
+// cloneInitialDestState performs a pure reflection deep copy of the initial state fixture.
+// It avoids using the mm/copier library itself to prevent triggering Copiable logic
+// or sensitivity checks during the test setup phase.
 func cloneInitialDestState(t *testing.T, initialDestPtr interface{}) interface{} {
 	t.Helper()
 	if initialDestPtr == nil {
@@ -22,153 +24,74 @@ func cloneInitialDestState(t *testing.T, initialDestPtr interface{}) interface{}
 		t.Fatalf("cloneInitialDestState: initialDestPtr must be a pointer, got %T", initialDestPtr)
 	}
 	if val.IsNil() {
-		// Return a nil pointer of the correct type
 		return reflect.Zero(val.Type()).Interface()
 	}
 
-	srcElem := val.Elem() // This is the actual slice/array/struct value
-
-	// Create a new destination pointer of the same type as initialDestPtr
-	clonedDestPtrValue := reflect.New(srcElem.Type()) // e.g., *[]Hello or *DestStruct
-	clonedDestElem := clonedDestPtrValue.Elem()       // e.g., []Hello or DestStruct (zeroed initially)
-
-	// For cloning the initial state, we want a "raw" copy that does not
-	// invoke the custom Copiable logic of types like `tests.Hello` if the
-	// test itself intends to test scenarios like `WithSkipSensitive(true)`.
-	// We will perform a direct element/field copy where possible.
-
-	switch srcElem.Kind() {
-	case reflect.Slice:
-		if srcElem.Type() == clonedDestElem.Type() {
-			clonedDestElem.Set(reflect.MakeSlice(srcElem.Type(), srcElem.Len(), srcElem.Cap()))
-			for i := 0; i < srcElem.Len(); i++ {
-				// Directly set, assuming elements are basic enough or we want their raw form.
-				// For tests.Hello (string), this copies the string value directly.
-				clonedDestElem.Index(i).Set(srcElem.Index(i))
-			}
-			return clonedDestPtrValue.Interface()
-		}
-	case reflect.Array:
-		if srcElem.Type() == clonedDestElem.Type() {
-			// Arrays are value types, clonedDestElem is already appropriately sized.
-			for i := 0; i < srcElem.Len(); i++ {
-				clonedDestElem.Index(i).Set(srcElem.Index(i))
-			}
-			return clonedDestPtrValue.Interface()
-		}
-	case reflect.Map:
-		if srcElem.Type() == clonedDestElem.Type() {
-			if srcElem.IsNil() {
-				clonedDestElem.Set(reflect.Zero(srcElem.Type()))
-			} else {
-				clonedDestElem.Set(reflect.MakeMapWithSize(srcElem.Type(), srcElem.Len()))
-				iter := srcElem.MapRange()
-				for iter.Next() {
-					// Shallow copy of map keys/values for cloning initial state.
-					// If map values are complex and need deep cloning for setup, this might need enhancement
-					// or tests should ensure initial map states are simple.
-					clonedDestElem.SetMapIndex(iter.Key(), iter.Value())
-				}
-			}
-			return clonedDestPtrValue.Interface()
-		}
-	case reflect.Struct:
-		// For structs, use a basic mm.Copier that should not trigger specific sensitive transforms
-		// if those transforms rely on options not set in this basic cloner.
-		// A default copier for cloning should be mostly raw.
-		// The crucial part is that the TEST'S copier (c in the test case) has the options like WithSkipSensitive.
-		cloner := copier.New().WithDebug(false).WithOverwrite(true).WithCycleDetection(true)
-		// We copy from the original pointed-to value into our new cloned value's address.
-		err := cloner.Copy(clonedDestPtrValue.Interface(), initialDestPtr)
-		if err != nil {
-			t.Logf("Warning/Error during struct cloneInitialDestState for type %T: %v", initialDestPtr, err)
-		}
-		return clonedDestPtrValue.Interface()
-	}
-
-	// Fallback for types not handled above, or if types didn't match exactly.
-	// This uses a default copier. If initialDestPtr contains types with globally active
-	// Copiable methods (like `tests.Hello`), those *will* run here.
-	// This might be okay if the `dstInitial` in tests is already expected to be in its "transformed" state.
-	// However, for `Slice/Array - Skip sensitive`, `dstInitial` has raw strings.
-	t.Logf("cloneInitialDestState: फॉलबैक का उपयोग कर रहा है mm.Copy प्रकार %T के लिए", initialDestPtr)
-	fallbackCloner := copier.New().WithDebug(false).WithOverwrite(true).WithCycleDetection(true)
-	err := fallbackCloner.Copy(clonedDestPtrValue.Interface(), initialDestPtr)
-	if err != nil {
-		t.Logf("Warning/Error during fallback cloneInitialDestState for type %T: %v", initialDestPtr, err)
-	}
-	return clonedDestPtrValue.Interface()
+	// Perform deep clone
+	clonedVal := cloneValue(val)
+	return clonedVal.Interface()
 }
 
-// cloneInitialDestState2 creates a shallow clone of the input reflect.Value.
-// It handles structs, maps, slices, arrays, pointers, and other types, preserving
-// pointers and interface values as needed for test initial states.
-func cloneInitialDestState2(v reflect.Value) reflect.Value {
-	// Handle invalid or zero values
+// cloneValue recursively clones a reflect.Value
+func cloneValue(v reflect.Value) reflect.Value {
 	if !v.IsValid() {
 		return v
 	}
 
 	switch v.Kind() {
 	case reflect.Ptr:
-		// If the pointer is nil, return a nil pointer of the same type
 		if v.IsNil() {
 			return reflect.Zero(v.Type())
 		}
-		// Clone the value pointed to and create a new pointer to it
-		clonedElem := cloneInitialDestState2(v.Elem())
-		newPtr := reflect.New(clonedElem.Type())
-		newPtr.Elem().Set(clonedElem)
-		return newPtr
+		newValue := reflect.New(v.Type().Elem())
+		newValue.Elem().Set(cloneValue(v.Elem()))
+		return newValue
 
 	case reflect.Struct:
-		// Create a new struct instance and copy each field
-		cloned := reflect.New(v.Type()).Elem()
+		newValue := reflect.New(v.Type()).Elem()
 		for i := 0; i < v.NumField(); i++ {
-			if cloned.Field(i).CanSet() {
-				// Shallow copy: set the field to the same value (e.g., same pointer for pointer fields)
-				cloned.Field(i).Set(v.Field(i))
+			field := v.Field(i)
+			if field.CanSet() {
+				newValue.Field(i).Set(cloneValue(field))
 			}
 		}
-		return cloned
+		return newValue
 
 	case reflect.Map:
-		// Create a new map and copy all key-value pairs
 		if v.IsNil() {
 			return reflect.Zero(v.Type())
 		}
-		cloned := reflect.MakeMapWithSize(v.Type(), v.Len())
+		newValue := reflect.MakeMapWithSize(v.Type(), v.Len())
 		for iter := v.MapRange(); iter.Next(); {
-			cloned.SetMapIndex(iter.Key(), iter.Value())
+			newValue.SetMapIndex(cloneValue(iter.Key()), cloneValue(iter.Value()))
 		}
-		return cloned
+		return newValue
 
 	case reflect.Slice:
-		// Create a new slice and copy elements
 		if v.IsNil() {
 			return reflect.Zero(v.Type())
 		}
-		cloned := reflect.MakeSlice(v.Type(), v.Len(), v.Cap())
-		reflect.Copy(cloned, v)
-		return cloned
+		newValue := reflect.MakeSlice(v.Type(), v.Len(), v.Cap())
+		for i := 0; i < v.Len(); i++ {
+			newValue.Index(i).Set(cloneValue(v.Index(i)))
+		}
+		return newValue
 
 	case reflect.Array:
-		// Create a new array and copy elements
-		cloned := reflect.New(v.Type()).Elem()
-		reflect.Copy(cloned, v)
-		return cloned
+		newValue := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.Len(); i++ {
+			newValue.Index(i).Set(cloneValue(v.Index(i)))
+		}
+		return newValue
 
 	case reflect.Interface:
-		// If nil, return a zero value of the interface type
 		if v.IsNil() {
 			return reflect.Zero(v.Type())
 		}
-		// Clone the underlying value and wrap it in a new interface
-		clonedValue := cloneInitialDestState2(v.Elem())
-		return clonedValue
+		return cloneValue(v.Elem())
 
 	default:
-		// For immutable types (int, string, etc.), return the value as-is
+		// Basic types (string, int, etc.) are immutable/copied by value
 		return v
 	}
 }
@@ -293,11 +216,12 @@ func TestStructSensitive(t *testing.T) {
 			skipDstCheck:     true,
 		},
 		{
-			name:             "S2S: SkipSensitive - Skips all sensitive",
-			src:              Source{Normal: "normal", SensitiveStr: "secret", HelloField: "hello"},
-			dstInitial:       &Dest{Normal: "initial_val_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
-			opts:             []copier.Option{copier.WithSkipSensitive(true)},
-			expectDst:        &Dest{Normal: "normal", SensitiveStr: "", HelloField: ""},
+			name:       "S2S: SkipSensitive - Skips all sensitive",
+			src:        Source{Normal: "normal", SensitiveStr: "secret", HelloField: "hello"},
+			dstInitial: &Dest{Normal: "initial_val_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
+			opts:       []copier.Option{copier.WithSkipSensitive(true)},
+			// Expect preserved initial values, not empty strings
+			expectDst:        &Dest{Normal: "normal", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
 			expectErrContent: "",
 			skipDstCheck:     false,
 		},
@@ -307,21 +231,25 @@ func TestStructSensitive(t *testing.T) {
 			dstInitial: &Dest{Normal: "initial_val_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
 			opts:       []copier.Option{copier.WithErrors(true)},
 			expectDst: &Dest{
-				Normal:       "normal",
-				SensitiveStr: "",
-				HelloField:   Hello(base64.StdEncoding.EncodeToString([]byte("hello"))),
+				Normal: "normal",
+				// SensitiveStr error collected -> field not set -> preserved
+				SensitiveStr: "initial_secret",
+				// HelloField copied via Copiable
+				HelloField: Hello(base64.StdEncoding.EncodeToString([]byte("hello"))),
 			},
 			expectErrContent: "sensitive item 'sensitive_str' (src type string) requires Copiable",
 			skipDstCheck:     false,
 		},
 		{
-			name:             "S2S: Merge - Skips non-empty dest fields before sensitivity",
-			src:              Source{Normal: "normal_src", SensitiveStr: "secret_src", HelloField: "hello_src"},
-			dstInitial:       &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
-			opts:             []copier.Option{copier.WithMerge()},
+			name:       "S2S: Merge - Skips non-empty dest fields before sensitivity",
+			src:        Source{Normal: "normal_src", SensitiveStr: "secret_src", HelloField: "hello_src"},
+			dstInitial: &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
+			opts:       []copier.Option{copier.WithMerge()},
+			// Since dest fields are non-empty, merge logic skips them *before* checking sensitivity.
+			// Therefore, no error is expected, and values are preserved.
 			expectDst:        &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
-			expectErrContent: "sensitive item 'sensitive_str' (src type string) requires Copiable",
-			skipDstCheck:     true,
+			expectErrContent: "",
+			skipDstCheck:     false,
 		},
 		{
 			name:             "S2Map: Default - Error on sensitive string",
@@ -338,7 +266,8 @@ func TestStructSensitive(t *testing.T) {
 				m := map[string]interface{}{"Normal": "old_normal", "sensitive_str": "keep_map_secret", "hello_field": "keep_map_hello"}
 				return &m
 			}(),
-			opts:             []copier.Option{copier.WithSkipSensitive(true)},
+			opts: []copier.Option{copier.WithSkipSensitive(true)},
+			// Preserved values
 			expectDst:        &map[string]interface{}{"Normal": "normal", "sensitive_str": "keep_map_secret", "hello_field": "keep_map_hello"},
 			expectErrContent: "",
 			skipDstCheck:     false,
@@ -352,8 +281,9 @@ func TestStructSensitive(t *testing.T) {
 			}(),
 			opts: []copier.Option{copier.WithErrors(true)},
 			expectDst: &map[string]interface{}{
-				"Normal":        "normal",
-				"hello_field":   Hello(base64.StdEncoding.EncodeToString([]byte("hello"))),
+				"Normal":      "normal",
+				"hello_field": Hello(base64.StdEncoding.EncodeToString([]byte("hello"))),
+				// Error collected -> preserved
 				"sensitive_str": "keep_map_secret",
 			},
 			expectErrContent: "sensitive item 'mapValueForKey 'sensitive_str'",
@@ -368,11 +298,12 @@ func TestStructSensitive(t *testing.T) {
 			skipDstCheck:     true,
 		},
 		{
-			name:             "Map2S: SkipSensitive",
-			src:              map[string]interface{}{"Normal": "normal", "sensitive_str": "secret_map_val", "hello_field": "hello_map_val"},
-			dstInitial:       &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
-			opts:             []copier.Option{copier.WithSkipSensitive(true)},
-			expectDst:        &Dest{Normal: "normal", SensitiveStr: "", HelloField: ""},
+			name:       "Map2S: SkipSensitive",
+			src:        map[string]interface{}{"Normal": "normal", "sensitive_str": "secret_map_val", "hello_field": "hello_map_val"},
+			dstInitial: &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
+			opts:       []copier.Option{copier.WithSkipSensitive(true)},
+			// Preserved values
+			expectDst:        &Dest{Normal: "normal", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
 			expectErrContent: "",
 			skipDstCheck:     false,
 		},
@@ -383,7 +314,7 @@ func TestStructSensitive(t *testing.T) {
 			opts:       []copier.Option{copier.WithErrors(true)},
 			expectDst: &Dest{
 				Normal:       "normal",
-				SensitiveStr: "",
+				SensitiveStr: "initial_secret", // Preserved
 				HelloField:   Hello(base64.StdEncoding.EncodeToString([]byte("hello_map_val"))),
 			},
 			expectErrContent: "sensitive item 'field 'sensitive_str' from mapKey 'sensitive_str''",
@@ -588,15 +519,9 @@ func TestMapSensitive(t *testing.T) {
 			}
 			c.WithDebug(false)
 
-			// Clone initial destination state (simplified for clarity)
-			currentDstPtr := new(map[string]Hello)
-			if tt.dstInitial != nil {
-				initial := *(tt.dstInitial.(*map[string]Hello))
-				*currentDstPtr = make(map[string]Hello)
-				for k, v := range initial {
-					(*currentDstPtr)[k] = v
-				}
-			}
+			// Clone initial destination state using manual setup to avoid pollution
+			// (Use cloneInitialDestState for consistency)
+			currentDstPtr := cloneInitialDestState(t, tt.dstInitial).(*map[string]Hello)
 
 			// Perform the copy operation
 			err := c.Copy(currentDstPtr, tt.src)
@@ -673,20 +598,8 @@ func TestPtrInterfaceSensitive(t *testing.T) {
 			c := copier.NewCopier(tt.opts...)
 			c.WithDebug(false)
 
-			// Manually initialize currentDst to match dstInitial
-			var currentDst interface{}
-			switch v := tt.dstInitial.(type) {
-			case *PtrDest:
-				// Create a new PtrDest with the same Value
-				val := v.Value // Copy the pointer (shallow copy sufficient here)
-				currentDst = &PtrDest{Value: val}
-			case *InterfaceDestTest:
-				// Create a new InterfaceDestTest with the same Value
-				val := v.Value // Interface value (shallow copy sufficient)
-				currentDst = &InterfaceDestTest{Value: val}
-			default:
-				t.Fatalf("unsupported dstInitial type: %T", v)
-			}
+			// Manually initialize currentDst to match dstInitial using pure reflection helper
+			currentDst := cloneInitialDestState(t, tt.dstInitial)
 
 			err := c.Copy(currentDst, tt.src)
 

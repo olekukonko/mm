@@ -4,15 +4,15 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/olekukonko/ll"
-	"github.com/olekukonko/mm/cycle"
 	"reflect"
 	"strings"
 	"sync"
 	"unsafe"
+
+	"github.com/olekukonko/ll"
+	"github.com/olekukonko/mm/cycle"
 )
 
-// Core Structs & Types
 type Copier struct {
 	tagName           string
 	fallbackTagKeys   []string
@@ -40,7 +40,39 @@ type Copier struct {
 	logger            *ll.Logger
 }
 
-// New creates a new Copier with the given options.
+var sysContextPool = sync.Pool{
+	New: func() interface{} {
+		return &SysContext{
+			Visited: make(map[cycle.VisitKey]reflect.Value),
+			Errors:  make([]error, 0),
+			Detector: cycle.New(
+				cycle.WithPool(true),
+				cycle.WithMetrics(false),
+			),
+		}
+	},
+}
+
+func (c *Copier) acquireSysContext() *SysContext {
+	ctx := sysContextPool.Get().(*SysContext)
+	ctx.depth = 0
+	if len(ctx.Errors) > 0 {
+		ctx.Errors = ctx.Errors[:0]
+	}
+	ctx.Detector.Reset()
+	if c.logger != nil {
+		ctx.Detector.SetLogger(c.logger)
+	}
+	return ctx
+}
+
+func (c *Copier) releaseSysContext(ctx *SysContext) {
+	for k := range ctx.Visited {
+		delete(ctx.Visited, k)
+	}
+	sysContextPool.Put(ctx)
+}
+
 func New(options ...Option) *Copier {
 	c := &Copier{
 		overwrite:       true,
@@ -69,7 +101,6 @@ func New(options ...Option) *Copier {
 	return c
 }
 
-// Initialization
 func NewCopier(options ...Option) *Copier {
 	c := &Copier{
 		tagName:           "mm",
@@ -92,7 +123,7 @@ func NewCopier(options ...Option) *Copier {
 		debugMode:         false,
 		tagResolution:     true,
 		bufferPool:        sync.Pool{New: func() interface{} { buf := make([]byte, 1024); return &buf }},
-		logger:            ll.New("copier"),
+		logger:            ll.New("copier").Suspend(),
 	}
 
 	for _, opt := range options {
@@ -100,19 +131,17 @@ func NewCopier(options ...Option) *Copier {
 	}
 
 	return c
-
 }
 
-// AddFallbackTagKeys appends to the list of fallback tag keys.
 func (c *Copier) AddFallbackTagKeys(keys ...string) *Copier {
 	c.fallbackTagKeys = append(c.fallbackTagKeys, keys...)
 	c.typeInfoCache = sync.Map{}
 	return c
 }
 
-// Copy copies data from src into dest. dest must be a non-nil pointer.
 func (c *Copier) Copy(dest interface{}, src interface{}) error {
 	c.logger.Debugf("Copier.Copy started. Overwrite: %v, Debug: %v", c.overwrite, c.debugMode)
+
 	if dest == nil {
 		return c.FinalizeResult(ErrDestinationIsNil, &SysContext{Errors: make([]error, 0)})
 	}
@@ -142,7 +171,8 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 		c.logger.Debugf("Destination element %s not settable via standard means, relying on unsafe.", destElem.Type())
 	}
 
-	ctx := &SysContext{depth: 0, Visited: make(map[cycle.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: cycle.New(cycle.WithLogger(c.logger))}
+	ctx := c.acquireSysContext()
+	defer c.releaseSysContext(ctx)
 
 	srcReflectVal := reflect.ValueOf(src)
 
@@ -174,7 +204,6 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 	return finalErr
 }
 
-// MustCopy is like Copy but panics if an error occurs.
 func (c *Copier) MustCopy(dest, src interface{}) {
 	tempCopier := *c
 	tempCopier.panicOnError = true
@@ -185,7 +214,6 @@ func (c *Copier) MustCopy(dest, src interface{}) {
 	}
 }
 
-// Merge copies data from src into dest, but only if the destination field/element is a zero/empty value.
 func (c *Copier) Merge(dest, src interface{}) error {
 	tempCopier := *c
 	tempCopier.overwrite = false
@@ -196,8 +224,6 @@ func (c *Copier) Merge(dest, src interface{}) error {
 	return tempCopier.Copy(dest, src)
 }
 
-// CopyCat copies data from the first source using standard Copy logic,
-// then merges data from subsequent sources using Merge logic (overwrite=false).
 func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 	if len(sources) == 0 {
 		return nil
@@ -219,7 +245,9 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 		}
 	}
 
-	ctx := &SysContext{depth: 0, Visited: make(map[cycle.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: cycle.New(cycle.WithLogger(c.logger))}
+	ctx := c.acquireSysContext()
+	defer c.releaseSysContext(ctx)
+
 	firstCopier := *c
 	mergeCopier := *c
 	mergeCopier.overwrite = false
@@ -289,8 +317,6 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 	return finalErr
 }
 
-// Deep creates a deep copy of the input value v.
-// It returns a new value independent of the original.
 func (c *Copier) Deep(v interface{}) (interface{}, error) {
 	c.logger.Debugf("Copier.Deep called for type %T", v)
 	if v == nil {
@@ -309,12 +335,9 @@ func (c *Copier) Deep(v interface{}) (interface{}, error) {
 	destType := srcVal.Type()
 	destVal := reflect.New(destType).Elem()
 
-	ctx := &SysContext{depth: 0, Visited: make(map[cycle.VisitKey]reflect.Value), Errors: make([]error, 0), Detector: cycle.New(cycle.WithLogger(c.logger))}
+	ctx := c.acquireSysContext()
+	defer c.releaseSysContext(ctx)
 
-	// For Deep(), avoid pre-tracking the top-level source pointer if it's a special type
-	// like *bytes.Buffer, as these have dedicated handlers in CopyRecursive that
-	// will perform the correct allocation and setting. Pre-tracking can cause the
-	// cycle Detector to short-circuit to the initially nil destVal.
 	isSpecialPointerType := false
 	if c.enableCycleDetect && srcVal.Kind() == reflect.Ptr && !srcVal.IsNil() {
 		elemType := srcVal.Type().Elem()
@@ -322,8 +345,6 @@ func (c *Copier) Deep(v interface{}) (interface{}, error) {
 			isSpecialPointerType = true
 		}
 		if !isSpecialPointerType {
-			// Track src pointer, its element type, to the new destination pointer
-			// (which is destVal itself if destType is a Ptr)
 			ctx.Detector.Track(srcVal.Pointer(), elemType, destVal)
 		}
 	}
@@ -341,7 +362,6 @@ func (c *Copier) Deep(v interface{}) (interface{}, error) {
 	return destVal.Interface(), nil
 }
 
-// MustDeep is like Deep but panics if an error occurs.
 func (c *Copier) MustDeep(v interface{}) interface{} {
 	tempCopier := *c
 	tempCopier.panicOnError = true

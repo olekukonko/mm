@@ -1,12 +1,12 @@
-// mf.go
 package copier
 
 import (
 	"errors"
 	"fmt"
-	"github.com/olekukonko/mm/mf"
 	"reflect"
 	"unsafe"
+
+	"github.com/olekukonko/mm/mf"
 )
 
 // Handling Helpers

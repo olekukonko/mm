@@ -3,25 +3,28 @@ package mm
 import (
 	"bytes"
 	"fmt"
-	"github.com/olekukonko/ll"
-	"github.com/olekukonko/mm/copier"
-	"github.com/olekukonko/mm/cycle"
 	"reflect"
 	"strings"
 	"unsafe"
+
+	"github.com/olekukonko/ll"
+	"github.com/olekukonko/mm/copier"
+	"github.com/olekukonko/mm/cycle"
 )
 
-// Default Copier and Package-Level Functions
-
-var logger = ll.New("mm").Enable()
+// Default Copier and Package-Level Variables
+var logger = ll.New("mm").Suspend()
 var defaultCopier = copier.NewCopier(copier.WithLogger(logger))
 
-// Copy creates a new value of type T and copies data from src into it, using the default Copier.
+// Copy creates a new value of type T and copies data from src into it using the default copier.
+// Returns the copied value or an error if the copy operation fails.
 func Copy[T any](src interface{}) (T, error) {
 	return CopyWith[T](defaultCopier, src)
 }
 
-// CopyWith creates a new value of type T and copies data from src into it, using the provided Copier.
+// CopyWith creates a new value of type T and copies data from src into it using the provided copier.
+// Handles nil sources based on SkipNilSrc and supports cycle detection for pointers.
+// Returns the copied value or an error if the copy operation fails.
 func CopyWith[T any](c *copier.Copier, src interface{}) (T, error) {
 	var zero T
 	destReflectType := reflect.TypeOf(zero) // Get type of T
@@ -43,8 +46,8 @@ func CopyWith[T any](c *copier.Copier, src interface{}) (T, error) {
 		Errors:  make([]error, 0),
 		Detector: cycle.New(
 			cycle.WithLogger(c.Logger()), // Use copier's logger for cycle detector
-			cycle.WithPool(true),         // Assuming pooling is generally good
-			cycle.WithMetrics(false),     // Metrics off by default unless needed
+			cycle.WithPool(true),         // Enable pooling for cycle detector
+			cycle.WithMetrics(false),     // Disable metrics for cycle detector
 		),
 	}
 
@@ -162,7 +165,8 @@ func CopyWith[T any](c *copier.Copier, src interface{}) (T, error) {
 	return finalDest, nil
 }
 
-// MustCopy is like Copy but panics if an error occurs. Uses the default Copier.
+// MustCopy creates a new value of type T and copies data from src using the default copier, panicking on error.
+// Returns the copied value.
 func MustCopy[T any](src interface{}) T {
 	// Make a local copy to set panic mode without affecting defaultCopier
 	tempPanicCopier := *defaultCopier
@@ -177,23 +181,26 @@ func MustCopy[T any](src interface{}) T {
 	return val
 }
 
-// Deep creates a deep copy of the input value, returning a new independent value.
-// Uses the default copier.
+// Deep creates a deep copy of the input value using the default copier.
+// Returns the copied value or an error if the copy operation fails.
 func Deep(v interface{}) (interface{}, error) {
 	return defaultCopier.Deep(v)
 }
 
-// MustDeep is like Deep but panics if an error occurs. Uses the default copier.
+// MustDeep creates a deep copy of the input value using the default copier, panicking on error.
+// Returns the copied value.
 func MustDeep(v interface{}) interface{} {
 	return defaultCopier.MustDeep(v)
 }
 
-// CopyCat copies data from the first source using standard Copy logic,
-// then merges data from subsequent sources using Merge logic (overwrite=false).
+// CopyCat copies data from the first source using Copy logic, then merges subsequent sources using Merge logic (overwrite=false).
+// Returns an error if the operation fails.
 func CopyCat(dest interface{}, sources ...interface{}) error {
 	return defaultCopier.CopyCat(dest, sources...)
 }
 
+// Merge merges data from src into dest using the default copier.
+// Returns an error if the merge operation fails.
 func Merge(dest, src interface{}) error {
 	return defaultCopier.Merge(dest, src)
 }

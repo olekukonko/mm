@@ -1,12 +1,12 @@
-// ca.go
 package copier
 
 import (
 	"fmt"
-	"github.com/olekukonko/mm/mf"
 	"reflect"
 	"runtime"
 	"unsafe"
+
+	"github.com/olekukonko/mm/mf"
 )
 
 // copyArray copies data from a slice or array to a fixed-size array.

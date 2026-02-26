@@ -1,12 +1,12 @@
-// op.go
 package copier
 
 import (
-	"github.com/olekukonko/ll"
-	"github.com/olekukonko/ll/lx"
 	"log" // Keep standard log for this specific warning
 	"reflect"
 	"sync"
+
+	"github.com/olekukonko/ll"
+	"github.com/olekukonko/ll/lx"
 )
 
 type Option func(*Copier)

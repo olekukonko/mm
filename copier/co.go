@@ -1,10 +1,10 @@
-// copier/co.go
 package copier
 
 import (
 	"fmt"
-	"github.com/olekukonko/mm/mf"
 	"reflect"
+
+	"github.com/olekukonko/mm/mf"
 )
 
 func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {

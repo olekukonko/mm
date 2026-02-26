@@ -1,5 +1,3 @@
-// copier/cs.go
-// cs.go
 package copier
 
 import (

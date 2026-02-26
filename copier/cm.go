@@ -1,10 +1,9 @@
-// copier/cm.go
-// cm.go
 package copier
 
 import (
 	"errors"
 	"fmt"
+
 	"github.com/olekukonko/mm/mf"
 
 	// "log" // Not used

@@ -5,7 +5,6 @@ import (
 	"reflect"
 )
 
-// copyChan copies data from a source channel to a destination channel.
 func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 	destType := dest.Type()
 	srcType := src.Type()
@@ -24,22 +23,13 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 		}
 		if c.overwrite && dest.CanSet() && dest.IsValid() && !dest.IsNil() {
 			c.logger.Debugf("   Zeroing destination channel (setting to nil).")
-			dest.Set(reflect.Zero(destType)) // Makes channel nil
+			dest.Set(reflect.Zero(destType))
 		}
 		return nil
 	}
 
-	// --- Type-level Sensitivity and Copiable for the channel type itself ---
-	// This part remains as it's about the channel container, not individual elements.
-	// processItem is not used here.
 	isSensitiveChannelType := false
-	// Use c.checkIsSensitive for the src channel value itself, if the channel type could be sensitive
-	// However, sensitivity for a "channel type" is less common than for its elements.
-	// The original logic checked srcType.Implements(), which is for the type definition.
 	if srcType.Implements(reflect.TypeOf((*Sensitivity)(nil)).Elem()) {
-		// Create a zero value of the channel type to call Sensitive()
-		// This is tricky as channel itself doesn't have methods in that sense unless it's a named type.
-		// For a `type MyChan chan int` where `MyChan` implements Sensitivity.
 		zeroSrcChan := reflect.Zero(srcType)
 		if zeroSrcChan.IsValid() && zeroSrcChan.CanInterface() {
 			if sensitiveInstance, ok := zeroSrcChan.Interface().(Sensitivity); ok && sensitiveInstance.Sensitive() {
@@ -58,9 +48,6 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 
 	if isSensitiveChannelType && !srcType.Implements(reflect.TypeOf((*Copiable)(nil)).Elem()) {
 		c.logger.Debugf("   -> SKIPPING Sensitive src channel type %s: No Copiable implementation on the channel type.", srcType)
-		if c.debugMode {
-			// log.Printf("[mm debug] Sensitive channel type %s skipped due to missing Copiable on type", srcType)
-		}
 		if c.overwrite && dest.CanSet() && dest.IsValid() && !dest.IsNil() {
 			dest.Set(reflect.Zero(destType))
 		}
@@ -71,7 +58,6 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 	if srcType.Implements(reflect.TypeOf((*Copiable)(nil)).Elem()) && src.IsValid() && src.CanInterface() {
 		c.logger.Debugf("   Src channel type %s implements Copiable, calling Copy for the channel itself...", srcType)
 
-		// Robust Copiable instantiation for srcType
 		var copiableInst Copiable
 		receiverForCopiable := reflect.New(srcType)
 		var okAssert bool
@@ -93,7 +79,7 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 		}
 
 		ctxCopyChannel := &CopyContext{
-			FieldName: srcType.String(), // Context for the channel type itself
+			FieldName: srcType.String(),
 			Settings:  struct{ Overwrite, SkipEmpty, SkipZero, SkipNil bool }{c.overwrite, c.skipEmptyValue, c.skipZeroValue, c.skipNilSrc},
 			Overwrite: false,
 			SetValue: func(value interface{}) error {
@@ -101,7 +87,7 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 					return fmt.Errorf("cannot set destination channel of type %s (Copiable on channel type)", destType)
 				}
 				valueVal := reflect.ValueOf(value)
-				if !valueVal.IsValid() { // Handle nil from Copiable
+				if !valueVal.IsValid() {
 					dest.Set(reflect.Zero(destType))
 					return nil
 				}
@@ -128,7 +114,7 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 
 		if ctxCopyChannel.Overwrite {
 			copiableUsedForChannelItself = true
-			if err := ctxCopyChannel.SetValue(valueFromCopiable); err != nil { // SetValue will handle nil valueFromCopiable
+			if err := ctxCopyChannel.SetValue(valueFromCopiable); err != nil {
 				chanErr := fmt.Errorf("setting Copiable value for channel type %s: %w", srcType, err)
 				if c.handlePotentialError(chanErr, ctx) {
 					return nil
@@ -146,19 +132,15 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 
 		if copiableUsedForChannelItself {
 			c.logger.Debugf("   Copiable handled the channel type %s itself. Skipping element-wise copy.", srcType)
-			return nil // Copiable on the channel type itself has full control.
+			return nil
 		}
 		c.logger.Debugf("   Copiable for channel type %s ran but did not set Overwrite. Proceeding with element copy.", srcType)
 	}
-	// --- End of Type-level Copiable for channel ---
 
-	// Setup destination channel if needed
 	if !dest.IsValid() || dest.IsNil() {
 		if !dest.CanSet() {
 			return fmt.Errorf("cannot set nil channel dest %s", destType)
 		}
-		// Make new channel with same type, direction, and capacity as source, but using destType
-		// src.Cap() is correct. destType.ChanDir() provides the direction for the new channel.
 		dest.Set(reflect.MakeChan(destType, src.Cap()))
 		c.logger.Debugf("   Initialized nil channel dest %s with capacity %d, direction %s.", destType, src.Cap(), destType.ChanDir())
 	} else if c.overwrite {
@@ -168,22 +150,18 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 			dest.Set(newDestChan)
 		} else {
 			c.logger.Debugf("   Destination channel exists but cannot be set for overwrite. Will attempt to send elements to existing channel.")
-			// Elements will be sent to the existing dest channel. If it's full, TrySend will fail.
 		}
-	} else { // Merge mode
+	} else {
 		c.logger.Debugf("   Merging into existing destination channel %s.", destType)
-		// Elements will be sent to the existing dest channel.
 	}
 
-	if !dest.IsValid() || dest.IsNil() { // Re-check after potential setup/overwrite
+	if !dest.IsValid() || dest.IsNil() {
 		c.logger.Debugf("   Destination channel is nil after setup, cannot copy elements.")
-		// This can happen if Copiable on channel type set it to nil and Overwrite was true.
 		return nil
 	}
 
 	destElemType := destType.Elem()
 
-	// Element processing loop
 	elementIndex := 0
 	for {
 		val, ok := src.TryRecv()
@@ -192,13 +170,10 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 			break
 		}
 
-		itemName := fmt.Sprintf("chanElem[%d]", elementIndex)
-		itemIsSensitive := c.checkIsSensitive(val) // Check sensitivity of the received element
-
-		res := c.processItem(val, itemName, destElemType, itemIsSensitive, ctx)
+		itemIsSensitive := c.checkIsSensitive(val)
+		res := c.processItem(val, elementIndex, destElemType, itemIsSensitive, ctx)
 
 		if res.err != nil {
-			// If processItem returns an error, it means it wasn't collected.
 			return fmt.Errorf("processing channel element %d: %w", elementIndex, res.err)
 		}
 
@@ -207,12 +182,12 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 			if res.valueToSet.IsValid() {
 				valueToSend = res.valueToSet
 			} else {
-				valueToSend = reflect.Zero(destElemType) // Ensure we send a typed zero if valueToSet is invalid
+				valueToSend = reflect.Zero(destElemType)
 			}
 
 			if !dest.TrySend(valueToSend) {
 				c.logger.Debugf("   Failed to send channel element %d (type %s) to destination (full or closed). Stopping element copy.", elementIndex, valueToSend.Type())
-				break // Stop if send fails
+				break
 			}
 			c.logger.Debugf("   Sent channel element %d (type %s) to destination.", elementIndex, valueToSend.Type())
 		} else {

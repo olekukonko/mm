@@ -1,10 +1,10 @@
-// copier/tests/cycle_test.go
 package tests
 
 import (
+	"testing"
+
 	"github.com/olekukonko/mm"
 	"github.com/olekukonko/mm/copier"
-	"testing"
 )
 
 // Cyclic struct for testing cycle detection
