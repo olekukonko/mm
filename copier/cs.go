@@ -3,11 +3,20 @@ package copier
 import (
 	"fmt"
 	"reflect"
+	"runtime"
+	"unsafe"
 
 	"github.com/olekukonko/mm/cycle"
 )
 
-// copyStructDriven copies data from src struct to dest struct.
+type fastFieldAccess struct {
+	index  []int
+	offset uintptr
+	typ    reflect.Type
+	setter func(unsafe.Pointer, reflect.Value)
+	getter func(unsafe.Pointer) reflect.Value
+}
+
 func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err error) {
 	srcForInfo := src
 	if srcForInfo.Kind() == reflect.Ptr {
@@ -36,13 +45,13 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 		}
 		srcForInfo = srcForInfo.Elem()
 	}
+
 	if srcForInfo.Kind() != reflect.Struct {
 		return fmt.Errorf("copyStructDriven: source must be a struct or pointer to a struct, got %s", src.Type())
 	}
 
 	destInfo := c.getTypeInfo(dest.Type())
 	srcInfo := c.getTypeInfo(srcForInfo.Type())
-
 	destFieldsProcessedOrSkipped := make(map[string]struct{})
 
 	var unmappedDestMap reflect.Value
@@ -56,7 +65,6 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 		unmappedDestFieldName = destInfo.unmappedField.name
 		destFieldsProcessedOrSkipped[unmappedDestFieldName] = struct{}{}
 		mapFieldVal, mapFieldValOk, mapFieldValErr := c.getSettableFieldValue(dest, destInfo.unmappedField)
-
 		if mapFieldValErr == nil && mapFieldValOk {
 			fieldType := mapFieldVal.Type()
 			isValidUnmappedType := fieldType.Kind() == reflect.Map &&
@@ -87,6 +95,7 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 	}
 
 	c.logger.Debugf(" Iterating through SOURCE fields of type %s (%d fields).", srcForInfo.Type(), len(srcInfo.fields))
+
 	for srcFieldEffectiveName, srcFieldInfo := range srcInfo.fields {
 		c.logger.Debugf(" Processing source field (srcEffectiveName: '%s', Go name: '%s')", srcFieldEffectiveName, srcFieldInfo.structField.Name)
 
@@ -107,6 +116,7 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 				}
 			}
 		}
+
 		if !destFieldFound {
 			if dfi, found := destInfo.fields[srcFieldEffectiveName]; found {
 				if unmappedDestFieldName == "" || dfi.name != unmappedDestFieldName {
@@ -122,6 +132,7 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 				}
 			}
 		}
+
 		if !destFieldFound && c.tagResolution {
 			potentialTags := append([]string{c.tagName}, c.fallbackTagKeys...)
 		outerTagLoopResolve:
@@ -162,6 +173,7 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 			c.logger.Debugf("   -> SKIPPING Source Field '%s': source field tag '-'. Dest field '%s' preserved.", srcFieldEffectiveName, matchedDestFieldEffectiveName)
 			continue
 		}
+
 		if destFieldFound {
 			if _, skipGlobal := c.skipFields[matchedDestFieldEffectiveName]; skipGlobal {
 				c.logger.Debugf("   -> SKIPPING Dest Field '%s' (globally). Src field '%s' not copied. Dest field preserved.", matchedDestFieldEffectiveName, srcFieldEffectiveName)
@@ -265,8 +277,11 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 		dynamicSrcSensitivity := c.checkIsSensitive(formattedSrcVal)
 		combinedSensitivity := fieldTagSensitivity || dynamicSrcSensitivity
 
-		res := c.processItem(formattedSrcVal, itemNameForProcessItem, baseDestTypeForProcessItem, combinedSensitivity, ctx)
+		if destFieldFound && c.tryFastFieldCopy(dest, &destFieldInfoFound, formattedSrcVal, itemNameForProcessItem, combinedSensitivity, ctx) {
+			continue
+		}
 
+		res := c.processItem(formattedSrcVal, itemNameForProcessItem, baseDestTypeForProcessItem, combinedSensitivity, ctx)
 		if res.err != nil {
 			errField := fmt.Errorf("processing src field '%s' for dest target '%s': %w", srcFieldEffectiveName, itemNameForProcessItem, res.err)
 			if c.handlePotentialError(errField, ctx) {
@@ -329,6 +344,51 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 
 	c.logger.Debugf("Finished copyStructDriven (%s -> %s)", srcForInfo.Type(), dest.Type())
 	return nil
+}
+
+func (c *Copier) tryFastFieldCopy(dest reflect.Value, destFieldInfo *FieldInfo, srcVal reflect.Value, itemName string, isSensitive bool, ctx *SysContext) bool {
+	if isSensitive || !c.useUnsafe || !srcVal.IsValid() || !srcVal.CanInterface() {
+		return false
+	}
+
+	destVal, destOk, destErr := c.getSettableFieldValue(dest, destFieldInfo)
+	if destErr != nil || !destOk || !destVal.CanSet() {
+		return false
+	}
+
+	srcType := srcVal.Type()
+	destType := destVal.Type()
+
+	if srcType != destType && !srcType.AssignableTo(destType) {
+		return false
+	}
+
+	if !IsMemCopySuitable(srcType) {
+		return false
+	}
+
+	if !destVal.CanAddr() || !srcVal.CanAddr() {
+		return false
+	}
+
+	if destFieldInfo.structField.PkgPath != "" && !c.copyUnexported {
+		return false
+	}
+
+	elemSize := srcType.Size()
+	if elemSize == 0 {
+		return false
+	}
+
+	destPtr := unsafe.Pointer(destVal.UnsafeAddr())
+	srcPtr := unsafe.Pointer(srcVal.UnsafeAddr())
+
+	c.logger.Debugf("   -> Fast unsafe copy for field '%s' (%s)", itemName, srcType)
+	memmove(destPtr, srcPtr, elemSize)
+	runtime.KeepAlive(destVal)
+	runtime.KeepAlive(srcVal)
+
+	return true
 }
 
 // copyStructToMap copies data from a struct to a map.

@@ -8,7 +8,7 @@ import (
 )
 
 // ParseTagOptions parses struct tag options into a map of option names to values.
-// The first part is treated as the field name unless it’s a known flag (e.g., "omitempty", "sensitive").
+// The first part is treated as the field name unless it's a known flag (e.g., "omitempty", "sensitive").
 // Subsequent parts are treated as flags. The "-" flag removes any parsed name.
 // Returns a map of options where flags have empty string values.
 func ParseTagOptions(tag string) map[string]string {
@@ -20,7 +20,6 @@ func ParseTagOptions(tag string) map[string]string {
 		"unmapped":  true,
 		"-":         true,
 	}
-
 	if len(parts) > 0 {
 		part0 := strings.TrimSpace(parts[0])
 		if part0 != "" {
@@ -30,7 +29,6 @@ func ParseTagOptions(tag string) map[string]string {
 				opts["name"] = part0
 			}
 		}
-
 		for _, opt := range parts[1:] {
 			trimmedOpt := strings.TrimSpace(opt)
 			if trimmedOpt != "" {
@@ -38,11 +36,9 @@ func ParseTagOptions(tag string) map[string]string {
 			}
 		}
 	}
-
 	if _, ignorePresent := opts["-"]; ignorePresent {
 		delete(opts, "name")
 	}
-
 	return opts
 }
 
