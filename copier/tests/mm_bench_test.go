@@ -1,8 +1,9 @@
 package tests
 
 import (
-	"github.com/olekukonko/mm/copier"
 	"testing"
+
+	"github.com/olekukonko/mm/copier"
 )
 
 // Benchmarks (Keep as is, verify they run)

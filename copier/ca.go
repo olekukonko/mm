@@ -5,11 +5,8 @@ import (
 	"reflect"
 	"runtime"
 	"unsafe"
-
-	"github.com/olekukonko/mm/mf"
 )
 
-// copyArray copies data from a slice or array to a fixed-size array.
 func (c *Copier) copyArray(dest, src reflect.Value, ctx *SysContext) error {
 	srcType := src.Type()
 	destType := dest.Type()
@@ -41,7 +38,7 @@ func (c *Copier) copyArray(dest, src reflect.Value, ctx *SysContext) error {
 		c.logger.Debugf("   -> Element type %s or %s may require processItem (Copiable/Sensitive). Disabling bulk copy for array.", srcElemType, destElemType)
 	}
 
-	if !elementPotentiallyNeedsProcessItem && c.useUnsafe && destElemType == srcElemType && mf.IsMemCopySuitable(destElemType) {
+	if !elementPotentiallyNeedsProcessItem && c.useUnsafe && destElemType == srcElemType && IsMemCopySuitable(destElemType) {
 		if dest.CanAddr() && src.CanAddr() {
 			elemSize := destElemType.Size()
 			totalSize := elemSize * uintptr(destLen)
@@ -66,9 +63,9 @@ func (c *Copier) copyArray(dest, src reflect.Value, ctx *SysContext) error {
 		for i := 0; i < srcLen; i++ {
 			srcElem := src.Index(i)
 			destElem := dest.Index(i)
-			itemName := fmt.Sprintf("arrayElem[%d]", i)
 			currentItemIsSensitive := c.checkIsSensitive(srcElem)
-			res := c.processItem(srcElem, itemName, destElem.Type(), currentItemIsSensitive, ctx)
+
+			res := c.processItem(srcElem, i, destElem.Type(), currentItemIsSensitive, ctx)
 
 			if res.err != nil {
 				return res.err
@@ -98,7 +95,6 @@ func (c *Copier) copyArray(dest, src reflect.Value, ctx *SysContext) error {
 	return nil
 }
 
-// copySlice copies data from a slice or array to a slice.
 func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 	destType := dest.Type()
 	srcType := src.Type()
@@ -107,16 +103,13 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Slice/Array -> Slice (%s -> %s)", srcType, destType)
 
-	// Keep a reference to the original dest's state for potential preservation logic.
 	originalDestValue := dest
 	originalDestLen := 0
-	var originalDestContentCopy reflect.Value // Used if we need a snapshot
+	var originalDestContentCopy reflect.Value
 
 	if originalDestValue.IsValid() && !originalDestValue.IsNil() {
 		originalDestLen = originalDestValue.Len()
-		// Create a snapshot of originalDestValue's content if we might need it for overwrite+element-wise
-		// This snapshot helps preserve initial values if targetSliceForCopyElements is entirely new.
-		if c.overwrite { // Only relevant for overwrite scenarios needing preservation
+		if c.overwrite {
 			originalDestContentCopy = reflect.MakeSlice(destType, originalDestLen, originalDestLen)
 			reflect.Copy(originalDestContentCopy, originalDestValue)
 			c.logger.Debugf("   Snapshot of original dest content taken (len %d).", originalDestLen)
@@ -135,40 +128,39 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 		return nil
 	}
 
-	currentDestEffectiveLen := 0 // Length of the slice that elements will be copied into
+	currentDestEffectiveLen := 0
 	if dest.IsValid() && !dest.IsNil() {
 		currentDestEffectiveLen = dest.Len()
 	}
 
 	var newDestAllocated, targetSliceForCopyElements reflect.Value
 	targetLenAfterCopy, copyStartIndex := 0, 0
-	sliceReallocated := false // True if targetSliceForCopyElements points to a newly allocated backing array
+	sliceReallocated := false
 
 	if c.overwrite {
 		targetLenAfterCopy = srcLen
-		copyStartIndex = 0 // Copying starts at index 0 of the target
+		copyStartIndex = 0
 		if !dest.IsValid() || dest.IsNil() || dest.Cap() < srcLen {
 			if !dest.CanSet() {
 				return fmt.Errorf("cannot set/resize slice dest %s for overwrite (cap %d < srcLen %d or nil/invalid)", destType, dest.Cap(), srcLen)
 			}
-			newDestAllocated = reflect.MakeSlice(destType, srcLen, srcLen) // New slice, elements are zeroed
+			newDestAllocated = reflect.MakeSlice(destType, srcLen, srcLen)
 			sliceReallocated = true
 			c.logger.Debugf("   -> Created new slice for dest %s (len/cap %d) due to nil/cap<srcLen.", destType, srcLen)
 			targetSliceForCopyElements = newDestAllocated
-		} else { // dest is valid, non-nil, and has enough capacity
+		} else {
 			targetSliceForCopyElements = dest
 			if dest.Len() != srcLen {
 				if !dest.CanSet() {
 					return fmt.Errorf("cannot set length of non-settable slice %s for overwrite", destType)
 				}
-				dest.SetLen(srcLen) // Adjust length; elements preserved/zeroed by SetLen
+				dest.SetLen(srcLen)
 				c.logger.Debugf("   -> Adjusted dest slice %s length from %d to %d for overwrite.", destType, currentDestEffectiveLen, srcLen)
 			} else {
 				c.logger.Debugf("   -> Dest slice %s already correct size for overwrite.", destType)
 			}
-			// sliceReallocated remains false, targetSliceForCopyElements is the original dest (or a view of it)
 		}
-	} else { // Merge mode
+	} else {
 		targetLenAfterCopy = currentDestEffectiveLen + srcLen
 		copyStartIndex = currentDestEffectiveLen
 		if !dest.IsValid() || dest.IsNil() {
@@ -206,14 +198,13 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 		}
 	}
 
-	if sliceReallocated { // If newDestAllocated was created and used for targetSliceForCopyElements
+	if sliceReallocated {
 		if dest.CanSet() {
 			dest.Set(newDestAllocated)
 			c.logger.Debugf("   -> Assigned newly allocated slice back to original dest variable.")
-			targetSliceForCopyElements = dest // Ensure subsequent operations use the slice attached to 'dest'
+			targetSliceForCopyElements = dest
 		} else {
 			c.logger.Warnf("   -> Slice reallocated (%s) but original dest variable not settable. Element copy will target the new slice; original variable 'dest' is unchanged.", newDestAllocated.Type())
-			// targetSliceForCopyElements remains newDestAllocated
 		}
 	}
 
@@ -243,13 +234,12 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 		c.logger.Debugf("   -> Element type %s or %s may require processItem (Copiable/Sensitive). Element-wise copy will be used.", srcElemType, destElemType)
 	}
 
-	// Attempt bulk copy only if elements don't need special processing AND it's a full overwrite.
 	if !elementPotentiallyNeedsProcessItem && c.overwrite && targetSliceForCopyElements.IsValid() && targetSliceForCopyElements.Len() == srcLen {
 		if srcType.Kind() == destType.Kind() && srcElemType.AssignableTo(destElemType) {
 			c.logger.Debugf("   -> Performing reflect.Copy (overwrite, full slice, assignable elements).")
 			reflect.Copy(targetSliceForCopyElements, src)
 			canBulkCopy = true
-		} else if c.useUnsafe && destElemType == srcElemType && mf.IsMemCopySuitable(destElemType) {
+		} else if c.useUnsafe && destElemType == srcElemType && IsMemCopySuitable(destElemType) {
 			if targetSliceForCopyElements.CanAddr() && src.CanAddr() && srcLen > 0 {
 				elemSize := destElemType.Size()
 				totalSize := elemSize * uintptr(srcLen)
@@ -262,7 +252,7 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 					runtime.KeepAlive(src)
 					canBulkCopy = true
 				} else if totalSize == 0 {
-					canBulkCopy = true // Copying zero bytes is a successful bulk copy.
+					canBulkCopy = true
 				}
 			} else {
 				c.logger.Debugf("   -> Cannot use memmove: slice data not addressable or srcLen is 0.")
@@ -282,8 +272,6 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 				destType, targetSliceForCopyElements.Len(), srcLen, copyStartIndex)
 		}
 
-		// If overwriting and targetSliceForCopyElements was reallocated (is new & zeroed),
-		// pre-populate it with values from originalDestContentCopy to ensure preservation logic works.
 		if c.overwrite && sliceReallocated && originalDestContentCopy.IsValid() {
 			copyCount := srcLen
 			if originalDestContentCopy.Len() < srcLen {
@@ -308,9 +296,9 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 			}
 
 			srcElem := src.Index(i)
-			itemName := fmt.Sprintf("sliceElem[%d]", i)
 			currentItemIsSensitive := c.checkIsSensitive(srcElem)
-			res := c.processItem(srcElem, itemName, destElemType, currentItemIsSensitive, ctx)
+
+			res := c.processItem(srcElem, i, destElemType, currentItemIsSensitive, ctx)
 
 			if res.err != nil {
 				return res.err
@@ -324,7 +312,6 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 				}
 				c.logger.Debugf("      Slice element at destIndex %d set via processItem.", destIndex)
 			} else {
-				// If shouldSet is false, destElemSlot (which holds the original or pre-populated value) is preserved.
 				c.logger.Debugf("      Slice element at destIndex %d not set by processItem. Original/pre-populated element value preserved.", destIndex)
 			}
 		}
@@ -387,7 +374,7 @@ func (c *Copier) copySliceToMap(dest, src reflect.Value, ctx *SysContext) error 
 			destMapKey := reflect.ValueOf(i)
 
 			if !c.overwrite {
-				if existingVal := dest.MapIndex(destMapKey); existingVal.IsValid() && !mf.IsEmptyValue(existingVal) {
+				if existingVal := dest.MapIndex(destMapKey); existingVal.IsValid() && !IsEmptyValue(existingVal) {
 					c.logger.Debugf("      -> Skipping map key '%d': Overwrite=false and key exists non-empty.", i)
 					continue
 				}
@@ -431,11 +418,11 @@ func (c *Copier) copySliceToMap(dest, src reflect.Value, ctx *SysContext) error 
 				c.logger.Debugf("      Skipping src elem (idx %d) for key (zero value).", i)
 				continue
 			}
-			if c.skipEmptyValue && mf.IsEmptyValue(srcElemForKey) {
+			if c.skipEmptyValue && IsEmptyValue(srcElemForKey) {
 				c.logger.Debugf("      Skipping src elem (idx %d) for key (empty value).", i)
 				continue
 			}
-			if c.skipNilSrc && srcElemForKey.IsValid() && mf.IsNilable(srcElemForKey) && srcElemForKey.IsNil() {
+			if c.skipNilSrc && srcElemForKey.IsValid() && IsNilable(srcElemForKey) && srcElemForKey.IsNil() {
 				c.logger.Debugf("      Skipping src elem (idx %d) for key (nil value).", i)
 				continue
 			}
@@ -572,7 +559,7 @@ func (c *Copier) copySliceToMap(dest, src reflect.Value, ctx *SysContext) error 
 			}
 
 			if !c.overwrite {
-				if existingVal := dest.MapIndex(destMapKey); existingVal.IsValid() && !mf.IsEmptyValue(existingVal) {
+				if existingVal := dest.MapIndex(destMapKey); existingVal.IsValid() && !IsEmptyValue(existingVal) {
 					c.logger.Debugf("      -> Skipping map key '%v': Overwrite=false and key exists non-empty.", destMapKey.Interface())
 					continue
 				}

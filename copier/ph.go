@@ -2,10 +2,7 @@ package copier
 
 import (
 	"fmt"
-	"log"
 	"reflect"
-
-	"github.com/olekukonko/mm/mf"
 )
 
 type processItemResult struct {
@@ -36,11 +33,6 @@ func (c *Copier) processItem(
 	c.logger.Indent(ctxSys.depth + 1)
 	defer c.logger.Indent(ctxSys.depth)
 
-	// We call getNameLazy early because it's needed for the log message.
-	// If ll handles level check internally, this is safer than wrapping in if c.debugMode
-	// assuming getNameLazy overhead is acceptable for consistency.
-	// If performance is paramount and debug logs are off, ideally we wouldn't format this string.
-	// However, respecting the instruction to remove `if c.debugMode`:
 	itemName := getNameLazy(itemNameCtx)
 
 	var srcTypeStr, srcKindStr string
@@ -83,7 +75,7 @@ func (c *Copier) processItem(
 		c.logger.Debugf("  Skipping '%s' (zero value).", itemName)
 		return processItemResult{shouldSet: false}
 	}
-	if c.skipEmptyValue && mf.IsEmptyValue(src) {
+	if c.skipEmptyValue && IsEmptyValue(src) {
 		c.logger.Debugf("  Skipping '%s' (empty value).", itemName)
 		return processItemResult{shouldSet: false}
 	}
@@ -129,9 +121,6 @@ func (c *Copier) processItem(
 			}
 			errMsg := fmt.Sprintf("sensitive item '%s' (src type %s) requires Copiable on source's (concrete) type, dest type (%s), or pointer to dest type (*%s), but none found", itemName, logSrcTypeForError, baseDestType, baseDestType)
 			c.logger.Warnf("  -> ERROR: %s.", errMsg)
-			if c.debugMode {
-				log.Printf("[mm debug] %s: %s", itemName, errMsg)
-			}
 			sensitiveErr := fmt.Errorf("%s: %w", errMsg, ErrSensitiveTypeCopied)
 			if c.handlePotentialError(sensitiveErr, ctxSys) {
 				return processItemResult{shouldSet: false}

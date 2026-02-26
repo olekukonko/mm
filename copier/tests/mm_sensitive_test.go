@@ -11,9 +11,6 @@ import (
 	"github.com/olekukonko/mm/copier"
 )
 
-// cloneInitialDestState performs a pure reflection deep copy of the initial state fixture.
-// It avoids using the mm/copier library itself to prevent triggering Copiable logic
-// or sensitivity checks during the test setup phase.
 func cloneInitialDestState(t *testing.T, initialDestPtr interface{}) interface{} {
 	t.Helper()
 	if initialDestPtr == nil {
@@ -27,12 +24,10 @@ func cloneInitialDestState(t *testing.T, initialDestPtr interface{}) interface{}
 		return reflect.Zero(val.Type()).Interface()
 	}
 
-	// Perform deep clone
 	clonedVal := cloneValue(val)
 	return clonedVal.Interface()
 }
 
-// cloneValue recursively clones a reflect.Value
 func cloneValue(v reflect.Value) reflect.Value {
 	if !v.IsValid() {
 		return v
@@ -91,24 +86,20 @@ func cloneValue(v reflect.Value) reflect.Value {
 		return cloneValue(v.Elem())
 
 	default:
-		// Basic types (string, int, etc.) are immutable/copied by value
 		return v
 	}
 }
 
-// Helper for TestSliceMapConversions
 func sortHelloSlice(s []Hello) {
 	sort.Slice(s, func(i, j int) bool {
 		return string(s[i]) < string(s[j])
 	})
 }
 
-// Helper function to create pointers for testing
 func ptr[T any](v T) *T {
 	return &v
 }
 
-// Hello is a sensitive type for testing.
 type Hello string
 
 func (h Hello) Sensitive() bool {
@@ -137,25 +128,20 @@ func (h Hello) Copy(ctx *copier.CopyContext, src interface{}) (interface{}, erro
 	return Hello(encoded), nil
 }
 
-// HelloPointer is a pointer type for handling pointer destinations.
 type HelloPointer string
 
-// Sensitive indicates that HelloPointer contains sensitive data.
 func (hp *HelloPointer) Sensitive() bool {
 	return true
 }
 
-// PtrDest holds a pointer to HelloPointer.
 type PtrDest struct {
 	Value *HelloPointer
 }
 
-// InterfaceDestTest holds an interface{}.
 type InterfaceDestTest struct {
 	Value interface{}
 }
 
-// Copy implements the Copiable interface for HelloPointer, returning a pointer.
 func (hp *HelloPointer) Copy(ctx *copier.CopyContext, src interface{}) (interface{}, error) {
 	var stringToEncode string
 	switch v := src.(type) {
@@ -216,11 +202,10 @@ func TestStructSensitive(t *testing.T) {
 			skipDstCheck:     true,
 		},
 		{
-			name:       "S2S: SkipSensitive - Skips all sensitive",
-			src:        Source{Normal: "normal", SensitiveStr: "secret", HelloField: "hello"},
-			dstInitial: &Dest{Normal: "initial_val_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
-			opts:       []copier.Option{copier.WithSkipSensitive(true)},
-			// Expect preserved initial values, not empty strings
+			name:             "S2S: SkipSensitive - Skips all sensitive",
+			src:              Source{Normal: "normal", SensitiveStr: "secret", HelloField: "hello"},
+			dstInitial:       &Dest{Normal: "initial_val_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
+			opts:             []copier.Option{copier.WithSkipSensitive(true)},
 			expectDst:        &Dest{Normal: "normal", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
 			expectErrContent: "",
 			skipDstCheck:     false,
@@ -231,22 +216,18 @@ func TestStructSensitive(t *testing.T) {
 			dstInitial: &Dest{Normal: "initial_val_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
 			opts:       []copier.Option{copier.WithErrors(true)},
 			expectDst: &Dest{
-				Normal: "normal",
-				// SensitiveStr error collected -> field not set -> preserved
+				Normal:       "normal",
 				SensitiveStr: "initial_secret",
-				// HelloField copied via Copiable
-				HelloField: Hello(base64.StdEncoding.EncodeToString([]byte("hello"))),
+				HelloField:   Hello(base64.StdEncoding.EncodeToString([]byte("hello"))),
 			},
 			expectErrContent: "sensitive item 'sensitive_str' (src type string) requires Copiable",
 			skipDstCheck:     false,
 		},
 		{
-			name:       "S2S: Merge - Skips non-empty dest fields before sensitivity",
-			src:        Source{Normal: "normal_src", SensitiveStr: "secret_src", HelloField: "hello_src"},
-			dstInitial: &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
-			opts:       []copier.Option{copier.WithMerge()},
-			// Since dest fields are non-empty, merge logic skips them *before* checking sensitivity.
-			// Therefore, no error is expected, and values are preserved.
+			name:             "S2S: Merge - Skips non-empty dest fields before sensitivity",
+			src:              Source{Normal: "normal_src", SensitiveStr: "secret_src", HelloField: "hello_src"},
+			dstInitial:       &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
+			opts:             []copier.Option{copier.WithMerge()},
 			expectDst:        &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
 			expectErrContent: "",
 			skipDstCheck:     false,
@@ -256,7 +237,7 @@ func TestStructSensitive(t *testing.T) {
 			src:              Source{Normal: "normal", SensitiveStr: "secret", HelloField: "hello"},
 			dstInitial:       func() *map[string]interface{} { m := make(map[string]interface{}); return &m }(),
 			opts:             []copier.Option{},
-			expectErrContent: "sensitive item 'mapValueForKey 'sensitive_str'",
+			expectErrContent: "sensitive item 'sensitive_str'",
 			skipDstCheck:     true,
 		},
 		{
@@ -266,8 +247,7 @@ func TestStructSensitive(t *testing.T) {
 				m := map[string]interface{}{"Normal": "old_normal", "sensitive_str": "keep_map_secret", "hello_field": "keep_map_hello"}
 				return &m
 			}(),
-			opts: []copier.Option{copier.WithSkipSensitive(true)},
-			// Preserved values
+			opts:             []copier.Option{copier.WithSkipSensitive(true)},
 			expectDst:        &map[string]interface{}{"Normal": "normal", "sensitive_str": "keep_map_secret", "hello_field": "keep_map_hello"},
 			expectErrContent: "",
 			skipDstCheck:     false,
@@ -281,12 +261,11 @@ func TestStructSensitive(t *testing.T) {
 			}(),
 			opts: []copier.Option{copier.WithErrors(true)},
 			expectDst: &map[string]interface{}{
-				"Normal":      "normal",
-				"hello_field": Hello(base64.StdEncoding.EncodeToString([]byte("hello"))),
-				// Error collected -> preserved
+				"Normal":        "normal",
+				"hello_field":   Hello(base64.StdEncoding.EncodeToString([]byte("hello"))),
 				"sensitive_str": "keep_map_secret",
 			},
-			expectErrContent: "sensitive item 'mapValueForKey 'sensitive_str'",
+			expectErrContent: "sensitive item 'sensitive_str'",
 			skipDstCheck:     false,
 		},
 		{
@@ -294,15 +273,14 @@ func TestStructSensitive(t *testing.T) {
 			src:              map[string]interface{}{"Normal": "normal", "sensitive_str": "secret", "hello_field": "hello"},
 			dstInitial:       &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
 			opts:             []copier.Option{},
-			expectErrContent: "sensitive item 'field 'sensitive_str' from mapKey 'sensitive_str''",
+			expectErrContent: "sensitive item 'sensitive_str'",
 			skipDstCheck:     true,
 		},
 		{
-			name:       "Map2S: SkipSensitive",
-			src:        map[string]interface{}{"Normal": "normal", "sensitive_str": "secret_map_val", "hello_field": "hello_map_val"},
-			dstInitial: &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
-			opts:       []copier.Option{copier.WithSkipSensitive(true)},
-			// Preserved values
+			name:             "Map2S: SkipSensitive",
+			src:              map[string]interface{}{"Normal": "normal", "sensitive_str": "secret_map_val", "hello_field": "hello_map_val"},
+			dstInitial:       &Dest{Normal: "initial_norm", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
+			opts:             []copier.Option{copier.WithSkipSensitive(true)},
 			expectDst:        &Dest{Normal: "normal", SensitiveStr: "initial_secret", HelloField: "initial_hello"},
 			expectErrContent: "",
 			skipDstCheck:     false,
@@ -314,10 +292,10 @@ func TestStructSensitive(t *testing.T) {
 			opts:       []copier.Option{copier.WithErrors(true)},
 			expectDst: &Dest{
 				Normal:       "normal",
-				SensitiveStr: "initial_secret", // Preserved
+				SensitiveStr: "initial_secret",
 				HelloField:   Hello(base64.StdEncoding.EncodeToString([]byte("hello_map_val"))),
 			},
-			expectErrContent: "sensitive item 'field 'sensitive_str' from mapKey 'sensitive_str''",
+			expectErrContent: "sensitive item 'sensitive_str'",
 			skipDstCheck:     false,
 		},
 	}
@@ -366,15 +344,15 @@ func TestSliceSensitive(t *testing.T) {
 		{
 			name:       "Slice - Skip sensitive",
 			srcSlice:   []Hello{"s_hello1", "s_hello2"},
-			dstInitial: []Hello{"s_initial1", "s_initial2"}, // Raw strings
+			dstInitial: []Hello{"s_initial1", "s_initial2"},
 			opts:       []copier.Option{copier.WithSkipSensitive(true)},
-			expectDst:  []Hello{"s_initial1", "s_initial2"}, // Expect raw strings to be preserved
+			expectDst:  []Hello{"s_initial1", "s_initial2"},
 		},
 		{
 			name:       "Slice - Copy sensitive with Copiable",
 			srcSlice:   []Hello{"s_hello1", "s_hello2"},
-			dstInitial: []Hello{"s_initial1", "s_initial2"}, // Raw strings in initial
-			opts:       []copier.Option{},                   // Default copier, will use Hello.Copy
+			dstInitial: []Hello{"s_initial1", "s_initial2"},
+			opts:       []copier.Option{},
 			expectDst:  []Hello{Hello(base64.StdEncoding.EncodeToString([]byte("s_hello1"))), Hello(base64.StdEncoding.EncodeToString([]byte("s_hello2")))},
 		},
 		{
@@ -382,12 +360,12 @@ func TestSliceSensitive(t *testing.T) {
 			srcSlice:   []Hello{"s_merge1", "s_merge2"},
 			dstInitial: []Hello{"s_initial_merge1", "s_initial_merge2"},
 			opts:       []copier.Option{copier.WithMerge()},
-			expectErr:  "sensitive item 'sliceElem[0]' (type tests.Hello) Copiable wants overwrite, but copier is in Merge mode",
+			expectErr:  "sensitive item '[0]' (type tests.Hello) Copiable wants overwrite, but copier is in Merge mode",
 		},
 		{
 			name:       "Array - Copy sensitive with Copiable",
-			srcSlice:   []Hello{"a_hello1", "a_hello2"},      // Source elements for array
-			dstInitial: [2]Hello{"a_initial1", "a_initial2"}, // Raw strings in initial array
+			srcSlice:   []Hello{"a_hello1", "a_hello2"},
+			dstInitial: [2]Hello{"a_initial1", "a_initial2"},
 			asArray:    true,
 			arraySize:  2,
 			opts:       []copier.Option{},
@@ -395,12 +373,12 @@ func TestSliceSensitive(t *testing.T) {
 		},
 		{
 			name:       "Array - Skip sensitive",
-			srcSlice:   []Hello{"a_skip1", "a_skip2"},            // Source elements for array
-			dstInitial: [2]Hello{"a_init_skip1", "a_init_skip2"}, // Raw strings in initial array
+			srcSlice:   []Hello{"a_skip1", "a_skip2"},
+			dstInitial: [2]Hello{"a_init_skip1", "a_init_skip2"},
 			asArray:    true,
 			arraySize:  2,
 			opts:       []copier.Option{copier.WithSkipSensitive(true)},
-			expectDst:  []Hello{"a_init_skip1", "a_init_skip2"}, // Expect raw strings to be preserved
+			expectDst:  []Hello{"a_init_skip1", "a_init_skip2"},
 		},
 	}
 
@@ -422,8 +400,6 @@ func TestSliceSensitive(t *testing.T) {
 				tempArrayPtr.Elem().Set(dstInitialVal)
 				ptrToDstInitialForClone = tempArrayPtr.Interface()
 			} else if dstInitialVal.Kind() == reflect.Slice {
-				// For slice, dstInitial itself is the value (e.g. []Hello{...})
-				// To pass a pointer to it for cloning:
 				tempSlicePtr := reflect.New(dstInitialVal.Type())
 				tempSlicePtr.Elem().Set(dstInitialVal)
 				ptrToDstInitialForClone = tempSlicePtr.Interface()
@@ -434,7 +410,6 @@ func TestSliceSensitive(t *testing.T) {
 			currentProcessDest := cloneInitialDestState(t, ptrToDstInitialForClone)
 
 			if tt.asArray {
-				// currentProcessDest is *[N]Hello. We copy into this pointer.
 				srcArrayVal := reflect.New(reflect.ValueOf(currentProcessDest).Elem().Type()).Elem()
 				for i := 0; i < tt.arraySize; i++ {
 					if i < len(tt.srcSlice) {
@@ -450,7 +425,6 @@ func TestSliceSensitive(t *testing.T) {
 					}
 				}
 			} else {
-				// currentProcessDest is *[]Hello. We copy into this pointer.
 				err = c.Copy(currentProcessDest, tt.srcSlice)
 				if err == nil {
 					finalResultAsSlice = *(currentProcessDest.(*[]Hello))
@@ -495,7 +469,7 @@ func TestMapSensitive(t *testing.T) {
 			name:       "Copy sensitive with Copiable",
 			src:        map[string]Hello{"key1": "hello1", "key2": "hello2"},
 			dstInitial: &map[string]Hello{"key_old": "old_val", "key1": "initial1_for_overwrite"},
-			opts:       []copier.Option{}, // Default copier uses Hello.Copy
+			opts:       []copier.Option{},
 			expectDst: map[string]Hello{
 				"key1": Hello(base64.StdEncoding.EncodeToString([]byte("hello1"))),
 				"key2": Hello(base64.StdEncoding.EncodeToString([]byte("hello2"))),
@@ -506,27 +480,22 @@ func TestMapSensitive(t *testing.T) {
 			src:        map[string]Hello{"key1": "hello_merge1"},
 			dstInitial: &map[string]Hello{"key1": ""},
 			opts:       []copier.Option{copier.WithMerge()},
-			expectErr:  "sensitive item 'mapValue[key:key1]' (type tests.Hello)",
+			expectErr:  "sensitive item 'key1' (type tests.Hello)",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Initialize copier with options
 			c := copier.NewCopier()
 			if tt.opts != nil {
 				c = copier.New(tt.opts...)
 			}
 			c.WithDebug(false)
 
-			// Clone initial destination state using manual setup to avoid pollution
-			// (Use cloneInitialDestState for consistency)
 			currentDstPtr := cloneInitialDestState(t, tt.dstInitial).(*map[string]Hello)
 
-			// Perform the copy operation
 			err := c.Copy(currentDstPtr, tt.src)
 
-			// Validate results
 			if tt.expectErr != "" {
 				if err == nil {
 					t.Fatalf("expected error containing '%s', got nil", tt.expectErr)
@@ -598,7 +567,6 @@ func TestPtrInterfaceSensitive(t *testing.T) {
 			c := copier.NewCopier(tt.opts...)
 			c.WithDebug(false)
 
-			// Manually initialize currentDst to match dstInitial using pure reflection helper
 			currentDst := cloneInitialDestState(t, tt.dstInitial)
 
 			err := c.Copy(currentDst, tt.src)
@@ -737,12 +705,9 @@ func TestChanSensitive(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := copier.NewCopier(tt.opts...).WithDebug(false)
 
-			// Initialize destination slice as empty to avoid nil
 			var result []Hello = []Hello{}
 
-			// Process channel elements
 			for elem := range tt.srcChan {
-				// Create a single-element destination for copying
 				var dest Hello
 				err := c.Copy(&dest, elem)
 				if err != nil && tt.expectErr == "" {
@@ -758,21 +723,17 @@ func TestChanSensitive(t *testing.T) {
 					t.Fatalf("expected error containing '%s', got nil", tt.expectErr)
 				}
 
-				// For Copy_sensitive_channel_elements_with_Copiable, ensure base64 encoding
 				if tt.name == "Copy sensitive channel elements with Copiable" {
-					// If copier didn't encode, manually apply expected Copiable behavior
 					if dest == elem {
 						dest = Hello(base64.StdEncoding.EncodeToString([]byte(elem)))
 					}
 				}
 
-				// Append if the element was copied (not skipped)
 				if !reflect.ValueOf(dest).IsZero() {
 					result = append(result, dest)
 				}
 			}
 
-			// Assert the result
 			assertDeepEqual(t, result, tt.expect, "Channel sensitive test failed on received elements")
 		})
 	}

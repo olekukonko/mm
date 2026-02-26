@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"unsafe"
-
-	"github.com/olekukonko/mm/mf"
 )
 
 // Handling Helpers
@@ -29,13 +27,13 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 			fields:       make(map[string]FieldInfo),
 			size:         typ.Size(),
 			alignment:    uintptr(typ.Align()),
-			containsPtrs: mf.HasPointers(typ),
+			containsPtrs: HasPointers(typ),
 			isStruct:     false,
 			isSlice:      typ.Kind() == reflect.Slice,
 			isMap:        typ.Kind() == reflect.Map,
 			isPtr:        typ.Kind() == reflect.Ptr,
 			isInterface:  typ.Kind() == reflect.Interface,
-			canMemCopy:   mf.IsMemCopySuitable(concreteType),
+			canMemCopy:   IsMemCopySuitable(concreteType),
 		}
 	}
 
@@ -48,7 +46,7 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 		fields:       make(map[string]FieldInfo),
 		size:         typ.Size(),
 		alignment:    uintptr(typ.Align()),
-		containsPtrs: mf.HasPointers(typ),
+		containsPtrs: HasPointers(typ),
 		isStruct:     true,
 		isSlice:      typ.Kind() == reflect.Slice,
 		isMap:        typ.Kind() == reflect.Map,
@@ -74,7 +72,7 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 		// Try primary tag first
 		primaryTagValue := f.Tag.Get(c.tagName)
 		if primaryTagValue != "" {
-			parsedOpts := mf.ParseTagOptions(primaryTagValue)
+			parsedOpts := ParseTagOptions(primaryTagValue)
 			if name, ok := parsedOpts["name"]; ok {
 				effectiveName = name
 				nameSetByTag = true
@@ -93,7 +91,7 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 			for _, fallbackKey := range c.fallbackTagKeys {
 				fallbackTagValue := f.Tag.Get(fallbackKey)
 				if fallbackTagValue != "" {
-					parsedFallbackOpts := mf.ParseTagOptions(fallbackTagValue)
+					parsedFallbackOpts := ParseTagOptions(fallbackTagValue)
 					if name, ok := parsedFallbackOpts["name"]; ok {
 						effectiveName = name
 						nameSetByTag = true          // Fallback set the name
@@ -165,7 +163,7 @@ func (c *Copier) getTypeInfo(typ reflect.Type) *TypeInfo {
 			}
 		}
 	}
-	info.canMemCopy = mf.IsMemCopySuitable(concreteType)
+	info.canMemCopy = IsMemCopySuitable(concreteType)
 	c.typeInfoCache.Store(concreteType, info)
 	c.logger.Debugf("getTypeInfo: Finished analyzing type %s (concrete: %s). Fields: %d, Unmapped: %v",
 		typ, concreteType, len(info.fields), info.unmappedField != nil)

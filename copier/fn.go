@@ -1,4 +1,4 @@
-package mf
+package copier
 
 import (
 	"bytes"

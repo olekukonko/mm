@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/olekukonko/ll"
+	"github.com/olekukonko/mm/cycle"
 	"reflect"
 	"strings"
 	"sync"
 	"unsafe"
-
-	"github.com/olekukonko/ll"
-	"github.com/olekukonko/mm/cycle"
 )
 
 type Copier struct {
@@ -123,7 +122,7 @@ func NewCopier(options ...Option) *Copier {
 		debugMode:         false,
 		tagResolution:     true,
 		bufferPool:        sync.Pool{New: func() interface{} { buf := make([]byte, 1024); return &buf }},
-		logger:            ll.New("copier").Suspend(),
+		logger:            ll.New("copier"),
 	}
 
 	for _, opt := range options {

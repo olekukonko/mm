@@ -3,8 +3,6 @@ package copier
 import (
 	"fmt"
 	"reflect"
-
-	"github.com/olekukonko/mm/mf"
 )
 
 func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
@@ -86,7 +84,7 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		}
 		return nil
 	}
-	if c.skipEmptyValue && mf.IsEmptyValue(src) {
+	if c.skipEmptyValue && IsEmptyValue(src) {
 		c.logger.Debugf("   -> Skipping Ptr element assign: Src value for element is empty.")
 		if c.overwrite && dest.CanSet() && !dest.IsNil() {
 			dest.Set(reflect.Zero(destType))
@@ -107,7 +105,7 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		destElem = newAllocatedPtr.Elem()
 	} else {
 		destElem = dest.Elem()
-		if !c.overwrite && destElem.IsValid() && !mf.IsBasicTypeZero(destElem) && !mf.IsEmptyValue(destElem) {
+		if !c.overwrite && destElem.IsValid() && !IsBasicTypeZero(destElem) && !IsEmptyValue(destElem) {
 			c.logger.Debugf("   -> Skipping Ptr element assign: Overwrite=false and dest element non-zero/non-empty.")
 			return nil
 		}
@@ -451,7 +449,7 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 		return nil
 	}
-	if c.skipEmptyValue && mf.IsEmptyValue(ultimateSrcConcreteVal) {
+	if c.skipEmptyValue && IsEmptyValue(ultimateSrcConcreteVal) {
 		c.logger.Debugf("   Skipping interface assign: Src concrete (type %s) is empty.", ultimateSrcConcreteVal.Type())
 		if c.overwrite && dest.IsValid() && !dest.IsNil() {
 			dest.Set(reflect.Zero(dest.Type()))
@@ -460,7 +458,7 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 	}
 
 	if !c.overwrite && dest.IsValid() && !dest.IsNil() {
-		if destElemIf := dest.Elem(); destElemIf.IsValid() && !mf.IsEmptyValue(destElemIf) {
+		if destElemIf := dest.Elem(); destElemIf.IsValid() && !IsEmptyValue(destElemIf) {
 			c.logger.Debugf("   Skipping interface assign: Overwrite=false, dest interface non-empty (contains %s).", destElemIf.Type())
 			return nil
 		}
@@ -678,7 +676,7 @@ func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err er
 		}
 		return nil
 	}
-	if c.skipEmptyValue && mf.IsEmptyValue(valueToSetInInterface) {
+	if c.skipEmptyValue && IsEmptyValue(valueToSetInInterface) {
 		c.logger.Debugf("   Skipping set of empty value (type %s) into interface (skipEmptyValue=true)", valueToSetInInterface.Type())
 		if c.overwrite {
 			dest.Set(reflect.Zero(dest.Type()))

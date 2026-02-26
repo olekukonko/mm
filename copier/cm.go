@@ -1,16 +1,10 @@
 package copier
 
 import (
-	"errors"
 	"fmt"
-
-	"github.com/olekukonko/mm/mf"
-
-	// "log" // Not used
 	"reflect"
 )
 
-// copyMapToStruct copies data from a map to a struct, matching map keys to field names.
 func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *SysContext) error {
 	destInfo := c.getTypeInfo(dest.Type())
 	srcMapKeys := src.MapKeys()
@@ -51,7 +45,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 		} else if mapFieldValErr != nil {
 			errUnmapped := fmt.Errorf("getting unmapped dest field '%s': %w", unmappedDestFieldName, mapFieldValErr)
 			if c.handlePotentialError(errUnmapped, ctx) {
-			} else if !errors.Is(mapFieldValErr, ErrUnexportedField) || c.collectErrors {
+			} else if mapFieldValErr != ErrUnexportedField {
 				c.logger.Warnf("   Error initializing unmapped dest field '%s': %v.", unmappedDestFieldName, mapFieldValErr)
 			} else {
 				c.logger.Debugf("   Unmapped dest field '%s' is unexported or not settable.", unmappedDestFieldName)
@@ -86,7 +80,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 		}
 		if !foundSrcKeyInMap {
 			for _, kVal := range srcMapKeys {
-				if mf.InterfaceToString(kVal) == srcKeyNameForThisDestField {
+				if InterfaceToString(kVal) == srcKeyNameForThisDestField {
 					srcMapVal = src.MapIndex(kVal)
 					actualSrcKeyReflectVal = kVal
 					foundSrcKeyInMap = true
@@ -102,7 +96,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 
 		destFieldsProcessedOrSkipped[destFieldEffectiveName] = struct{}{}
 		if actualSrcKeyReflectVal.IsValid() {
-			usedMapKeys[mf.InterfaceToString(actualSrcKeyReflectVal)] = struct{}{}
+			usedMapKeys[InterfaceToString(actualSrcKeyReflectVal)] = struct{}{}
 		}
 
 		if _, skip := c.skipFields[destFieldEffectiveName]; skip {
@@ -138,7 +132,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 						c.logger.Debugf("     Formatter returned nil for '%s', skipping due to skipNilSrc=true. Field value preserved.", destFieldEffectiveName)
 						continue
 					}
-					formattedSrcMapVal = mf.GetNilLikeValue(srcMapVal)
+					formattedSrcMapVal = GetNilLikeValue(srcMapVal)
 				}
 			}
 		}
@@ -148,7 +142,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 		}
 
 		if !c.overwrite && destVal.IsValid() {
-			isDestNonEmptyNonZero := !(mf.IsBasicTypeZero(destVal) || mf.IsEmptyValue(destVal))
+			isDestNonEmptyNonZero := !(IsBasicTypeZero(destVal) || IsEmptyValue(destVal))
 			if isDestNonEmptyNonZero {
 				var valStr string
 				if destVal.CanInterface() {
@@ -164,8 +158,8 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 
 		srcMapValueIsDynamicallySensitive := c.checkIsSensitive(formattedSrcMapVal)
 		combinedSensitivity := destFieldInfo.sensitive || srcMapValueIsDynamicallySensitive
-		itemNameForProcessItem := fmt.Sprintf("field '%s' from mapKey '%s'", destFieldEffectiveName, srcKeyNameForThisDestField)
-		res := c.processItem(formattedSrcMapVal, itemNameForProcessItem, destVal.Type(), combinedSensitivity, ctx)
+
+		res := c.processItem(formattedSrcMapVal, destFieldEffectiveName, destVal.Type(), combinedSensitivity, ctx)
 
 		if res.err != nil {
 			if c.handlePotentialError(res.err, ctx) {
@@ -188,7 +182,7 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 
 	if unmappedDestMap.IsValid() {
 		for _, keyVal := range srcMapKeys {
-			keyStr := mf.InterfaceToString(keyVal)
+			keyStr := InterfaceToString(keyVal)
 			if _, used := usedMapKeys[keyStr]; used {
 				continue
 			}
@@ -196,14 +190,14 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 			srcValForUnmapped := src.MapIndex(keyVal)
 
 			if !c.overwrite {
-				if existingInUnmapped := unmappedDestMap.MapIndex(keyVal); existingInUnmapped.IsValid() && !mf.IsEmptyValue(existingInUnmapped) {
+				if existingInUnmapped := unmappedDestMap.MapIndex(keyVal); existingInUnmapped.IsValid() && !IsEmptyValue(existingInUnmapped) {
 					c.logger.Debugf("   -> UNMAPPED MERGE SKIP for key '%s'. Dest key exists and non-empty.", keyStr)
 					continue
 				}
 			}
 
 			itemIsDynamicallySensitive := c.checkIsSensitive(srcValForUnmapped)
-			itemName := fmt.Sprintf("unmappedKey '%s'", keyStr)
+			itemName := keyStr
 			res := c.processItem(srcValForUnmapped, itemName, unmappedDestValueType, itemIsDynamicallySensitive, ctx)
 
 			if res.err != nil {
@@ -254,7 +248,6 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 	return nil
 }
 
-// copyMapToSlice copies data from a map to a slice.
 func (c *Copier) copyMapToSlice(dest, src reflect.Value, ctx *SysContext) error {
 	destType := dest.Type()
 	destElemType := destType.Elem()
@@ -322,9 +315,9 @@ func (c *Copier) copyMapToSlice(dest, src reflect.Value, ctx *SysContext) error 
 	elementsAdded := 0
 	for iter.Next() {
 		srcVal := iter.Value()
-		itemName := fmt.Sprintf("sliceElemFromMapVal[%d]", elementsAdded)
+
 		itemIsSensitive := c.checkIsSensitive(srcVal)
-		res := c.processItem(srcVal, itemName, destElemType, itemIsSensitive, ctx)
+		res := c.processItem(srcVal, elementsAdded, destElemType, itemIsSensitive, ctx)
 
 		if res.err != nil {
 			mapToSliceErr := fmt.Errorf("processing map value for slice element %d: %w", elementsAdded, res.err)
@@ -363,6 +356,168 @@ func (c *Copier) copyMapToSlice(dest, src reflect.Value, ctx *SysContext) error 
 		}
 	} else if targetSlice.Pointer() != dest.Pointer() {
 		c.logger.Warnf("Map -> Slice: dest slice %s was not settable and copy was performed into a new slice. Original dest variable is unchanged.", destType)
+	}
+	return nil
+}
+
+func (c *Copier) copyMap(dest, src reflect.Value, ctx *SysContext) error {
+	if src.Kind() != reflect.Map {
+		return fmt.Errorf("copyMap: source must be map, got %s", src.Type())
+	}
+	if dest.Kind() != reflect.Map {
+		return fmt.Errorf("copyMap: destination must be map, got %s", dest.Type())
+	}
+	destType := dest.Type()
+	srcType := src.Type()
+	srcLen := 0
+	if src.IsValid() && !src.IsNil() {
+		srcLen = src.Len()
+	}
+	c.logger.Indent(ctx.depth)
+	c.logger.Debugf("Copying Map -> Map (%s -> %s)", srcType, destType)
+
+	originalDestMapSnapshot := make(map[interface{}]reflect.Value)
+	if dest.IsValid() && !dest.IsNil() {
+		iter := dest.MapRange()
+		for iter.Next() {
+			keyCopy := reflect.New(iter.Key().Type()).Elem()
+			keyCopy.Set(iter.Key())
+			originalDestMapSnapshot[keyCopy.Interface()] = iter.Value()
+		}
+	}
+
+	if !src.IsValid() || src.IsNil() {
+		if c.skipNilSrc {
+			c.logger.Debugf("   Source map is nil, skipping (skipNilSrc=true). Dest map preserved.")
+			return nil
+		}
+		if c.overwrite && dest.CanSet() {
+			c.logger.Debugf("   Source map is nil, zeroing destination map (setting to new empty map).")
+			dest.Set(reflect.MakeMap(destType))
+		} else {
+			c.logger.Debugf("   Source map is nil, not skipping, not overwriting or dest not settable/valid. Dest unchanged.")
+		}
+		return nil
+	}
+
+	if dest.IsNil() {
+		if !dest.CanSet() {
+			return fmt.Errorf("cannot set nil map dest %s", destType)
+		}
+		c.logger.Debugf("   Initializing nil destination map %s.", destType)
+		dest.Set(reflect.MakeMapWithSize(destType, srcLen))
+		if dest.IsNil() {
+			return fmt.Errorf("map %s init failed or dest not settable", destType)
+		}
+	}
+
+	if dest.IsNil() {
+		return fmt.Errorf("map %s is nil after setup, cannot copy elements", destType)
+	}
+
+	if srcLen == 0 {
+		if c.overwrite {
+			c.logger.Debugf("   Source map empty and overwriting. Clearing destination map %s.", destType)
+			if dest.IsValid() && !dest.IsNil() {
+				iter := dest.MapRange()
+				var keysToClear []reflect.Value
+				for iter.Next() {
+					keysToClear = append(keysToClear, iter.Key())
+				}
+				for _, k := range keysToClear {
+					dest.SetMapIndex(k, reflect.Value{})
+				}
+			}
+		} else {
+			c.logger.Debugf("   Source map is empty, nothing to copy.")
+		}
+		return nil
+	}
+
+	destKeyType := destType.Key()
+	destValType := destType.Elem()
+	iter := src.MapRange()
+
+	processedSourceKeys := make(map[interface{}]struct{})
+
+	for iter.Next() {
+		srcKey, srcVal := iter.Key(), iter.Value()
+
+		destKeyHolder := reflect.New(destKeyType).Elem()
+		keyCopyCtx := c.acquireSysContext()
+		keyCopyCtx.depth = ctx.depth + 1
+
+		if errKey := c.CopyRecursive(destKeyHolder, srcKey, keyCopyCtx); errKey != nil {
+			c.releaseSysContext(keyCopyCtx)
+			keyErr := fmt.Errorf("failed to copy/convert map key '%v' (type %s) to type %s: %w", InterfaceKeySrc(srcKey), srcKey.Type(), destKeyType, errKey)
+			if c.handlePotentialError(keyErr, ctx) {
+				continue
+			}
+			return keyErr
+		}
+		c.releaseSysContext(keyCopyCtx)
+
+		destKey := destKeyHolder
+		if destKey.IsValid() {
+			processedSourceKeys[destKey.Interface()] = struct{}{}
+		} else {
+			c.logger.Debugf("      Skipping due to invalid destination key from source key '%v'.", InterfaceKeySrc(srcKey))
+			continue
+		}
+
+		if !c.overwrite {
+			if existingVal := dest.MapIndex(destKey); existingVal.IsValid() && !IsEmptyValue(existingVal) {
+				c.logger.Debugf("      Skipping map key '%v': Overwrite=false and key exists with non-empty value.", InterfaceKeySrc(destKey))
+				continue
+			}
+		}
+
+		srcValIsDynamicallySensitive := c.checkIsSensitive(srcVal)
+
+		res := c.processItem(srcVal, destKey.Interface(), destValType, srcValIsDynamicallySensitive, ctx)
+
+		if res.err != nil {
+			errMapItem := fmt.Errorf("processing value for map key '%v': %w", InterfaceKeySrc(destKey), res.err)
+			if c.handlePotentialError(errMapItem, ctx) {
+				continue
+			}
+			return errMapItem
+		}
+
+		if dest.IsNil() {
+			return fmt.Errorf("dest map %s became nil during copyMap iteration", destType)
+		}
+
+		if res.shouldSet {
+			if res.valueToSet.IsValid() {
+				dest.SetMapIndex(destKey, res.valueToSet)
+			} else {
+				dest.SetMapIndex(destKey, reflect.Zero(destValType))
+			}
+			c.logger.Debugf("      Set map key '%v' via processItem.", InterfaceKeySrc(destKey))
+		} else {
+			if c.overwrite {
+				if originalVal, ok := originalDestMapSnapshot[destKey.Interface()]; ok {
+					dest.SetMapIndex(destKey, originalVal)
+					c.logger.Debugf("      Map value for key '%v' NOT SET by processItem (overwrite=true, skipped src), restored original dest value.", InterfaceKeySrc(destKey))
+				} else {
+					dest.SetMapIndex(destKey, reflect.Value{})
+					c.logger.Debugf("      Map value for key '%v' NOT SET by processItem (overwrite=true, skipped src), key removed or remains absent from dest.", InterfaceKeySrc(destKey))
+				}
+			} else {
+				c.logger.Debugf("      Map value for key '%v' NOT SET by processItem (merge, skipped src). Dest value preserved.", InterfaceKeySrc(destKey))
+			}
+		}
+	}
+
+	if c.overwrite {
+		currentKeysInDest := dest.MapKeys()
+		for _, k := range currentKeysInDest {
+			if _, srcProvidedThisKey := processedSourceKeys[k.Interface()]; !srcProvidedThisKey {
+				c.logger.Debugf("   Overwrite Cleanup: Removing key '%v' from dest map as it was not processed from source map.", k.Interface())
+				dest.SetMapIndex(k, reflect.Value{})
+			}
+		}
 	}
 	return nil
 }
