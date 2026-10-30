@@ -3,20 +3,11 @@ package copier
 import (
 	"fmt"
 	"reflect"
-	"runtime"
-	"unsafe"
 
 	"github.com/olekukonko/mm/cycle"
 )
 
-type fastFieldAccess struct {
-	index  []int
-	offset uintptr
-	typ    reflect.Type
-	setter func(unsafe.Pointer, reflect.Value)
-	getter func(unsafe.Pointer) reflect.Value
-}
-
+// copyStructDriven copies data from src struct to dest struct.
 func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err error) {
 	srcForInfo := src
 	if srcForInfo.Kind() == reflect.Ptr {
@@ -277,10 +268,6 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 		dynamicSrcSensitivity := c.checkIsSensitive(formattedSrcVal)
 		combinedSensitivity := fieldTagSensitivity || dynamicSrcSensitivity
 
-		if destFieldFound && c.tryFastFieldCopy(dest, &destFieldInfoFound, formattedSrcVal, itemNameForProcessItem, combinedSensitivity, ctx) {
-			continue
-		}
-
 		res := c.processItem(formattedSrcVal, itemNameForProcessItem, baseDestTypeForProcessItem, combinedSensitivity, ctx)
 		if res.err != nil {
 			errField := fmt.Errorf("processing src field '%s' for dest target '%s': %w", srcFieldEffectiveName, itemNameForProcessItem, res.err)
@@ -346,51 +333,6 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 	return nil
 }
 
-func (c *Copier) tryFastFieldCopy(dest reflect.Value, destFieldInfo *FieldInfo, srcVal reflect.Value, itemName string, isSensitive bool, ctx *SysContext) bool {
-	if isSensitive || !c.useUnsafe || !srcVal.IsValid() || !srcVal.CanInterface() {
-		return false
-	}
-
-	destVal, destOk, destErr := c.getSettableFieldValue(dest, destFieldInfo)
-	if destErr != nil || !destOk || !destVal.CanSet() {
-		return false
-	}
-
-	srcType := srcVal.Type()
-	destType := destVal.Type()
-
-	if srcType != destType && !srcType.AssignableTo(destType) {
-		return false
-	}
-
-	if !IsMemCopySuitable(srcType) {
-		return false
-	}
-
-	if !destVal.CanAddr() || !srcVal.CanAddr() {
-		return false
-	}
-
-	if destFieldInfo.structField.PkgPath != "" && !c.copyUnexported {
-		return false
-	}
-
-	elemSize := srcType.Size()
-	if elemSize == 0 {
-		return false
-	}
-
-	destPtr := unsafe.Pointer(destVal.UnsafeAddr())
-	srcPtr := unsafe.Pointer(srcVal.UnsafeAddr())
-
-	c.logger.Debugf("   -> Fast unsafe copy for field '%s' (%s)", itemName, srcType)
-	memmove(destPtr, srcPtr, elemSize)
-	runtime.KeepAlive(destVal)
-	runtime.KeepAlive(srcVal)
-
-	return true
-}
-
 // copyStructToMap copies data from a struct to a map.
 func (c *Copier) copyStructToMap(dest, src reflect.Value, ctx *SysContext) error {
 	srcForInfo := src
@@ -404,15 +346,19 @@ func (c *Copier) copyStructToMap(dest, src reflect.Value, ctx *SysContext) error
 		}
 		srcForInfo = srcForInfo.Elem()
 	}
+
 	if srcForInfo.Kind() != reflect.Struct {
 		return fmt.Errorf("copyStructToMap: source must be a struct or pointer to a struct, got %s", src.Type())
 	}
+
 	if dest.Kind() != reflect.Map {
 		return fmt.Errorf("copyStructToMap: destination must be a map, got %s", dest.Type())
 	}
+
 	destType := dest.Type()
 	destMapKeyType := destType.Key()
 	destValueType := destType.Elem()
+
 	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Struct -> Map (%s -> %s)", srcForInfo.Type(), dest.Type())
 
@@ -478,6 +424,7 @@ func (c *Copier) copyStructToMap(dest, src reflect.Value, ctx *SysContext) error
 			c.logger.Debugf("   -> Skipping struct field '%s' (tag '-'). Dest map key '%v' value preserved if it existed.", srcFieldNameFromInfo, destKeyVal.Interface())
 			continue
 		}
+
 		if _, skipGlobal := c.skipFields[destKeyName]; skipGlobal {
 			c.logger.Debugf("   -> Skipping struct field '%s' to map key '%s' (globally). Dest map key value preserved if it existed.", srcFieldNameFromInfo, destKeyName)
 			continue
@@ -488,6 +435,7 @@ func (c *Copier) copyStructToMap(dest, src reflect.Value, ctx *SysContext) error
 			c.logger.Debugf("   -> Skipping struct field '%s': unreadable. Dest map key '%v' value preserved if it existed.", srcFieldNameFromInfo, destKeyVal.Interface())
 			continue
 		}
+
 		if _, omit := srcFieldInfo.tagOpts["omitempty"]; omit && IsEmptyValueForOmit(srcVal) {
 			c.logger.Debugf("   -> Skipping struct field '%s' to map key '%s' (omitempty). Dest map key value preserved if it existed.", srcFieldNameFromInfo, destKeyName)
 			continue
@@ -502,9 +450,10 @@ func (c *Copier) copyStructToMap(dest, src reflect.Value, ctx *SysContext) error
 
 		srcValIsDynamicallySensitive := c.checkIsSensitive(srcVal)
 		combinedSensitivity := srcFieldInfo.sensitive || srcValIsDynamicallySensitive
-		itemNameForProcessItem := destKeyName
-		res := c.processItem(srcVal, itemNameForProcessItem, destValueType, combinedSensitivity, ctx)
 
+		itemNameForProcessItem := destKeyName
+
+		res := c.processItem(srcVal, itemNameForProcessItem, destValueType, combinedSensitivity, ctx)
 		if res.err != nil {
 			errMapVal := fmt.Errorf("processing value for map key '%s' from field '%s': %w", destKeyName, srcFieldNameFromInfo, res.err)
 			if c.handlePotentialError(errMapVal, ctx) {
@@ -548,5 +497,6 @@ func (c *Copier) copyStructToMap(dest, src reflect.Value, ctx *SysContext) error
 			}
 		}
 	}
+
 	return nil
 }
