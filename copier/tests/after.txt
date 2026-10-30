@@ -1,0 +1,85 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/olekukonko/mm/copier/tests
+cpu: Apple M3 Pro
+BenchmarkMapUnmapped_MM-12                    	  477174	       691.2 ns/op	     560 B/op	      16 allocs/op
+BenchmarkMapUnmapped_MM-12                    	  535465	       669.7 ns/op	     560 B/op	      16 allocs/op
+BenchmarkMapUnmapped_MM-12                    	  566456	       718.1 ns/op	     560 B/op	      16 allocs/op
+BenchmarkMapUnmapped_Mapstructure-12          	  326953	      1186 ns/op	    1376 B/op	      28 allocs/op
+BenchmarkMapUnmapped_Mapstructure-12          	  327091	      1105 ns/op	    1376 B/op	      28 allocs/op
+BenchmarkMapUnmapped_Mapstructure-12          	  323028	      1220 ns/op	    1376 B/op	      28 allocs/op
+BenchmarkMapstructure_MapToStruct_Plain-12    	  338246	       974.1 ns/op	    1400 B/op	      26 allocs/op
+BenchmarkMapstructure_MapToStruct_Plain-12    	  416457	       955.9 ns/op	    1400 B/op	      26 allocs/op
+BenchmarkMapstructure_MapToStruct_Plain-12    	  399666	       897.5 ns/op	    1400 B/op	      26 allocs/op
+BenchmarkMMMapToStruct_Plain-12               	  834386	       433.1 ns/op	     128 B/op	       8 allocs/op
+BenchmarkMMMapToStruct_Plain-12               	  801520	       448.7 ns/op	     128 B/op	       8 allocs/op
+BenchmarkMMMapToStruct_Plain-12               	  744654	       438.9 ns/op	     128 B/op	       8 allocs/op
+BenchmarkMMStructToMap_Plain-12               	  848305	       411.8 ns/op	     400 B/op	       6 allocs/op
+BenchmarkMMStructToMap_Plain-12               	  903037	       423.6 ns/op	     400 B/op	       6 allocs/op
+BenchmarkMMStructToMap_Plain-12               	  898165	       407.5 ns/op	     400 B/op	       6 allocs/op
+BenchmarkMMDeep_SameType-12                   	 2784772	       130.3 ns/op	     128 B/op	       2 allocs/op
+BenchmarkMMDeep_SameType-12                   	 2717916	       132.3 ns/op	     128 B/op	       2 allocs/op
+BenchmarkMMDeep_SameType-12                   	 2457810	       127.4 ns/op	     128 B/op	       2 allocs/op
+BenchmarkMMGenericCopy_SameType-12            	 2301427	       162.1 ns/op	     304 B/op	       6 allocs/op
+BenchmarkMMGenericCopy_SameType-12            	 2253476	       155.7 ns/op	     304 B/op	       6 allocs/op
+BenchmarkMMGenericCopy_SameType-12            	 2079622	       172.5 ns/op	     304 B/op	       6 allocs/op
+BenchmarkMapstructure_SimpleCopy-12           	  290512	      1212 ns/op	    1872 B/op	      37 allocs/op
+BenchmarkMapstructure_SimpleCopy-12           	  292152	      1232 ns/op	    1872 B/op	      37 allocs/op
+BenchmarkMapstructure_SimpleCopy-12           	  307945	      1210 ns/op	    1872 B/op	      37 allocs/op
+BenchmarkMMSimpleCopy-12                      	 1998993	       181.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMMSimpleCopy-12                      	 1939352	       188.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMMSimpleCopy-12                      	 1971646	       215.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapstructure_NestedCopy-12           	  140016	      2495 ns/op	    3056 B/op	      66 allocs/op
+BenchmarkMapstructure_NestedCopy-12           	  159854	      2222 ns/op	    3056 B/op	      66 allocs/op
+BenchmarkMapstructure_NestedCopy-12           	  154410	      2332 ns/op	    3056 B/op	      66 allocs/op
+BenchmarkMMNestedCopy-12                      	  913347	       360.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMMNestedCopy-12                      	  950494	       342.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMMNestedCopy-12                      	 1000000	       334.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapstructure_SliceCopy-12            	    5442	     67516 ns/op	   97040 B/op	    2065 allocs/op
+BenchmarkMapstructure_SliceCopy-12            	    5151	     74542 ns/op	   97040 B/op	    2065 allocs/op
+BenchmarkMapstructure_SliceCopy-12            	    4467	     68386 ns/op	   97040 B/op	    2065 allocs/op
+BenchmarkMMSliceCopy-12                       	   18168	     20019 ns/op	   14832 B/op	     471 allocs/op
+BenchmarkMMSliceCopy-12                       	   17545	     20124 ns/op	   14832 B/op	     471 allocs/op
+BenchmarkMMSliceCopy-12                       	   16314	     19190 ns/op	   14832 B/op	     471 allocs/op
+BenchmarkMapstructure_MapToStruct-12          	  432235	       845.6 ns/op	    1400 B/op	      26 allocs/op
+BenchmarkMapstructure_MapToStruct-12          	  407792	       836.3 ns/op	    1400 B/op	      26 allocs/op
+BenchmarkMapstructure_MapToStruct-12          	  436440	       882.3 ns/op	    1400 B/op	      26 allocs/op
+BenchmarkMMMapToStruct-12                     	  877486	       435.5 ns/op	     128 B/op	       8 allocs/op
+BenchmarkMMMapToStruct-12                     	  880930	       424.4 ns/op	     128 B/op	       8 allocs/op
+BenchmarkMMMapToStruct-12                     	  887673	       423.6 ns/op	     128 B/op	       8 allocs/op
+BenchmarkMapstructure_StructToMap-12          	 1236571	       295.1 ns/op	     216 B/op	      10 allocs/op
+BenchmarkMapstructure_StructToMap-12          	 1232340	       288.4 ns/op	     216 B/op	      10 allocs/op
+BenchmarkMapstructure_StructToMap-12          	 1247379	       289.7 ns/op	     216 B/op	      10 allocs/op
+BenchmarkMMStructToMap-12                     	  886417	       397.0 ns/op	     400 B/op	       6 allocs/op
+BenchmarkMMStructToMap-12                     	  892285	       400.3 ns/op	     400 B/op	       6 allocs/op
+BenchmarkMMStructToMap-12                     	  941750	       395.1 ns/op	     400 B/op	       6 allocs/op
+BenchmarkSimpleCopy-12                        	 2313698	       155.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSimpleCopy-12                        	 2211838	       157.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSimpleCopy-12                        	 2300464	       155.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNestedCopy-12                        	 1465035	       246.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNestedCopy-12                        	 1473516	       246.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNestedCopy-12                        	 1451293	       252.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSliceCopy_Simple-12                  	  214507	      1699 ns/op	    1722 B/op	      47 allocs/op
+BenchmarkSliceCopy_Simple-12                  	  214436	      1654 ns/op	    1722 B/op	      47 allocs/op
+BenchmarkSliceCopy_Simple-12                  	  218979	      1678 ns/op	    1722 B/op	      47 allocs/op
+BenchmarkSliceCopy_Complex-12                 	   19035	     18930 ns/op	    9519 B/op	     497 allocs/op
+BenchmarkSliceCopy_Complex-12                 	   17491	     22253 ns/op	    9520 B/op	     497 allocs/op
+BenchmarkSliceCopy_Complex-12                 	   16329	     21334 ns/op	    9520 B/op	     497 allocs/op
+BenchmarkCycleCopy-12                         	  116024	      3074 ns/op	    1442 B/op	      94 allocs/op
+BenchmarkCycleCopy-12                         	  106993	      3544 ns/op	    1442 B/op	      94 allocs/op
+BenchmarkCycleCopy-12                         	  100762	      3314 ns/op	    1442 B/op	      94 allocs/op
+BenchmarkUnsafeSimpleCopy-12                  	 3049712	       106.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnsafeSimpleCopy-12                  	 3384504	       112.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnsafeSimpleCopy-12                  	 3198042	       123.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReflectSimpleCopy-12                 	 2851348	       123.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReflectSimpleCopy-12                 	 3007760	       107.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReflectSimpleCopy-12                 	 3297979	       107.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapToStruct-12                       	  438724	       802.1 ns/op	     656 B/op	      22 allocs/op
+BenchmarkMapToStruct-12                       	  462078	       816.6 ns/op	     656 B/op	      22 allocs/op
+BenchmarkMapToStruct-12                       	  443617	       803.2 ns/op	     656 B/op	      22 allocs/op
+BenchmarkStructToMap-12                       	  825679	       400.0 ns/op	     400 B/op	       6 allocs/op
+BenchmarkStructToMap-12                       	  858385	       402.1 ns/op	     400 B/op	       6 allocs/op
+BenchmarkStructToMap-12                       	  841677	       400.3 ns/op	     400 B/op	       6 allocs/op
+PASS
+ok  	github.com/olekukonko/mm/copier/tests	34.770s
+BENCHDONE
