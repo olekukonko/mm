@@ -30,17 +30,17 @@ func (c *Copier) processItem(
 	ctxSys *SysContext,
 ) (result processItemResult) {
 
-	c.logger.Indent(ctxSys.depth + 1)
-	defer c.logger.Indent(ctxSys.depth)
-
+	// The item name is part of error messages, so it is always computed. The
+	// type/kind strings on the other hand are only used by debug logging.
 	itemName := getNameLazy(itemNameCtx)
-
 	var srcTypeStr, srcKindStr string
 	isValidSrc := src.IsValid()
-	if isValidSrc {
-		srcTypeStr, srcKindStr = src.Type().String(), src.Kind().String()
-	} else {
-		srcTypeStr, srcKindStr = "<invalid_src_type>", "<invalid_src_kind>"
+	if c.debugMode {
+		if isValidSrc {
+			srcTypeStr, srcKindStr = src.Type().String(), src.Kind().String()
+		} else {
+			srcTypeStr, srcKindStr = "<invalid_src_type>", "<invalid_src_kind>"
+		}
 	}
 	c.logger.Debugf("PROCESS_ITEM Start: '%s' (Src: %s, Kind: %s -> BaseDestType: %s, ItemSensitiveFlags: srcItemSensitive=%v)", itemName, srcTypeStr, srcKindStr, baseDestType, isSrcItemSensitive)
 

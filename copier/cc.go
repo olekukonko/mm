@@ -9,12 +9,10 @@ import (
 	"runtime"
 	"strings"
 	"time"
-	"unsafe"
 )
 
 func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err error) {
-	c.logger.Indent(ctx.depth)
-	if c.logger != nil {
+	if c.debugMode {
 		var srcTypeStr, srcKindStr string
 		if src.IsValid() {
 			srcTypeStr = src.Type().String()
@@ -61,7 +59,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				}
 				dest.Set(reflect.Zero(dest.Type()))
 			} else if c.useUnsafe && dest.CanAddr() && (!isUnexportedStructField(dest) || c.copyUnexported) {
-				ptr := unsafe.Pointer(dest.UnsafeAddr())
+				ptr := dest.Addr().UnsafePointer()
 				zeroVal := reflect.Zero(dest.Type())
 				if zeroVal.IsValid() {
 					if c.logger != nil {
@@ -107,7 +105,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				}
 				dest.Set(reflect.Zero(dest.Type()))
 			} else if c.useUnsafe && dest.CanAddr() && (!isUnexportedStructField(dest) || c.copyUnexported) {
-				ptr := unsafe.Pointer(dest.UnsafeAddr())
+				ptr := dest.Addr().UnsafePointer()
 				zeroVal := reflect.Zero(dest.Type())
 				if zeroVal.IsValid() {
 					if c.logger != nil {
@@ -130,6 +128,12 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				c.logger.Debugf("Overwrite=false, skipping zeroing for %s due to nil source.", dest.Type())
 			}
 		}
+		return nil
+	}
+
+	// Fast path for map -> plain struct, taken before cycle detection: every
+	// value accepted here is a plain value, so a cycle is impossible.
+	if effectiveSrc.Kind() == reflect.Map && dest.Kind() == reflect.Struct && c.tryFastMapToStruct(dest, effectiveSrc) {
 		return nil
 	}
 
@@ -170,8 +174,8 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					edvTypeStr = "<invalid_existing_dest_val>"
 					edvKindStr = "<invalid_existing_dest_val_kind>"
 				}
-				c.logger.Debugf("Cycle Check: Visited src Ptr %p (KeyType %s). ExistingDest %s (%s). Current dest %s (%s).",
-					unsafe.Pointer(srcPtrForCycle), srcTypeForCycleKey,
+				c.logger.Debugf("Cycle Check: Visited src Ptr %#x (KeyType %s). ExistingDest %s (%s). Current dest %s (%s).",
+					srcPtrForCycle, srcTypeForCycleKey,
 					edvTypeStr, edvKindStr,
 					dest.Type(), dest.Kind())
 
@@ -182,13 +186,13 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				// and `existingDestVal` IS that same pointer. This means we are trying to populate the object
 				// this pointer refers to, and a cycle points back to this pointer. We must proceed to populate.
 				if dest.Kind() == reflect.Ptr && existingDestVal.Kind() == reflect.Ptr && dest.Pointer() == existingDestVal.Pointer() {
-					c.logger.Debugf("  Cycle REASSIGN (Self-Ptr): `dest` (%p) is `existingDestVal`. Population of pointed-to struct must proceed.", unsafe.Pointer(dest.Pointer()))
+					c.logger.Debugf("  Cycle REASSIGN (Self-Ptr): `dest` (%p) is `existingDestVal`. Population of pointed-to struct must proceed.", dest.UnsafePointer())
 					// No assignment needed here, `assigned` remains false, `isSelfRefFallThrough` logic will handle fall-through.
 				} else if dest.Kind() != reflect.Ptr && dest.Kind() != reflect.Interface && // `dest` is a value type (e.g. struct)
 					existingDestVal.Kind() == reflect.Ptr && !existingDestVal.IsNil() && dest.Type() == existingDestVal.Type().Elem() && // `existingDestVal` is a pointer to `dest`'s type
 					dest.CanAddr() && existingDestVal.Pointer() == dest.UnsafeAddr() { // and `existingDestVal` points to `dest`
 					c.logger.Debugf("  Cycle REASSIGN (Ptr->Self-Value): `existingDestVal` (%p) points to `dest` itself (%s @ %p). Population must proceed.",
-						unsafe.Pointer(existingDestVal.Pointer()), dest.Type(), unsafe.Pointer(dest.UnsafeAddr()))
+						existingDestVal.UnsafePointer(), dest.Type(), dest.Addr().UnsafePointer())
 					// No assignment, `assigned` remains false.
 				} else {
 					// Standard reassignment logic if not a self-reference needing population.
@@ -196,7 +200,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					if !dest.CanSet() {
 						if c.useUnsafe && dest.CanAddr() && (!isUnexportedStructField(dest) || c.copyUnexported) {
 							if dest.IsValid() {
-								tempDest := reflect.NewAt(dest.Type(), unsafe.Pointer(dest.UnsafeAddr())).Elem()
+								tempDest := reflect.NewAt(dest.Type(), dest.Addr().UnsafePointer()).Elem()
 								if tempDest.CanSet() {
 									settableDest = tempDest
 								}
@@ -361,9 +365,9 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					trackedDestTypeStr = destToActuallyTrack.Type().String()
 					trackedDestKindStr = destToActuallyTrack.Kind().String()
 					if (destToActuallyTrack.Kind() == reflect.Ptr || destToActuallyTrack.Kind() == reflect.UnsafePointer) && !destToActuallyTrack.IsNil() {
-						trackedDestPtrStr = fmt.Sprintf("%p", unsafe.Pointer(destToActuallyTrack.Pointer()))
+						trackedDestPtrStr = fmt.Sprintf("%p", destToActuallyTrack.UnsafePointer())
 					} else if destToActuallyTrack.CanAddr() {
-						trackedDestPtrStr = fmt.Sprintf("addr:%p", unsafe.Pointer(destToActuallyTrack.UnsafeAddr()))
+						trackedDestPtrStr = fmt.Sprintf("addr:%p", destToActuallyTrack.Addr().UnsafePointer())
 					} else {
 						trackedDestPtrStr = "<no_ptr_or_addr>"
 					}
@@ -372,8 +376,8 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					trackedDestKindStr = "<invalid_track_dest_kind>"
 					trackedDestPtrStr = "<invalid_track_dest_ptr>"
 				}
-				c.logger.Debugf("  Cycle TRACK: Storing srcPtr %p (keyType %s) -> destToTrack %s (%s) ptr/addr %s",
-					unsafe.Pointer(srcPtrForCycle), srcTypeForCycleKey,
+				c.logger.Debugf("  Cycle TRACK: Storing srcPtr %#x (keyType %s) -> destToTrack %s (%s) ptr/addr %s",
+					srcPtrForCycle, srcTypeForCycleKey,
 					trackedDestTypeStr, trackedDestKindStr, trackedDestPtrStr)
 				ctx.Detector.Track(srcPtrForCycle, srcTypeForCycleKey, destToActuallyTrack)
 			}
@@ -489,6 +493,20 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 		return nil
 	}
 
+	// Fast path: identical plain value types can be assigned in one operation.
+	// Plain means no pointers/maps/slices/interfaces and no copy hooks, so this
+	// cannot alias anything or bypass user logic.
+	if srcConcrete.Type() == destConcrete.Type() && c.directCopyMode() && c.canDirectAssign(srcConcrete.Type()) {
+		if destConcrete.CanSet() {
+			destConcrete.Set(srcConcrete)
+			return nil
+		}
+		if c.useUnsafe && destConcrete.CanAddr() {
+			reflect.NewAt(destConcrete.Type(), destConcrete.Addr().UnsafePointer()).Elem().Set(srcConcrete)
+			return nil
+		}
+	}
+
 	srcConcreteType := srcConcrete.Type()
 	destConcreteType := destConcrete.Type()
 
@@ -563,7 +581,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			srcBufferContent = make([]byte, srcBufVal.Len())
 			copy(srcBufferContent, srcBufVal.Bytes())
 		} else if srcConcrete.CanAddr() && c.useUnsafe {
-			srcBufPtr := (*bytes.Buffer)(unsafe.Pointer(srcConcrete.UnsafeAddr()))
+			srcBufPtr := (*bytes.Buffer)(srcConcrete.Addr().UnsafePointer())
 			srcBufferContent = make([]byte, srcBufPtr.Len())
 			copy(srcBufferContent, srcBufPtr.Bytes())
 			runtime.KeepAlive(srcConcrete)
@@ -591,7 +609,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			destConcrete.Set(reflect.ValueOf(newDestBuf))
 			return nil
 		} else if destConcrete.CanAddr() && c.useUnsafe {
-			destBufPtr := (*bytes.Buffer)(unsafe.Pointer(destConcrete.UnsafeAddr()))
+			destBufPtr := (*bytes.Buffer)(destConcrete.Addr().UnsafePointer())
 			destBufPtr.Reset()
 			if srcBufferContent != nil {
 				destBufPtr.Write(srcBufferContent)
@@ -637,7 +655,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			destConcrete.Set(reflect.ValueOf(newDestBuilder))
 			return nil
 		} else if destConcrete.CanAddr() && c.useUnsafe {
-			destBuilderPtr := (*strings.Builder)(unsafe.Pointer(destConcrete.UnsafeAddr()))
+			destBuilderPtr := (*strings.Builder)(destConcrete.Addr().UnsafePointer())
 			destBuilderPtr.Reset()
 			destBuilderPtr.WriteString(srcContent)
 			runtime.KeepAlive(destConcrete)
@@ -697,7 +715,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 			destConcrete.Set(srcConcrete)
 			handledBySpecialTypeOrConversion = true
 		} else if c.useUnsafe && destConcrete.CanAddr() && (c.copyUnexported || !isUnexportedStructField(destConcrete)) {
-			ptr := unsafe.Pointer(destConcrete.UnsafeAddr())
+			ptr := destConcrete.Addr().UnsafePointer()
 			reflect.NewAt(destConcreteType, ptr).Elem().Set(srcConcrete)
 			handledBySpecialTypeOrConversion = true
 			runtime.KeepAlive(destConcrete)
@@ -789,7 +807,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 					return nil
 				}
 				if c.useUnsafe && destConcrete.CanAddr() && (c.copyUnexported || !isUnexportedStructField(destConcrete)) {
-					ptr := unsafe.Pointer(destConcrete.UnsafeAddr())
+					ptr := destConcrete.Addr().UnsafePointer()
 					reflect.NewAt(destConcreteType, ptr).Elem().Set(converted)
 					runtime.KeepAlive(destConcrete)
 					return nil
@@ -824,7 +842,7 @@ func (c *Copier) CopyRecursive(dest, src reflect.Value, ctx *SysContext) (err er
 				return nil
 			}
 			if c.useUnsafe && destConcrete.CanAddr() && (c.copyUnexported || !isUnexportedStructField(destConcrete)) {
-				ptr := unsafe.Pointer(destConcrete.UnsafeAddr())
+				ptr := destConcrete.Addr().UnsafePointer()
 				reflect.NewAt(destConcreteType, ptr).Elem().Set(srcConcrete)
 				runtime.KeepAlive(destConcrete)
 				return nil

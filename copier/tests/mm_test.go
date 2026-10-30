@@ -204,11 +204,11 @@ func mapsClone(m map[string]interface{}) map[string]interface{} {
 
 // MustCopyWith helper for testing
 func MustCopyWith[T any](c *copier.Copier, src interface{}) T {
-	tempPanicCopier := *c // Make a copy to modify locally
+	tempPanicCopier := c.Clone()
 	tempPanicCopier.WithPanicOnError(true)
 	tempPanicCopier.WithCollectErrors(true)
 
-	val, err := mm.CopyWith[T](&tempPanicCopier, src)
+	val, err := mm.CopyWith[T](tempPanicCopier, src)
 	if err != nil {
 		panic(fmt.Sprintf("mm.MustCopyWith failed unexpectedly (should have panicked inside): %v", err))
 	}

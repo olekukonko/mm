@@ -5,7 +5,6 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
 var (
@@ -60,9 +59,9 @@ func WithMetrics(enabled bool) Option {
 }
 
 func New(opts ...Option) *Detector {
+	// Logging is opt-in: a nil logger keeps Check/Track allocation free.
 	d := &Detector{
 		visited: make(map[VisitKey]reflect.Value),
-		logger:  ll.New("cycle"),
 	}
 
 	for _, opt := range opts {
@@ -96,18 +95,20 @@ func (d *Detector) Check(srcPtr uintptr, srcElemType reflect.Type) (reflect.Valu
 		if d.enableMetrics {
 			atomic.AddUint64(&d.metrics.Hits, 1)
 		}
-		var existingDestPtr uintptr
-		if existingDest.IsValid() {
-			switch {
-			case (existingDest.Kind() == reflect.Ptr || existingDest.Kind() == reflect.UnsafePointer) && !existingDest.IsNil():
-				existingDestPtr = existingDest.Pointer()
-			case existingDest.CanAddr():
-				existingDestPtr = existingDest.UnsafeAddr()
-			}
-		}
 		if d.logger != nil {
-			d.logger.Debugf("Check: FOUND srcPtr %p (ElemType %s) -> existingDest %s (addr/ptr: %p)",
-				unsafe.Pointer(srcPtr), srcElemType.String(), existingDest.Type().String(), unsafe.Pointer(existingDestPtr))
+			// NB: never turn the uintptr keys back into unsafe.Pointer here. Doing
+			// so fails runtime checkptr (go test -race) and is not a valid use of unsafe.
+			var destAddr uintptr
+			if existingDest.IsValid() {
+				switch {
+				case (existingDest.Kind() == reflect.Ptr || existingDest.Kind() == reflect.UnsafePointer) && !existingDest.IsNil():
+					destAddr = existingDest.Pointer()
+				case existingDest.CanAddr():
+					destAddr = existingDest.UnsafeAddr()
+				}
+			}
+			d.logger.Debugf("Check: FOUND srcPtr %#x (ElemType %s) -> existingDest %s (addr/ptr: %#x)",
+				srcPtr, srcElemType.String(), existingDest.Type().String(), destAddr)
 		}
 	} else if d.enableMetrics {
 		atomic.AddUint64(&d.metrics.Misses, 1)
@@ -142,8 +143,8 @@ func (d *Detector) Track(srcPtr uintptr, srcElemType reflect.Type, destVal refle
 	if _, exists := d.visited[*vk]; !exists {
 		if !destVal.IsValid() {
 			if d.logger != nil {
-				d.logger.Warnf("Track: Attempted to track invalid destVal for srcPtr %p (ElemType %s)",
-					unsafe.Pointer(srcPtr), srcElemType.String())
+				d.logger.Warnf("Track: Attempted to track invalid destVal for srcPtr %#x (ElemType %s)",
+					srcPtr, srcElemType.String())
 			}
 			return
 		}
@@ -153,35 +154,45 @@ func (d *Detector) Track(srcPtr uintptr, srcElemType reflect.Type, destVal refle
 			atomic.AddUint64(&d.metrics.Tracked, 1)
 		}
 
-		var destValAddr uintptr
-		if (destVal.Kind() == reflect.Ptr || destVal.Kind() == reflect.UnsafePointer) && !destVal.IsNil() {
-			destValAddr = destVal.Pointer()
-		} else if destVal.CanAddr() {
-			destValAddr = destVal.UnsafeAddr()
-		}
 		if d.logger != nil {
-			d.logger.Debugf("Track: STORED srcPtr %p (ElemType %s) -> destVal %s (addr/ptr: %p)",
-				unsafe.Pointer(srcPtr), srcElemType.String(), destVal.Type().String(), unsafe.Pointer(destValAddr))
+			// See the note in Check: log the raw uintptr, never an unsafe.Pointer
+			// reconstructed from it (runtime checkptr forbids that).
+			var destValAddr uintptr
+			if (destVal.Kind() == reflect.Ptr || destVal.Kind() == reflect.UnsafePointer) && !destVal.IsNil() {
+				destValAddr = destVal.Pointer()
+			} else if destVal.CanAddr() {
+				destValAddr = destVal.UnsafeAddr()
+			}
+			d.logger.Debugf("Track: STORED srcPtr %#x (ElemType %s) -> destVal %s (addr/ptr: %#x)",
+				srcPtr, srcElemType.String(), destVal.Type().String(), destValAddr)
 		}
 	} else {
 		if d.enableMetrics {
 			atomic.AddUint64(&d.metrics.Collisions, 1)
 		}
 		if d.logger != nil {
-			d.logger.Debugf("Track: srcPtr %p (ElemType %s) already tracked",
-				unsafe.Pointer(srcPtr), srcElemType.String())
+			d.logger.Debugf("Track: srcPtr %#x (ElemType %s) already tracked",
+				srcPtr, srcElemType.String())
 		}
 	}
 }
 
+// Reset clears every tracked pointer while keeping the backing map allocated so
+// repeated copies do not pay for a fresh map each time.
 func (d *Detector) Reset() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.visited = make(map[VisitKey]reflect.Value)
+	if d.visited != nil {
+		clear(d.visited)
+	} else {
+		d.visited = make(map[VisitKey]reflect.Value)
+	}
 	if d.enableMetrics {
 		atomic.AddUint64(&d.metrics.Resets, 1)
 	}
-	d.logger.Debug("Reset: cleared all tracked pointers")
+	if d.logger != nil {
+		d.logger.Debug("Reset: cleared all tracked pointers")
+	}
 }
 
 func (d *Detector) Count() int {

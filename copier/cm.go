@@ -6,6 +6,10 @@ import (
 )
 
 func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *SysContext) error {
+	if c.tryFastMapToStruct(dest, src) {
+		return nil
+	}
+
 	destInfo := c.getTypeInfo(dest.Type())
 	srcMapKeys := src.MapKeys()
 	usedMapKeys := make(map[string]struct{})
@@ -15,7 +19,6 @@ func (c *Copier) copyMapToStruct(dest reflect.Value, src reflect.Value, ctx *Sys
 	var unmappedDestFieldName string
 	var unmappedDestValueType reflect.Type
 
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Map -> Struct (%s -> %s) | Overwrite: %v", src.Type(), dest.Type(), c.overwrite)
 
 	if destInfo.unmappedField != nil {
@@ -252,7 +255,6 @@ func (c *Copier) copyMapToSlice(dest, src reflect.Value, ctx *SysContext) error 
 	destType := dest.Type()
 	destElemType := destType.Elem()
 	srcType := src.Type()
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Map -> Slice (%s -> %s)", srcType, destType)
 
 	if !src.IsValid() || src.IsNil() {
@@ -373,7 +375,6 @@ func (c *Copier) copyMap(dest, src reflect.Value, ctx *SysContext) error {
 	if src.IsValid() && !src.IsNil() {
 		srcLen = src.Len()
 	}
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Map -> Map (%s -> %s)", srcType, destType)
 
 	originalDestMapSnapshot := make(map[interface{}]reflect.Value)

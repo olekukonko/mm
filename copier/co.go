@@ -11,8 +11,6 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 		return fmt.Errorf("copyPtr: destination type %s is not a pointer", destType)
 	}
 	destElemType := destType.Elem()
-	c.logger.Indent(ctx.depth + 1)
-	defer c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying -> Ptr (dest ptr type: %s, src value for elem: %s)", destType, src.Type())
 
 	if !src.IsValid() {
@@ -336,8 +334,6 @@ func (c *Copier) copyPtr(dest, src reflect.Value, ctx *SysContext) (err error) {
 // `src` is the original source value passed for the interface slot (could be anything).
 // `dest` is the interface slot itself.
 func (c *Copier) copyInterface(dest, src reflect.Value, ctx *SysContext) (err error) {
-	c.logger.Indent(ctx.depth + 1)
-	defer c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying -> Interface (src type: %s (kind %s) -> dest type: %s)", src.Type(), src.Kind(), dest.Type())
 
 	if !dest.CanSet() {

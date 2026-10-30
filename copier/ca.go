@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
-	"unsafe"
 )
 
 func (c *Copier) copyArray(dest, src reflect.Value, ctx *SysContext) error {
@@ -13,7 +12,6 @@ func (c *Copier) copyArray(dest, src reflect.Value, ctx *SysContext) error {
 	srcLen := src.Len()
 	destLen := dest.Len()
 
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Slice/Array -> Array (%s -> %s)", srcType, destType)
 
 	if destLen != srcLen {
@@ -89,8 +87,8 @@ func (c *Copier) tryBulkCopyArray(dest, src reflect.Value, destElemType, srcElem
 		return true
 	}
 	if totalSize > 0 && elemSize > 0 {
-		destPtr := unsafe.Pointer(dest.UnsafeAddr())
-		srcPtr := unsafe.Pointer(src.UnsafeAddr())
+		destPtr := dest.Addr().UnsafePointer()
+		srcPtr := src.Addr().UnsafePointer()
 		c.logger.Debugf("   -> Performing unsafe memmove (size %d)", totalSize)
 		memmove(destPtr, srcPtr, totalSize)
 		runtime.KeepAlive(dest)
@@ -106,7 +104,6 @@ func (c *Copier) copySlice(dest, src reflect.Value, ctx *SysContext) error {
 	srcType := src.Type()
 	srcLen := src.Len()
 
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Slice/Array -> Slice (%s -> %s)", srcType, destType)
 
 	originalDestValue := dest
@@ -319,8 +316,8 @@ func (c *Copier) tryBulkCopySlice(targetSlice, src reflect.Value, destElemType, 
 			return true
 		}
 		if totalSize > 0 && elemSize > 0 {
-			destPtr := unsafe.Pointer(targetSlice.Pointer())
-			srcPtr := unsafe.Pointer(src.Pointer())
+			destPtr := targetSlice.UnsafePointer()
+			srcPtr := src.UnsafePointer()
 			c.logger.Debugf("   -> Performing unsafe memmove (overwrite, full slice, size %d).", totalSize)
 			memmove(destPtr, srcPtr, totalSize)
 			runtime.KeepAlive(targetSlice)
@@ -340,7 +337,6 @@ func (c *Copier) copySliceToMap(dest, src reflect.Value, ctx *SysContext) error 
 	srcElemType := srcType.Elem()
 	srcLen := src.Len()
 
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Slice -> Map (%s -> %s)", srcType, destType)
 
 	if src.Kind() == reflect.Slice && src.IsNil() {

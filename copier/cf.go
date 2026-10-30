@@ -344,7 +344,7 @@ func (c *Copier) getSettableFieldValue(structVal reflect.Value, fi *FieldInfo) (
 			if !concreteStructVal.CanAddr() {
 				return reflect.Value{}, false, fmt.Errorf("struct %s (field '%s') not addressable for unsafe set", concreteStructVal.Type(), fi.name)
 			}
-			fieldPtr := unsafe.Pointer(concreteStructVal.UnsafeAddr() + fi.offset)
+			fieldPtr := unsafe.Add(concreteStructVal.Addr().UnsafePointer(), fi.offset)
 			fUnsafe := reflect.NewAt(fi.typ, fieldPtr).Elem()
 			if fUnsafe.IsValid() {
 				return fUnsafe, true, nil
@@ -386,7 +386,7 @@ func (c *Copier) readSourceFieldValue(srcStruct reflect.Value, fi *FieldInfo) (r
 				c.logger.Debugf("   readSourceFieldValue: Struct %s (field '%s') not addressable for unsafe read.", concreteSrcStruct.Type(), fi.name)
 				return reflect.Value{}, false
 			}
-			fieldPtr := unsafe.Pointer(concreteSrcStruct.UnsafeAddr() + fi.offset)
+			fieldPtr := unsafe.Add(concreteSrcStruct.Addr().UnsafePointer(), fi.offset)
 			// Create a new Value that refers to the memory at fieldPtr with type fi.typ. Then get its Elem().
 			// This reflect.Value, fUnsafe, should be readable.
 			fUnsafe := reflect.NewAt(fi.typ, fieldPtr).Elem()

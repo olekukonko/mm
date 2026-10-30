@@ -16,6 +16,17 @@ import (
 var logger = ll.New("mm").Suspend()
 var defaultCopier = copier.NewCopier(copier.WithLogger(logger))
 
+// newCycleDetector builds a pooled cycle detector. The copier logger is only
+// attached in debug mode: wiring a logger makes every Check/Track call evaluate
+// its (formatted) debug arguments even when logging is disabled.
+func newCycleDetector(c *copier.Copier) *cycle.Detector {
+	opts := []cycle.Option{cycle.WithPool(true), cycle.WithMetrics(false)}
+	if c.DebugMode() {
+		opts = append(opts, cycle.WithLogger(c.Logger()))
+	}
+	return cycle.New(opts...)
+}
+
 // Copy creates a new value of type T and copies data from src into it using the default copier.
 // Returns the copied value or an error if the copy operation fails.
 func Copy[T any](src interface{}) (T, error) {
@@ -42,13 +53,7 @@ func CopyWith[T any](c *copier.Copier, src interface{}) (T, error) {
 	srcReflectVal := reflect.ValueOf(src) // Get reflect.Value of src early
 
 	ctx := &copier.SysContext{
-		Visited: make(map[cycle.VisitKey]reflect.Value),
-		Errors:  make([]error, 0),
-		Detector: cycle.New(
-			cycle.WithLogger(c.Logger()), // Use copier's logger for cycle detector
-			cycle.WithPool(true),         // Enable pooling for cycle detector
-			cycle.WithMetrics(false),     // Disable metrics for cycle detector
-		),
+		Detector: newCycleDetector(c),
 	}
 
 	// Handle T being an interface type (e.g., any)
@@ -168,12 +173,11 @@ func CopyWith[T any](c *copier.Copier, src interface{}) (T, error) {
 // MustCopy creates a new value of type T and copies data from src using the default copier, panicking on error.
 // Returns the copied value.
 func MustCopy[T any](src interface{}) T {
-	// Make a local copy to set panic mode without affecting defaultCopier
-	tempPanicCopier := *defaultCopier
+	tempPanicCopier := defaultCopier.Clone()
 	tempPanicCopier.WithPanicOnError(true)
 	tempPanicCopier.WithCollectErrors(false) // Panic immediately
 
-	val, err := CopyWith[T](&tempPanicCopier, src)
+	val, err := CopyWith[T](tempPanicCopier, src)
 	if err != nil {
 		// This path should ideally not be reached if CopyWith correctly panics.
 		panic(fmt.Sprintf("mm.MustCopy failed: %v", err))

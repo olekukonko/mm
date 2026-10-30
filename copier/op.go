@@ -3,7 +3,6 @@ package copier
 import (
 	"log" // Keep standard log for this specific warning
 	"reflect"
-	"sync"
 
 	"github.com/olekukonko/ll"
 	"github.com/olekukonko/ll/lx"
@@ -15,7 +14,7 @@ type Option func(*Copier)
 func WithTag(tag string) Option {
 	return func(c *Copier) {
 		c.tagName = tag
-		c.typeInfoCache = sync.Map{}
+		c.resetCaches()
 	}
 }
 
@@ -108,7 +107,7 @@ func WithSkipUnsafe(skip bool) Option {
 		if !c.useUnsafe {
 			c.copyUnexported = false // Cannot copy unexported without unsafe
 		}
-		c.typeInfoCache = sync.Map{}
+		c.resetCaches()
 	}
 }
 
@@ -144,7 +143,7 @@ func WithSkipDebug(skip bool) Option {
 func WithTagResolution(use bool) Option {
 	return func(c *Copier) {
 		c.tagResolution = use
-		c.typeInfoCache = sync.Map{}
+		c.resetCaches()
 	}
 }
 
@@ -156,7 +155,7 @@ func WithFallbackTagKeys(keys ...string) Option {
 		} else {
 			c.fallbackTagKeys = keys
 		}
-		c.typeInfoCache = sync.Map{}
+		c.resetCaches()
 	}
 }
 
@@ -164,7 +163,7 @@ func WithFallbackTagKeys(keys ...string) Option {
 func WithFallbackTagKeysFrom(keys ...string) Option {
 	return func(c *Copier) {
 		c.fallbackTagKeys = append(c.fallbackTagKeys, keys...)
-		c.typeInfoCache = sync.Map{}
+		c.resetCaches()
 	}
 }
 
@@ -199,7 +198,7 @@ func WithUnsafe(enable bool) Option {
 			}
 			c.copyUnexported = false
 		}
-		c.typeInfoCache = sync.Map{}
+		c.resetCaches()
 	}
 }
 
@@ -220,7 +219,7 @@ func WithUnexported(enable bool) Option {
 		} else {
 			c.copyUnexported = enable
 		}
-		c.typeInfoCache = sync.Map{} // May affect type info regarding field access
+		c.resetCaches() // May affect type info regarding field access
 	}
 }
 
@@ -269,20 +268,20 @@ func WithLogger(l *ll.Logger) Option {
 func WithDebug(enable bool) Option { // This option configures the logger
 	return func(c *Copier) {
 		c.debugMode = enable // Keep internal flag for conditional logic if needed
-		if c.logger != nil {
-			if enable {
-				c.logger.Enable()
-				c.logger.Level(lx.LevelDebug)
-			} else {
-				// Keep logger enabled but potentially set to a higher level? Or disable?
-				// Disabling might be unexpected if a logger was explicitly provided.
-				// Let's just ensure level is not Debug if enable is false.
-				if c.logger.GetLevel() == lx.LevelDebug {
-					c.logger.Level(lx.LevelInfo) // Default to Info if disabling Debug specifically
-				}
-				// Or maybe just: c.logger.SetLevel(ll.LevelWarn) or higher?
-				// Safest might be to not change level if disabling debug.
-			}
+		if c.logger == nil {
+			return
+		}
+		if enable {
+			// Loggers created by NewCopier are suspended by default so that the
+			// default path never formats a message; resume is required to log.
+			c.logger.Resume()
+			c.logger.Enable()
+			c.logger.Level(lx.LevelDebug)
+		} else {
+			// Suspend instead of merely raising the level: ll.Logger.Debugf
+			// formats its message before checking enablement, so a suspended
+			// logger is the only zero-cost "off" state.
+			c.logger.Suspend()
 		}
 	}
 }
@@ -290,7 +289,7 @@ func WithDebug(enable bool) Option { // This option configures the logger
 // Configuration Methods
 func (c *Copier) WithTag(tag string) *Copier {
 	c.tagName = tag
-	c.typeInfoCache = sync.Map{}
+	c.resetCaches()
 	return c
 }
 func (c *Copier) WithFieldMapping(src, dst string) *Copier {
@@ -321,7 +320,7 @@ func (c *Copier) WithSkipSilent(skip bool) *Copier     { c.silentErrors = !skip;
 func (c *Copier) WithSkipDebug(skip bool) *Copier      { c.debugMode = !skip; WithDebug(!skip)(c); return c } // Also apply logger setting
 func (c *Copier) WithTagResolution(use bool) *Copier {
 	c.tagResolution = use
-	c.typeInfoCache = sync.Map{} // Clear cache
+	c.resetCaches() // Clear cache
 	return c
 }
 func (c *Copier) WithFallbackTagKeys(keys ...string) *Copier {
@@ -330,7 +329,7 @@ func (c *Copier) WithFallbackTagKeys(keys ...string) *Copier {
 	} else {
 		c.fallbackTagKeys = keys
 	}
-	c.typeInfoCache = sync.Map{} // Clear cache
+	c.resetCaches() // Clear cache
 	return c
 }
 func (c *Copier) WithFallbackTagKeysFrom(keys ...string) *Copier {

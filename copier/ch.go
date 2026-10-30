@@ -9,7 +9,6 @@ func (c *Copier) copyChan(dest, src reflect.Value, ctx *SysContext) error {
 	destType := dest.Type()
 	srcType := src.Type()
 
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Channel -> Channel (%s -> %s)", srcType, destType)
 
 	if destType.Kind() != reflect.Chan || srcType.Kind() != reflect.Chan {

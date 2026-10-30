@@ -9,9 +9,13 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"unsafe"
 )
 
+// Copier copies and merges Go values using reflection. It also performs deep
+// copies (including cyclic graphs) and supports per-field customisation.
+//
+// A Copier is safe for concurrent use once it has been constructed; the
+// With*/Add* mutators are intended for configuration before first use.
 type Copier struct {
 	tagName           string
 	fallbackTagKeys   []string
@@ -31,19 +35,22 @@ type Copier struct {
 	collectErrors     bool
 	panicOnError      bool
 	silentErrors      bool
-	typeInfoCache     sync.Map
-	bufferPool        sync.Pool
 	debugMode         bool
 	tagResolution     bool
 	merging           bool
 	logger            *ll.Logger
+
+	// Cache state is held behind pointers so that cloning a Copier never copies
+	// a lock: sync.Map and sync.Pool must not be copied by value (go vet).
+	typeInfoCache *sync.Map
+	plainCache    *sync.Map
+	planCache     *sync.Map
+	bufferPool    *sync.Pool
 }
 
 var sysContextPool = sync.Pool{
 	New: func() interface{} {
 		return &SysContext{
-			Visited: make(map[cycle.VisitKey]reflect.Value),
-			Errors:  make([]error, 0),
 			Detector: cycle.New(
 				cycle.WithPool(true),
 				cycle.WithMetrics(false),
@@ -59,47 +66,20 @@ func (c *Copier) acquireSysContext() *SysContext {
 		ctx.Errors = ctx.Errors[:0]
 	}
 	ctx.Detector.Reset()
-	if c.logger != nil {
-		ctx.Detector.SetLogger(c.logger)
-	}
 	return ctx
 }
 
 func (c *Copier) releaseSysContext(ctx *SysContext) {
-	for k := range ctx.Visited {
-		delete(ctx.Visited, k)
-	}
+	clear(ctx.Visited)
 	sysContextPool.Put(ctx)
 }
 
-func New(options ...Option) *Copier {
-	c := &Copier{
-		overwrite:       true,
-		tagName:         "mm",
-		fallbackTagKeys: []string{"json"},
-		tagResolution:   true,
-		fieldMappings:   make(map[string]string),
-		formatters:      make(map[string]func(interface{}) interface{}),
-		skipFields:      make(map[string]struct{}),
-		typeConverters:  make(map[reflect.Type]map[reflect.Type]func(reflect.Value) (reflect.Value, error)),
-		logger:          ll.New("copier"),
-		maxDepth:        -1,
-	}
-
-	baseCopier := NewCopier()
-	c.logger = baseCopier.logger
-	c.fallbackTagKeys = baseCopier.fallbackTagKeys
-	c.typeInfoCache = baseCopier.typeInfoCache
-	c.bufferPool = baseCopier.bufferPool
-	c.enableCycleDetect = baseCopier.enableCycleDetect
-	c.useUnsafe = baseCopier.useUnsafe
-
-	for _, opt := range options {
-		opt(c)
-	}
-	return c
-}
-
+// NewCopier returns a Copier configured with the package defaults.
+//
+// Debug logging is off by default on purpose: ll.Logger.Debugf formats its
+// message before checking whether logging is enabled, so an active logger costs
+// roughly 3x throughput (and doubles allocations) on small copies even though
+// nothing is ever written. Call WithDebug(true) to turn it on.
 func NewCopier(options ...Option) *Copier {
 	c := &Copier{
 		tagName:           "mm",
@@ -111,18 +91,13 @@ func NewCopier(options ...Option) *Copier {
 		maxDepth:          -1,
 		overwrite:         true,
 		useUnsafe:         true,
-		copyUnexported:    false,
 		enableCycleDetect: true,
-		collectErrors:     false,
-		panicOnError:      false,
-		silentErrors:      false,
-		skipNilSrc:        false,
-		skipZeroValue:     false,
-		skipEmptyValue:    false,
-		debugMode:         false,
 		tagResolution:     true,
-		bufferPool:        sync.Pool{New: func() interface{} { buf := make([]byte, 1024); return &buf }},
-		logger:            ll.New("copier"),
+		logger:            ll.New("copier").Suspend(),
+		typeInfoCache:     &sync.Map{},
+		plainCache:        &sync.Map{},
+		planCache:         &sync.Map{},
+		bufferPool:        &sync.Pool{New: func() interface{} { buf := make([]byte, 1024); return &buf }},
 	}
 
 	for _, opt := range options {
@@ -132,10 +107,76 @@ func NewCopier(options ...Option) *Copier {
 	return c
 }
 
+// New is an alias for NewCopier.
+//
+// Deprecated: New and NewCopier used to expose subtly different defaults while
+// sharing internal caches (which made the result order dependent). Both now
+// return the same configuration; use NewCopier.
+func New(options ...Option) *Copier {
+	return NewCopier(options...)
+}
+
+// Clone returns an independent copy of the copier. Configuration maps are
+// copied so that mutating the clone does not affect the receiver, while the
+// derived type caches are shared (they are keyed by type and safe for
+// concurrent use).
+func (c *Copier) Clone() *Copier {
+	clone := *c // safe: every lock-bearing field is a pointer
+
+	clone.fallbackTagKeys = append([]string(nil), c.fallbackTagKeys...)
+	clone.fieldMappings = make(map[string]string, len(c.fieldMappings))
+	for k, v := range c.fieldMappings {
+		clone.fieldMappings[k] = v
+	}
+	clone.skipFields = make(map[string]struct{}, len(c.skipFields))
+	for k := range c.skipFields {
+		clone.skipFields[k] = struct{}{}
+	}
+	clone.formatters = make(map[string]func(interface{}) interface{}, len(c.formatters))
+	for k, v := range c.formatters {
+		clone.formatters[k] = v
+	}
+	clone.typeConverters = make(map[reflect.Type]map[reflect.Type]func(reflect.Value) (reflect.Value, error), len(c.typeConverters))
+	for srcType, byDest := range c.typeConverters {
+		converted := make(map[reflect.Type]func(reflect.Value) (reflect.Value, error), len(byDest))
+		for dstType, converter := range byDest {
+			converted[dstType] = converter
+		}
+		clone.typeConverters[srcType] = converted
+	}
+
+	if clone.typeInfoCache == nil {
+		clone.typeInfoCache = &sync.Map{}
+	}
+	if clone.plainCache == nil {
+		clone.plainCache = &sync.Map{}
+	}
+	if clone.planCache == nil {
+		clone.planCache = &sync.Map{}
+	}
+	if clone.bufferPool == nil {
+		clone.bufferPool = &sync.Pool{New: func() interface{} { buf := make([]byte, 1024); return &buf }}
+	}
+	if clone.logger == nil {
+		clone.logger = ll.New("copier").Suspend()
+	}
+
+	return &clone
+}
+
 func (c *Copier) AddFallbackTagKeys(keys ...string) *Copier {
 	c.fallbackTagKeys = append(c.fallbackTagKeys, keys...)
-	c.typeInfoCache = sync.Map{}
+	c.resetCaches()
 	return c
+}
+
+// resetCaches drops all derived type information. It must be called whenever an
+// option changes how types are interpreted (tag name, tag resolution, unsafe
+// access, ...), otherwise stale plans could be reused.
+func (c *Copier) resetCaches() {
+	c.typeInfoCache = &sync.Map{}
+	c.plainCache = &sync.Map{}
+	c.planCache = &sync.Map{}
 }
 
 func (c *Copier) Copy(dest interface{}, src interface{}) error {
@@ -186,9 +227,9 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 	if c.enableCycleDetect && !isSpecialPointerType &&
 		srcReflectVal.IsValid() && srcReflectVal.Kind() == reflect.Ptr && !srcReflectVal.IsNil() {
 		if destVal.Type() == srcReflectVal.Type() && destVal.Type().Elem().Kind() == reflect.Struct {
-			c.logger.Debugf("Copier.Copy: Priming cycle Detector for top-level object: %p (%s) -> %p (%s)",
-				unsafe.Pointer(srcReflectVal.Pointer()), srcReflectVal.Type(),
-				unsafe.Pointer(destVal.Pointer()), destVal.Type())
+			c.logger.Debugf("Copier.Copy: Priming cycle Detector for top-level object: %#x (%s) -> %#x (%s)",
+				srcReflectVal.Pointer(), srcReflectVal.Type(),
+				destVal.Pointer(), destVal.Type())
 			ctx.Detector.Track(srcReflectVal.Pointer(), srcReflectVal.Type().Elem(), destVal)
 		}
 	}
@@ -204,7 +245,7 @@ func (c *Copier) Copy(dest interface{}, src interface{}) error {
 }
 
 func (c *Copier) MustCopy(dest, src interface{}) {
-	tempCopier := *c
+	tempCopier := c.Clone()
 	tempCopier.panicOnError = true
 	tempCopier.collectErrors = false
 
@@ -214,7 +255,7 @@ func (c *Copier) MustCopy(dest, src interface{}) {
 }
 
 func (c *Copier) Merge(dest, src interface{}) error {
-	tempCopier := *c
+	tempCopier := c.Clone()
 	tempCopier.overwrite = false
 	tempCopier.merging = true
 	tempCopier.debugMode = c.debugMode
@@ -247,8 +288,8 @@ func (c *Copier) CopyCat(dest interface{}, sources ...interface{}) error {
 	ctx := c.acquireSysContext()
 	defer c.releaseSysContext(ctx)
 
-	firstCopier := *c
-	mergeCopier := *c
+	firstCopier := c.Clone()
+	mergeCopier := c.Clone()
 	mergeCopier.overwrite = false
 	mergeCopier.merging = true
 	mergeCopier.debugMode = c.debugMode
@@ -362,7 +403,7 @@ func (c *Copier) Deep(v interface{}) (interface{}, error) {
 }
 
 func (c *Copier) MustDeep(v interface{}) interface{} {
-	tempCopier := *c
+	tempCopier := c.Clone()
 	tempCopier.panicOnError = true
 	tempCopier.collectErrors = false
 	tempCopier.silentErrors = false

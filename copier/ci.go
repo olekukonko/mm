@@ -87,8 +87,11 @@ type CopyContext struct {
 type SysContext struct {
 	depth    int
 	Detector *cycle.Detector
-	Visited  map[cycle.VisitKey]reflect.Value
-	Errors   []error
+	// Visited is kept for backwards compatibility only: cycle state lives in
+	// Detector, and this map is intentionally left nil (clear on a nil map is a
+	// no-op). Do not write to it.
+	Visited map[cycle.VisitKey]reflect.Value
+	Errors  []error
 }
 type TypeInfo struct {
 	fields                                       map[string]FieldInfo

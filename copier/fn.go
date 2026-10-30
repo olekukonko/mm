@@ -214,10 +214,13 @@ func InterfaceKeySrc(key reflect.Value) interface{} {
 }
 
 // InterfaceToString converts a map key's reflect.Value to a string for logging or lookup.
-// Uses fmt.Sprintf for valid interfaces or a fallback for unexported/invalid keys.
+// Uses a direct conversion for string keys (the common case) and fmt.Sprintf otherwise.
 func InterfaceToString(keyVal reflect.Value) string {
 	if !keyVal.IsValid() {
 		return "<invalid_key_value>"
+	}
+	if keyVal.Kind() == reflect.String {
+		return keyVal.String()
 	}
 	if keyVal.CanInterface() {
 		return fmt.Sprintf("%v", keyVal.Interface())

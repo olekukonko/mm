@@ -41,6 +41,13 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 		return fmt.Errorf("copyStructDriven: source must be a struct or pointer to a struct, got %s", src.Type())
 	}
 
+	// Fast path: identical field names, plain values, no customisation. The
+	// plan is cached per (src, dest) type pair, so the generic walk below is
+	// only paid for the cases that actually need it.
+	if c.tryFastStructCopy(dest, srcForInfo) {
+		return nil
+	}
+
 	destInfo := c.getTypeInfo(dest.Type())
 	srcInfo := c.getTypeInfo(srcForInfo.Type())
 	destFieldsProcessedOrSkipped := make(map[string]struct{})
@@ -49,7 +56,6 @@ func (c *Copier) copyStructDriven(dest, src reflect.Value, ctx *SysContext) (err
 	var unmappedDestFieldName string
 	var unmappedDestValueType reflect.Type
 
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Struct -> Struct (%s -> %s) | Overwrite: %v", srcForInfo.Type(), dest.Type(), c.overwrite)
 
 	if destInfo.unmappedField != nil {
@@ -355,11 +361,15 @@ func (c *Copier) copyStructToMap(dest, src reflect.Value, ctx *SysContext) error
 		return fmt.Errorf("copyStructToMap: destination must be a map, got %s", dest.Type())
 	}
 
+	// Fast path: plain fields assignable to the map element type. Rebuilds the
+	// map when overwriting, which matches the generic path's cleanup semantics.
+	if c.tryFastStructToMap(dest, srcForInfo) {
+		return nil
+	}
+
 	destType := dest.Type()
 	destMapKeyType := destType.Key()
 	destValueType := destType.Elem()
-
-	c.logger.Indent(ctx.depth)
 	c.logger.Debugf("Copying Struct -> Map (%s -> %s)", srcForInfo.Type(), dest.Type())
 
 	srcInfo := c.getTypeInfo(srcForInfo.Type())
